@@ -252,6 +252,8 @@ public:
 
   bool shouldExpandVectorDynExt(SDNode *N) const;
 
+  bool shouldPreservePtrArith(const Function &F, EVT PtrVT) const override;
+
 private:
   // Analyze a combined offset from an amdgcn_buffer_ intrinsic and store the
   // three offsets (voffset, soffset and instoffset) into the SDValue[3] array
