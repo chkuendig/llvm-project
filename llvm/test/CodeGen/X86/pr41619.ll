@@ -5,6 +5,8 @@
 define void @foo(double %arg) {
 ; CHECK-LABEL: foo:
 ; CHECK:       ## %bb.0: ## %bb
+; CHECK-NEXT:    vpxor %xmm1, %xmm1, %xmm1
+; CHECK-NEXT:    vpblendd {{.*#+}} xmm0 = xmm0[0],xmm1[1,2,3]
 ; CHECK-NEXT:    vmovq %xmm0, %rax
 ; CHECK-NEXT:    vmovd %eax, %xmm0
 ; CHECK-NEXT:    vmovq %xmm0, %rax
