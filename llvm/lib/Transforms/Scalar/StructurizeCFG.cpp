@@ -643,8 +643,8 @@ void StructurizeCFG::delPhiValues(BasicBlock *From, BasicBlock *To) {
 /// Add a dummy PHI value as soon as we knew the new predecessor
 void StructurizeCFG::addPhiValues(BasicBlock *From, BasicBlock *To) {
   for (PHINode &Phi : To->phis()) {
-    Value *Undef = UndefValue::get(Phi.getType());
-    Phi.addIncoming(Undef, From);
+    Value *Poison = PoisonValue::get(Phi.getType());
+    Phi.addIncoming(Poison, From);
   }
   AddedPhis[To].push_back(From);
 }
@@ -726,10 +726,10 @@ void StructurizeCFG::setPhiValues() {
     PhiMap &Map = DeletedPhis[To];
     for (const auto &PI : Map) {
       PHINode *Phi = PI.first;
-      Value *Undef = UndefValue::get(Phi->getType());
+      Value *Poison = PoisonValue::get(Phi->getType());
       Updater.Initialize(Phi->getType(), "");
-      Updater.AddAvailableValue(&Func->getEntryBlock(), Undef);
-      Updater.AddAvailableValue(To, Undef);
+      Updater.AddAvailableValue(&Func->getEntryBlock(), Poison);
+      Updater.AddAvailableValue(To, Poison);
 
       SmallSet<BasicBlock *, 8> Incomings;
       SmallVector<BasicBlock *> ConstantPreds;
@@ -753,7 +753,7 @@ void StructurizeCFG::setPhiValues() {
         if (any_of(ConstantPreds,
                    [&](BasicBlock *CP) { return DT->dominates(CP, UB); }))
           continue;
-        Updater.AddAvailableValue(UB, Undef);
+        Updater.AddAvailableValue(UB, Poison);
       }
 
       for (BasicBlock *FI : From)
@@ -1050,9 +1050,9 @@ void StructurizeCFG::rebuildSSA() {
           continue;
 
         if (!Initialized) {
-          Value *Undef = UndefValue::get(I.getType());
+          Value *Poison = PoisonValue::get(I.getType());
           Updater.Initialize(I.getType(), "");
-          Updater.AddAvailableValue(&Func->getEntryBlock(), Undef);
+          Updater.AddAvailableValue(&Func->getEntryBlock(), Poison);
           Updater.AddAvailableValue(BB, &I);
           Initialized = true;
         }
