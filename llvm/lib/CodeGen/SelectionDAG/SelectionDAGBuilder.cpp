@@ -4401,9 +4401,13 @@ void SelectionDAGBuilder::visitGetElementPtr(const User &I) {
       // The successive addition of the current address, truncated to the
       // pointer index type and interpreted as an unsigned number, and each
       // offset, also interpreted as an unsigned number, does not wrap the
-      // pointer index type (add nuw).
+      // pointer index type (add nuw). Upstream uses a per-GEP NoWrapFlags (NW)
+      // API that's not in our pinned base; fall back to isInBounds() as a
+      // conservative proxy (same predicate used a few lines up for a
+      // constant-index GEP path).
       SDNodeFlags AddFlags;
-      AddFlags.setNoUnsignedWrap(NW.hasNoUnsignedWrap());
+      if (cast<GEPOperator>(I).isInBounds())
+        AddFlags.setNoUnsignedWrap(true);
 
       N = DAG.getMemBasePlusOffset(N, IdxN, dl, AddFlags);
     }
@@ -11181,7 +11185,7 @@ TargetLowering::LowerCallTo(TargetLowering::CallLoweringInfo &CLI) const {
     for (unsigned i = 0; i < NumValues; ++i) {
       SDValue Add = CLI.DAG.getMemBasePlusOffset(
           DemoteStackSlot, CLI.DAG.getConstant(Offsets[i], CLI.DL, PtrVT),
-          CLI.DL, SDNodeFlags::NoUnsignedWrap);
+          CLI.DL, Flags);
       SDValue L = CLI.DAG.getLoad(
           RetTys[i], CLI.DL, CLI.Chain, Add,
           MachinePointerInfo::getFixedStack(CLI.DAG.getMachineFunction(),

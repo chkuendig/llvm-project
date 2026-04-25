@@ -1657,8 +1657,14 @@ bool AMDGPUDAGToDAGISel::SelectFlatOffsetImpl(SDNode *N, SDValue Addr,
       // Adding the offset to the base address in a FLAT instruction must not
       // change the memory aperture in which the address falls. Therefore we can
       // only fold offsets from inbounds GEPs into FLAT instructions.
-      bool IsInBounds =
-          Addr.getOpcode() == ISD::PTRADD && Addr->getFlags().hasInBounds();
+      //
+      // Our pinned LLVM base predates the addition of SDNodeFlags::InBounds
+      // (part of the PTRADD inbounds work upstream). Be conservative: only
+      // treat as inbounds when the node is PTRADD AND is a named inbounds GEP.
+      // Since we don't have the inbounds bit, always say "not inbounds" — the
+      // fold is skipped unless COffsetVal==0, which is the correct-but-slower
+      // behaviour that the ROCm #4389 fix enforces.
+      bool IsInBounds = false;
       if (COffsetVal == 0 || FlatVariant != SIInstrFlags::FLAT || IsInBounds) {
         const SIInstrInfo *TII = Subtarget->getInstrInfo();
         if (TII->isLegalFLATOffset(COffsetVal, AS, FlatVariant)) {
