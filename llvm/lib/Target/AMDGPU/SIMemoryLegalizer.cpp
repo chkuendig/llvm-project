@@ -2013,14 +2013,21 @@ bool SIGfx10CacheControl::insertWait(MachineBasicBlock::iterator &MI,
       // In WGP mode the waves of a work-group can be executing on either CU of
       // the WGP. Therefore need to wait for operations to complete to ensure
       // they are visible to waves in the other CU as the L0 is per CU.
-      // Otherwise in CU mode and all waves of a work-group are on the same CU
-      // which shares the same L0.
-      if (!ST.isCuModeEnabled()) {
-        if ((Op & SIMemOp::LOAD) != SIMemOp::NONE)
-          VMCnt |= true;
-        if ((Op & SIMemOp::STORE) != SIMemOp::NONE)
-          VSCnt |= true;
-      }
+      //
+      // 2026-04-27: previously gated on `if (!ST.isCuModeEnabled())` on the
+      // assumption that "all waves on the same CU share the L0" makes the
+      // wait redundant. Per LLVM PR #161638 (Pierre van Houtryve, merged
+      // 2025-10-21 into upstream main), that assumption breaks transitivity:
+      // > "Our release fences aren't strong enough to 'wait' on stores
+      // > from other waves."
+      // Reproduced empirically: CUB BlockScan in Batman / FleX / PhysX —
+      // warp 0's `ds_write` of the per-lane exclusive-prefix is not
+      // visible to warp 1's `ds_read` after `bar.sync 0`. See
+      // project_phase8_smoking_gun_2026_04_27.md.
+      if ((Op & SIMemOp::LOAD) != SIMemOp::NONE)
+        VMCnt |= true;
+      if ((Op & SIMemOp::STORE) != SIMemOp::NONE)
+        VSCnt |= true;
       break;
     case SIAtomicScope::WAVEFRONT:
     case SIAtomicScope::SINGLETHREAD:
