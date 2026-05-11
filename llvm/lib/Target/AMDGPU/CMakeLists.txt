@@ -105,6 +105,7 @@ add_llvm_target(AMDGPUCodeGen
   AMDGPURewriteUndefForPHI.cpp
   AMDGPUSetWavePriority.cpp
   AMDGPUSplitModule.cpp
+  AMDGPUZeroVGPRProlog.cpp
   AMDGPUSubtarget.cpp
   AMDGPUTargetMachine.cpp
   AMDGPUTargetObjectFile.cpp
