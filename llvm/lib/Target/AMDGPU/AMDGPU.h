@@ -554,6 +554,11 @@ extern char &GCNPreRAOptimizationsID;
 FunctionPass *createAMDGPUSetWavePriorityPass();
 void initializeAMDGPUSetWavePriorityLegacyPass(PassRegistry &);
 
+// ZLUDA addition (2026-05-11): zero VGPR prolog pass for cross-kernel
+// residue mitigation. See AMDGPUZeroVGPRProlog.cpp.
+FunctionPass *createAMDGPUZeroVGPRPrologPass();
+void initializeAMDGPUZeroVGPRPrologPass(PassRegistry &);
+
 void initializeGCNRewritePartialRegUsesLegacyPass(llvm::PassRegistry &);
 extern char &GCNRewritePartialRegUsesID;
 
