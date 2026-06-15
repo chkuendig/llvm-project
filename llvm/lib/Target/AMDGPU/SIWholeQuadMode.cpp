@@ -80,11 +80,31 @@
 #include "llvm/CodeGen/MachinePostDominators.h"
 #include "llvm/IR/CallingConv.h"
 #include "llvm/InitializePasses.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
 
 #define DEBUG_TYPE "si-wqm"
+
+// ZLUDA fix (divergent OOB-guarded load hoisted into strict-WWM):
+// When a memory load's result transitively feeds a strict.wwm computation
+// (e.g. a CUB/PhysX warp scan), SIWholeQuadMode propagates StrictWWM back onto
+// the load and expands EXEC to all lanes around it. If that load sits inside a
+// divergent OOB guard (its address is only valid for the active/in-bounds
+// lanes), running it whole-wave makes the inactive (OOB) lanes load wild
+// addresses, clobbering the merge sentinel that those lanes were given before
+// the load. The result is garbage indices -> wild scatter -> GPU page fault
+// (Batman:AK IOFX radix sort). Memory loads never NEED whole-wave execution to
+// give inactive lanes a defined value -- that is the job of the explicit
+// sentinel write / V_SET_INACTIVE that already runs in WWM. So disable Strict
+// marking on general loads; they then execute under their natural (guarded)
+// exec and inactive lanes keep their pre-load value.
+static llvm::cl::opt<bool> DisableStrictWWMOnLoads(
+    "amdgpu-wwm-disable-strict-on-loads",
+    llvm::cl::desc("Do not hoist memory loads into strict-WWM exec (prevents "
+                   "divergent OOB-guarded loads from reading wild addresses)"),
+    llvm::cl::init(true), llvm::cl::Hidden);
 
 namespace {
 
@@ -495,6 +515,22 @@ char SIWholeQuadMode::scanInstructions(MachineFunction &MF,
       InstrInfo &III = Instructions[&MI];
       unsigned Opcode = MI.getOpcode();
       char Flags = 0;
+
+      // ZLUDA: keep general memory loads out of strict-WWM. A divergent
+      // OOB-guarded load whose result feeds a strict.wwm scan would otherwise
+      // be hoisted to whole-wave exec and read wild addresses for the inactive
+      // lanes, clobbering the merge sentinel (see file-level note above). The
+      // special LDS param/direct loads below intentionally want StrictWQM, so
+      // exclude them. Disabling here makes markInstruction() strip the Strict
+      // flag (Flag &= ~II.Disabled) when this load is later reached from the
+      // scan's backward use-marking.
+      if (DisableStrictWWMOnLoads && MI.mayLoad() &&
+          Opcode != AMDGPU::LDS_PARAM_LOAD &&
+          Opcode != AMDGPU::DS_PARAM_LOAD &&
+          Opcode != AMDGPU::LDS_DIRECT_LOAD &&
+          Opcode != AMDGPU::DS_DIRECT_LOAD) {
+        III.Disabled |= StateStrict;
+      }
 
       if (TII->isWQM(Opcode)) {
         // If LOD is not supported WQM is not needed.
