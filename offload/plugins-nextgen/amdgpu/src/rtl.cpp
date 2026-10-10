@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <sys/time.h>
@@ -25,17 +26,15 @@
 #include <unordered_map>
 #include <variant>
 
-#include "OmptCommonDefs.h"
-
-#include "OpenMP/OMPT/Interface.h"
+#include "ErrorReporting.h"
 #include "Shared/APITypes.h"
 #include "Shared/Debug.h"
 #include "Shared/Environment.h"
+#include "Shared/RefCnt.h"
 #include "Shared/Utils.h"
 #include "Utils/ELF.h"
 
 #include "GlobalHandler.h"
-#include "OpenMP/OMPT/Callback.h"
 #include "PluginInterface.h"
 #include "UtilitiesRTL.h"
 #include "omptarget.h"
@@ -55,6 +54,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Program.h"
+#include "llvm/Support/Signals.h"
 #include "llvm/Support/raw_ostream.h"
 
 #if !defined(__BYTE_ORDER__) || !defined(__ORDER_LITTLE_ENDIAN__) ||           \
@@ -84,34 +84,30 @@
 
 using namespace llvm::omp::target;
 using namespace llvm::omp::xteam_red;
+using namespace error;
 
 // AMDGPU-specific, so not using the common ones from the device independent
 // includes.
-#ifdef OMPT_SUPPORT
-#define OMPT_IF_TRACING_OR_ENV_VAR_ENABLED(stmts)                              \
-  do {                                                                         \
-    if (llvm::omp::target::ompt::TracingActive || OMPX_EnableQueueProfiling) { \
-      stmts                                                                    \
-    }                                                                          \
-  } while (0)
-#else
-#define OMPT_IF_TRACING_OR_ENV_VAR_ENABLED(stmts)                              \
-  do {                                                                         \
-    if (OMPX_EnableQueueProfiling) {                                           \
-      stmts                                                                    \
-    }                                                                          \
-  } while (0)
-#endif
 
-#ifdef OMPT_SUPPORT
-#include "OmptDeviceTracing.h"
-#include <omp-tools.h>
+double setTicksToTime() {
+  uint64_t TicksFrequency = 1;
+  double TicksToTime = 1.0;
 
-extern void ompt::setOmptTimestamp(uint64_t Start, uint64_t End);
-extern void ompt::setOmptHostToDeviceRate(double Slope, double Offset);
+  hsa_status_t Status =
+      hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY, &TicksFrequency);
+  if (Status == HSA_STATUS_SUCCESS)
+    TicksToTime = (double)1e9 / (double)TicksFrequency;
+  else
+    DP("Error calling hsa_system_get_info for timestamp frequency\n");
+
+  return TicksToTime;
+}
 
 /// HSA system clock frequency
 double TicksToTime = 1.0;
+
+/// Compute system timestamp conversion factor, modeled after ROCclr
+void setHSATicksToTimeConstant() { TicksToTime = setTicksToTime(); }
 
 /// Forward declare
 namespace llvm {
@@ -120,68 +116,50 @@ namespace target {
 namespace plugin {
 
 struct AMDGPUSignalTy;
+struct AMDGPUDeviceTy;
+
 /// Use to transport information to OMPT timing functions.
-struct OmptKernelTimingArgsAsyncTy {
+struct ProfilingInfoTy {
+  // Holds the profiler instance
+  GenericPluginTy *Plugin;
+
+  // The HSA agent on which the operation is executed
   hsa_agent_t Agent;
+
+  // The signal to profile
   AMDGPUSignalTy *Signal;
+
+  // HSA system clock frequency
   double TicksToTime;
-  std::unique_ptr<ompt::OmptEventInfoTy> OmptEventInfo;
+
+  // Handle to profiler specific data
+  void *ProfilerSpecificData;
 };
 
-/// Get OmptKernelTimingArgsAsyncTy from the void * used in the action
+/// Get ProfilingInfoTy from the void * used in the action
 /// functions.
-static OmptKernelTimingArgsAsyncTy *getOmptTimingsArgs(void *Data);
+static ProfilingInfoTy *getProfilingInfo(void *Data);
 
 /// Returns the pair of <start, end> time for a kernel
 static std::pair<uint64_t, uint64_t>
-getKernelStartAndEndTime(const OmptKernelTimingArgsAsyncTy *Args);
+getKernelStartAndEndTime(const ProfilingInfoTy *Args);
 
 /// Returns the pair of <start, end> time for a data transfer
 static std::pair<uint64_t, uint64_t>
-getCopyStartAndEndTime(const OmptKernelTimingArgsAsyncTy *Args);
+getCopyStartAndEndTime(const ProfilingInfoTy *Args);
 
 /// Obtain the timing info and call the RegionInterface callback for the
 /// asynchronous trace records.
 static Error timeDataTransferInNsAsync(void *Data) {
-  auto Args = getOmptTimingsArgs(Data);
+  auto Args = getProfilingInfo(Data);
 
   auto [Start, End] = getCopyStartAndEndTime(Args);
 
-  auto OmptEventInfo = *Args->OmptEventInfo.get();
-  auto RIFunc = std::get<2>(OmptEventInfo.RIFunction);
-  std::invoke(RIFunc, OmptEventInfo.RegionInterface, OmptEventInfo.TraceRecord,
-              Start, End);
+  Args->Plugin->getProfiler()->handleDataTransfer(Start, End,
+                                                  Args->ProfilerSpecificData);
 
   return Plugin::success();
 }
-
-/// Print out some debug info for the OmptEventInfoTy
-static void printOmptEventInfoTy(ompt::OmptEventInfoTy &OmptEventInfo) {
-  DP("OMPT-Async Trace Info: NumTeams %lu, TR %p, "
-     "RegionInterface %p\n",
-     OmptEventInfo.NumTeams, OmptEventInfo.TraceRecord,
-     OmptEventInfo.RegionInterface);
-}
-
-/// Returns a pointer to an OmptEventInfoTy object to be used for OMPT tracing
-/// or nullptr. It is the caller's duty to free the returned pointer when no
-/// longer needed.
-static std::unique_ptr<ompt::OmptEventInfoTy>
-getOrNullOmptEventInfo(AsyncInfoWrapperTy &AsyncInfoWrapper) {
-  __tgt_async_info *AI = AsyncInfoWrapper;
-  if (!AI || !AI->OmptEventInfo)
-    return nullptr;
-
-  // We need to copy the content of the OmptEventInfo object to persist it
-  // between multiple async operations.
-  auto LocalOmptEventInfo =
-      std::make_unique<ompt::OmptEventInfoTy>(*AI->OmptEventInfo);
-  DP("OMPT-Async: Two times printing\n");
-  printOmptEventInfoTy(*AI->OmptEventInfo);
-  printOmptEventInfoTy(*LocalOmptEventInfo);
-  return LocalOmptEventInfo;
-}
-
 } // namespace plugin
 } // namespace target
 } // namespace omp
@@ -192,17 +170,6 @@ void setOmptAsyncCopyProfile(bool Enable) {
   hsa_status_t Status = hsa_amd_profiling_async_copy_enable(Enable);
   if (Status != HSA_STATUS_SUCCESS)
     DP("Error enabling async copy profiling\n");
-}
-
-/// Compute system timestamp conversion factor, modeled after ROCclr.
-void setOmptTicksToTime() {
-  uint64_t TicksFrequency = 1;
-  hsa_status_t Status =
-      hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY, &TicksFrequency);
-  if (Status == HSA_STATUS_SUCCESS)
-    TicksToTime = (double)1e9 / (double)TicksFrequency;
-  else
-    DP("Error calling hsa_system_get_info for timestamp frequency\n");
 }
 
 /// Get the current HSA-based device timestamp.
@@ -230,37 +197,37 @@ static double getTimeOfDay() {
   return TimeVal;
 }
 
-/// Get the first timepoints on host and device.
-void startH2DTimeRate(double *HTime, uint64_t *DTime) {
-  *HTime = getTimeOfDay();
-  *DTime = getSystemTimestampInNs();
+#ifdef OMPT_SUPPORT
+namespace llvm::omp::target::plugin {
+/// Returns a pointer to an OmptEventInfoTy object to be used for OMPT tracing
+/// or nullptr. It is the caller's duty to free the returned pointer when no
+/// longer needed.
+static ompt::OmptEventInfoTy *
+getOrNullOmptEventInfo(AsyncInfoWrapperTy &AsyncInfoWrapper) {
+  __tgt_async_info *AI = AsyncInfoWrapper;
+  if (!AI || !AI->ProfilerData)
+    return nullptr;
+
+  // The profiler data is allocated in the profiler for each individual event.
+  return reinterpret_cast<ompt::OmptEventInfoTy *>(AI->ProfilerData);
 }
 
-/// Get the second timepoints on host and device and compute the rate
-/// required for translating device time to host time.
-void completeH2DTimeRate(double HostRef1, uint64_t DeviceRef1) {
-  double HostRef2 = getTimeOfDay();
-  uint64_t DeviceRef2 = getSystemTimestampInNs();
-  // Assume host (h) timing is related to device (d) timing as
-  // h = m.d + o, where m is the slope and o is the offset.
-  // Calculate slope and offset from the two host and device timepoints.
-  double HostDiff = HostRef2 - HostRef1;
-  uint64_t DeviceDiff = DeviceRef2 - DeviceRef1;
-  double Slope = DeviceDiff != 0 ? (HostDiff / DeviceDiff) : HostDiff;
-  double Offset = HostRef1 - Slope * DeviceRef1;
-  ompt::setOmptHostToDeviceRate(Slope, Offset);
-  DP("Translate time Slope: %f Offset: %f\n", Slope, Offset);
-}
+} // namespace llvm::omp::target::plugin
 
 #else // OMPT_SUPPORT
 namespace llvm::omp::target::ompt {
+
 struct OmptEventInfoTy {};
 } // namespace llvm::omp::target::ompt
+
 namespace llvm::omp::target::plugin {
-static std::unique_ptr<ompt::OmptEventInfoTy>
+
+/// When no OMPT is enabled, return nullptr to de-facto disable the profiling
+static ompt::OmptEventInfoTy *
 getOrNullOmptEventInfo(AsyncInfoWrapperTy &AsyncInfoWrapper) {
   return nullptr;
 }
+
 } // namespace llvm::omp::target::plugin
 #endif
 
@@ -268,26 +235,6 @@ namespace llvm {
 namespace omp {
 namespace target {
 namespace plugin {
-
-extern "C" {
-uint64_t hostrpc_assign_buffer(hsa_agent_t Agent, hsa_queue_t *ThisQ,
-                               uint32_t DeviceId,
-                               hsa_amd_memory_pool_t HostMemoryPool,
-                               hsa_amd_memory_pool_t DevMemoryPool);
-hsa_status_t hostrpc_terminate();
-__attribute__((weak)) hsa_status_t hostrpc_terminate() {
-  return HSA_STATUS_SUCCESS;
-}
-__attribute__((weak)) uint64_t hostrpc_assign_buffer(
-    hsa_agent_t, hsa_queue_t *, uint32_t DeviceId,
-    hsa_amd_memory_pool_t HostMemoryPool, hsa_amd_memory_pool_t DevMemoryPool) {
-  // FIXME:THIS SHOULD BE HARD FAIL
-  DP("Warning: Attempting to assign hostrpc to device %u, but hostrpc library "
-     "missing\n",
-     DeviceId);
-  return 0;
-}
-}
 
 /// Forward declarations for all specialized data structures.
 struct AMDGPUKernelTy;
@@ -301,12 +248,12 @@ struct AMDGPUDeviceImageTy;
 struct AMDGPUMemoryManagerTy;
 struct AMDGPUMemoryPoolTy;
 
-namespace utils {
+namespace hsa_utils {
 
 /// Iterate elements using an HSA iterate function. Do not use this function
 /// directly but the specialized ones below instead.
 template <typename ElemTy, typename IterFuncTy, typename CallbackTy>
-hsa_status_t iterate(IterFuncTy Func, CallbackTy Cb) {
+static hsa_status_t iterate(IterFuncTy Func, CallbackTy Cb) {
   auto L = [](ElemTy Elem, void *Data) -> hsa_status_t {
     CallbackTy *Unwrapped = static_cast<CallbackTy *>(Data);
     return (*Unwrapped)(Elem);
@@ -318,7 +265,8 @@ hsa_status_t iterate(IterFuncTy Func, CallbackTy Cb) {
 /// use this function directly but the specialized ones below instead.
 template <typename ElemTy, typename IterFuncTy, typename IterFuncArgTy,
           typename CallbackTy>
-hsa_status_t iterate(IterFuncTy Func, IterFuncArgTy FuncArg, CallbackTy Cb) {
+static hsa_status_t iterate(IterFuncTy Func, IterFuncArgTy FuncArg,
+                            CallbackTy Cb) {
   auto L = [](ElemTy Elem, void *Data) -> hsa_status_t {
     CallbackTy *Unwrapped = static_cast<CallbackTy *>(Data);
     return (*Unwrapped)(Elem);
@@ -330,7 +278,8 @@ hsa_status_t iterate(IterFuncTy Func, IterFuncArgTy FuncArg, CallbackTy Cb) {
 /// use this function directly but the specialized ones below instead.
 template <typename Elem1Ty, typename Elem2Ty, typename IterFuncTy,
           typename IterFuncArgTy, typename CallbackTy>
-hsa_status_t iterate(IterFuncTy Func, IterFuncArgTy FuncArg, CallbackTy Cb) {
+static hsa_status_t iterate(IterFuncTy Func, IterFuncArgTy FuncArg,
+                            CallbackTy Cb) {
   auto L = [](Elem1Ty Elem1, Elem2Ty Elem2, void *Data) -> hsa_status_t {
     CallbackTy *Unwrapped = static_cast<CallbackTy *>(Data);
     return (*Unwrapped)(Elem1, Elem2);
@@ -339,50 +288,47 @@ hsa_status_t iterate(IterFuncTy Func, IterFuncArgTy FuncArg, CallbackTy Cb) {
 }
 
 /// Iterate agents.
-template <typename CallbackTy> Error iterateAgents(CallbackTy Callback) {
+template <typename CallbackTy> static Error iterateAgents(CallbackTy Callback) {
   hsa_status_t Status = iterate<hsa_agent_t>(hsa_iterate_agents, Callback);
-  return Plugin::check(Status, "Error in hsa_iterate_agents: %s");
+  return Plugin::check(Status, "error in hsa_iterate_agents: %s");
 }
 
 /// Iterate ISAs of an agent.
 template <typename CallbackTy>
-Error iterateAgentISAs(hsa_agent_t Agent, CallbackTy Cb) {
+static Error iterateAgentISAs(hsa_agent_t Agent, CallbackTy Cb) {
   hsa_status_t Status = iterate<hsa_isa_t>(hsa_agent_iterate_isas, Agent, Cb);
-  return Plugin::check(Status, "Error in hsa_agent_iterate_isas: %s");
+  return Plugin::check(Status, "error in hsa_agent_iterate_isas: %s");
 }
 
 /// Iterate memory pools of an agent.
 template <typename CallbackTy>
-Error iterateAgentMemoryPools(hsa_agent_t Agent, CallbackTy Cb) {
+static Error iterateAgentMemoryPools(hsa_agent_t Agent, CallbackTy Cb) {
   hsa_status_t Status = iterate<hsa_amd_memory_pool_t>(
       hsa_amd_agent_iterate_memory_pools, Agent, Cb);
   return Plugin::check(Status,
-                       "Error in hsa_amd_agent_iterate_memory_pools: %s");
+                       "error in hsa_amd_agent_iterate_memory_pools: %s");
 }
-
-extern "C" uint64_t hostrpc_assign_buffer(hsa_agent_t Agent, hsa_queue_t *ThisQ,
-                                          uint32_t DeviceId,
-                                          hsa_amd_memory_pool_t HostMemoryPool,
-                                          hsa_amd_memory_pool_t DevMemoryPool);
-extern "C" hsa_status_t hostrpc_terminate();
 
 /// Dispatches an asynchronous memory copy.
 /// Enables different SDMA engines for the dispatch in a round-robin fashion.
-Error asyncMemCopy(bool UseMultipleSdmaEngines, void *Dst, hsa_agent_t DstAgent,
-                   const void *Src, hsa_agent_t SrcAgent, size_t Size,
-                   uint32_t NumDepSignals, const hsa_signal_t *DepSignals,
-                   hsa_signal_t CompletionSignal) {
+static Error asyncMemCopy(bool UseMultipleSdmaEngines, void *Dst,
+                          hsa_agent_t DstAgent, const void *Src,
+                          hsa_agent_t SrcAgent, size_t Size,
+                          uint32_t NumDepSignals,
+                          const hsa_signal_t *DepSignals,
+                          hsa_signal_t CompletionSignal) {
   if (!UseMultipleSdmaEngines) {
     hsa_status_t S =
         hsa_amd_memory_async_copy(Dst, DstAgent, Src, SrcAgent, Size,
                                   NumDepSignals, DepSignals, CompletionSignal);
-    return Plugin::check(S, "Error in hsa_amd_memory_async_copy: %s");
+    return Plugin::check(S, "error in hsa_amd_memory_async_copy: %s");
   }
 
 // This solution is probably not the best
 #if !(HSA_AMD_INTERFACE_VERSION_MAJOR >= 1 &&                                  \
       HSA_AMD_INTERFACE_VERSION_MINOR >= 2)
-  return Plugin::error("Async copy on selected SDMA requires ROCm 5.7");
+  return Plugin::error(ErrorCode::UNSUPPORTED,
+                       "async copy on selected SDMA requires ROCm 5.7");
 #else
   static std::atomic<int> SdmaEngine{1};
 
@@ -402,13 +348,13 @@ Error asyncMemCopy(bool UseMultipleSdmaEngines, void *Dst, hsa_agent_t DstAgent,
   LocalSdmaEngine = (LocalSdmaEngine << 1) % 3;
   SdmaEngine.store(LocalSdmaEngine, std::memory_order_relaxed);
 
-  return Plugin::check(S, "Error in hsa_amd_memory_async_copy_on_engine: %s");
+  return Plugin::check(S, "error in hsa_amd_memory_async_copy_on_engine: %s");
 #endif
 }
 
-Error getTargetTripleAndFeatures(hsa_agent_t Agent,
-                                 SmallVector<SmallString<32>> &Targets) {
-  auto Err = utils::iterateAgentISAs(Agent, [&](hsa_isa_t ISA) {
+static Error getTargetTripleAndFeatures(hsa_agent_t Agent,
+                                        SmallVector<SmallString<32>> &Targets) {
+  auto Err = hsa_utils::iterateAgentISAs(Agent, [&](hsa_isa_t ISA) {
     uint32_t Length;
     hsa_status_t Status;
     Status = hsa_isa_get_info_alt(ISA, HSA_ISA_INFO_NAME_LENGTH, &Length);
@@ -430,7 +376,7 @@ Error getTargetTripleAndFeatures(hsa_agent_t Agent,
   return Err;
 }
 
-} // namespace utils
+} // namespace hsa_utils
 
 /// Utility class representing generic resource references to AMDGPU resources.
 template <typename ResourceTy>
@@ -454,7 +400,8 @@ struct AMDGPUResourceRef : public GenericDeviceResourceRef {
   /// reference must be to a valid resource before calling to this function.
   Error destroy(GenericDeviceTy &Device) override {
     if (!Resource)
-      return Plugin::error("Destroying an invalid resource");
+      return Plugin::error(ErrorCode::INVALID_ARGUMENT,
+                           "destroying an invalid resource");
 
     if (auto Err = Resource->deinit())
       return Err;
@@ -521,13 +468,13 @@ struct AMDGPUMemoryPoolTy {
   Error allocate(size_t Size, void **PtrStorage) {
     hsa_status_t Status =
         hsa_amd_memory_pool_allocate(MemoryPool, Size, 0, PtrStorage);
-    return Plugin::check(Status, "Error in hsa_amd_memory_pool_allocate: %s");
+    return Plugin::check(Status, "error in hsa_amd_memory_pool_allocate: %s");
   }
 
   /// Return memory to the memory pool.
   Error deallocate(void *Ptr) {
     hsa_status_t Status = hsa_amd_memory_pool_free(Ptr);
-    return Plugin::check(Status, "Error in hsa_amd_memory_pool_free: %s");
+    return Plugin::check(Status, "error in hsa_amd_memory_pool_free: %s");
   }
 
   /// Returns if the \p Agent can access the memory pool.
@@ -552,14 +499,15 @@ struct AMDGPUMemoryPoolTy {
       // The agent is not allowed to access the memory pool in any case. Do not
       // continue because otherwise it result in undefined behavior.
       if (Access == HSA_AMD_MEMORY_POOL_ACCESS_NEVER_ALLOWED)
-        return Plugin::error("An agent is not allowed to access a memory pool");
+        return Plugin::error(ErrorCode::INVALID_VALUE,
+                             "an agent is not allowed to access a memory pool");
     }
 #endif
 
     // We can access but it is disabled by default. Enable the access then.
     hsa_status_t Status =
         hsa_amd_agents_allow_access(Agents.size(), Agents.data(), nullptr, Ptr);
-    return Plugin::check(Status, "Error in hsa_amd_agents_allow_access: %s");
+    return Plugin::check(Status, "error in hsa_amd_agents_allow_access: %s");
   }
 
   Error zeroInitializeMemory(void *Ptr, size_t Size) {
@@ -574,7 +522,7 @@ struct AMDGPUMemoryPoolTy {
   Error getAttr(hsa_amd_memory_pool_info_t Kind, Ty &Value) const {
     hsa_status_t Status;
     Status = hsa_amd_memory_pool_get_info(MemoryPool, Kind, &Value);
-    return Plugin::check(Status, "Error in hsa_amd_memory_pool_get_info: %s");
+    return Plugin::check(Status, "error in hsa_amd_memory_pool_get_info: %s");
   }
 
   template <typename Ty>
@@ -590,7 +538,7 @@ struct AMDGPUMemoryPoolTy {
     Status =
         hsa_amd_agent_memory_pool_get_info(Agent, MemoryPool, Kind, &Value);
     return Plugin::check(Status,
-                         "Error in hsa_amd_agent_memory_pool_get_info: %s");
+                         "error in hsa_amd_agent_memory_pool_get_info: %s");
   }
 
 private:
@@ -611,11 +559,22 @@ struct AMDGPUMemoryManagerTy : public DeviceAllocatorTy {
 
   /// Create an empty memory manager.
   AMDGPUMemoryManagerTy(AMDGPUPluginTy &Plugin)
-      : Plugin(Plugin), MemoryPool(nullptr), MemoryManager(nullptr) {}
+      : Plugin(Plugin), MemoryPool(nullptr), MemoryManager(nullptr),
+        OMPX_AMDMemoryMgrThreshold("OMPX_AMD_MEMORY_MANAGER_THRESHOLD_EXP_2",
+                                   30) {}
 
   /// Initialize the memory manager from a memory pool.
   Error init(AMDGPUMemoryPoolTy &MemoryPool) {
-    const uint32_t Threshold = 1 << 30;
+    // Sanity check to ensure user input will not overflow the variable.
+    if (OMPX_AMDMemoryMgrThreshold > sizeof(size_t) * CHAR_BIT - 1) {
+      // if user input is too large, trim it down to the upper limit of size_t.
+      OMPX_AMDMemoryMgrThreshold = sizeof(size_t) * CHAR_BIT - 1;
+      DP("User input for AMDGPUMemoryManager threshhold is too larget and was "
+         "trimmed to: %u\n",
+         OMPX_AMDMemoryMgrThreshold.get());
+    }
+    const size_t Threshold = 1UL << OMPX_AMDMemoryMgrThreshold;
+    DP("AMDGPUMemoryManager threshhold was set to: %zu B\n", Threshold);
     this->MemoryManager = new MemoryManagerTy(*this, Threshold);
     this->MemoryPool = &MemoryPool;
     return Plugin::success();
@@ -638,19 +597,23 @@ struct AMDGPUMemoryManagerTy : public DeviceAllocatorTy {
     assert(MemoryManager && "Invalid memory manager");
     assert(PtrStorage && "Invalid pointer storage");
 
-    *PtrStorage = MemoryManager->allocate(Size, nullptr);
-    if (*PtrStorage == nullptr)
-      return Plugin::error("Failure to allocate from AMDGPU memory manager");
+    auto PtrStorageOrErr = MemoryManager->allocate(Size, nullptr);
+    if (!PtrStorageOrErr)
+      return PtrStorageOrErr.takeError();
+
+    *PtrStorage = *PtrStorageOrErr;
+    if (Size && *PtrStorage == nullptr)
+      return Plugin::error(ErrorCode::OUT_OF_RESOURCES,
+                           "failure to allocate from AMDGPU memory manager");
 
     return Plugin::success();
   }
 
   /// Release an allocation to be reused.
   Error deallocate(void *Ptr) {
-    assert(Ptr && "Invalid pointer");
-
     if (MemoryManager->free(Ptr))
-      return Plugin::error("Failure to deallocate from AMDGPU memory manager");
+      return Plugin::error(ErrorCode::UNKNOWN,
+                           "failure to deallocate from AMDGPU memory manager");
 
     return Plugin::success();
   }
@@ -658,15 +621,12 @@ struct AMDGPUMemoryManagerTy : public DeviceAllocatorTy {
 private:
   /// Allocation callback that will be called once the memory manager does not
   /// have more previously allocated buffers.
-  void *allocate(size_t Size, void *HstPtr, TargetAllocTy Kind) override;
+  Expected<void *> allocate(size_t Size, void *HstPtr,
+                            TargetAllocTy Kind) override;
 
-  /// Deallocation callack that will be called by the memory manager.
-  int free(void *TgtPtr, TargetAllocTy Kind) override {
-    if (auto Err = MemoryPool->deallocate(TgtPtr)) {
-      consumeError(std::move(Err));
-      return OFFLOAD_FAIL;
-    }
-    return OFFLOAD_SUCCESS;
+  /// Deallocation callback that will be called by the memory manager.
+  Error free(void *TgtPtr, TargetAllocTy Kind) override {
+    return MemoryPool->deallocate(TgtPtr);
   }
 
   /// The underlying plugin that owns this memory manager.
@@ -677,14 +637,20 @@ private:
 
   /// Reference to the actual memory manager.
   MemoryManagerTy *MemoryManager;
+
+  /// Set the threshold for the size of the allocated memory
+  /// that will be handled by AMDGPUMemoryMangerTy. The input
+  /// value should be the exponent in the expression (2^n).
+  /// e.g input 10 => 2 ^ 10 = 1KB
+  UInt32Envar OMPX_AMDMemoryMgrThreshold;
 };
 
 /// Class implementing the AMDGPU device images' properties.
 struct AMDGPUDeviceImageTy : public DeviceImageTy {
   /// Create the AMDGPU image with the id and the target image pointer.
   AMDGPUDeviceImageTy(int32_t ImageId, GenericDeviceTy &Device,
-                      const __tgt_device_image *TgtImage)
-      : DeviceImageTy(ImageId, Device, TgtImage) {}
+                      std::unique_ptr<MemoryBuffer> &&TgtImage)
+      : DeviceImageTy(ImageId, Device, std::move(TgtImage)) {}
 
   /// Prepare and load the executable corresponding to the image.
   Error loadExecutable(const AMDGPUDeviceTy &Device);
@@ -692,11 +658,7 @@ struct AMDGPUDeviceImageTy : public DeviceImageTy {
   /// Unload the executable.
   Error unloadExecutable() {
     hsa_status_t Status = hsa_executable_destroy(Executable);
-    if (auto Err = Plugin::check(Status, "Error in hsa_executable_destroy: %s"))
-      return Err;
-
-    Status = hsa_code_object_destroy(CodeObject);
-    return Plugin::check(Status, "Error in hsa_code_object_destroy: %s");
+    return Plugin::check(Status, "error in hsa_executable_destroy: %s");
   }
 
   /// Get the executable.
@@ -710,7 +672,7 @@ struct AMDGPUDeviceImageTy : public DeviceImageTy {
   findDeviceSymbol(GenericDeviceTy &Device, StringRef SymbolName) const;
 
   /// Get additional info for kernel, e.g., register spill counts
-  std::optional<utils::KernelMetaDataTy>
+  std::optional<offloading::amdgpu::AMDGPUKernelMetaData>
   getKernelInfo(StringRef Identifier) const {
     auto It = KernelInfoMap.find(Identifier);
 
@@ -724,13 +686,12 @@ struct AMDGPUDeviceImageTy : public DeviceImageTy {
   bool hasDeviceSymbol(GenericDeviceTy &Device, StringRef SymbolName) const;
 
 private:
-  /// The exectuable loaded on the agent.
+  /// The executable loaded on the agent.
   hsa_executable_t Executable;
-  hsa_code_object_t CodeObject;
 #if SANITIZER_AMDGPU
   hsa_code_object_reader_t CodeObjectReader;
 #endif
-  StringMap<utils::KernelMetaDataTy> KernelInfoMap;
+  StringMap<offloading::amdgpu::AMDGPUKernelMetaData> KernelInfoMap;
   uint16_t ELFABIVersion;
 };
 
@@ -740,9 +701,13 @@ struct AMDGPUKernelTy : public GenericKernelTy {
   /// Create an AMDGPU kernel with a name and an execution mode.
   AMDGPUKernelTy(const char *Name, GenericGlobalHandlerTy &Handler)
       : GenericKernelTy(Name),
-        OMPX_DisableHostExec("LIBOMPTARGET_DISABLE_HOST_EXEC", false),
-        ServiceThreadDeviceBufferGlobal("service_thread_buf", sizeof(uint64_t)),
-        HostServiceBufferHandler(Handler) {}
+        OMPX_SPMDOccupancyBasedOpt("OMPX_SPMD_OCCUPANCY_BASED_OPT", false),
+        OMPX_GenericSPMDOccupancyBasedOpt(
+            "OMPX_GENERIC_SPMD_OCCUPANCY_BASED_OPT", false),
+        OMPX_BigJumpLoopOccupancyBasedOpt(
+            "OMPX_BIGJUMPLOOP_OCCUPANCY_BASED_OPT", false),
+        OMPX_XTeamReductionOccupancyBasedOpt(
+            "OMPX_XTEAMREDUCTION_OCCUPANCY_BASED_OPT", false) {}
 
   /// Initialize the AMDGPU kernel.
   Error initImpl(GenericDeviceTy &Device, DeviceImageTy &Image) override {
@@ -773,13 +738,14 @@ struct AMDGPUKernelTy : public GenericKernelTy {
     for (auto &Info : RequiredInfos) {
       Status = hsa_executable_symbol_get_info(Symbol, Info.first, Info.second);
       if (auto Err = Plugin::check(
-              Status, "Error in hsa_executable_symbol_get_info: %s"))
+              Status, "error in hsa_executable_symbol_get_info: %s"))
         return Err;
     }
 
     // Make sure it is a kernel symbol.
     if (SymbolType != HSA_SYMBOL_KIND_KERNEL)
-      return Plugin::error("Symbol %s is not a kernel function");
+      return Plugin::error(ErrorCode::INVALID_BINARY,
+                           "symbol %s is not a kernel function");
 
     // TODO: Read the kernel descriptor for the max threads per block. May be
     // read from the image.
@@ -813,7 +779,7 @@ struct AMDGPUKernelTy : public GenericKernelTy {
     }
 
     ImplicitArgsSize =
-        utils::getImplicitArgsSize(AMDImage.getELFABIVersion()); // COV 5 patch
+        hsa_utils::getImplicitArgsSize(AMDImage.getELFABIVersion()); // COV 5 patch
 
     DP("ELFABIVersion: %d\n", AMDImage.getELFABIVersion());
 
@@ -823,32 +789,39 @@ struct AMDGPUKernelTy : public GenericKernelTy {
       INFO(OMP_INFOTYPE_PLUGIN_KERNEL, Device.getDeviceId(),
            "Could not read extra information for kernel %s.", getName());
 
-    NeedsHostServices =
-        AMDImage.hasDeviceSymbol(Device, "__needs_host_services");
-    if (NeedsHostServices && !OMPX_DisableHostExec) {
-      // GenericGlobalHandlerTy * GHandler = Plugin::createGlobalHandler();
-      if (auto Err = HostServiceBufferHandler.getGlobalMetadataFromDevice(
-              Device, AMDImage, ServiceThreadDeviceBufferGlobal))
-        return Err;
-    }
+    HasRPC = AMDImage.hasDeviceSymbol(Device, "__llvm_rpc_client");
 
     return Plugin::success();
   }
 
   /// Launch the AMDGPU kernel function.
-  Error launchImpl(GenericDeviceTy &GenericDevice, uint32_t NumThreads,
-                   uint64_t NumBlocks, KernelArgsTy &KernelArgs,
+  Error launchImpl(GenericDeviceTy &GenericDevice, uint32_t NumThreads[3],
+                   uint32_t NumBlocks[3], KernelArgsTy &KernelArgs,
                    KernelLaunchParamsTy LaunchParams,
                    AsyncInfoWrapperTy &AsyncInfoWrapper) const override;
 
+  /// Return maximum block size for maximum occupancy
+  ///
+  /// TODO: This needs to be implemented for amdgpu
+  Expected<uint64_t> maxGroupSize(GenericDeviceTy &GenericDevice,
+                                  uint64_t DynamicMemSize) const override {
+    return Plugin::error(
+        ErrorCode::UNSUPPORTED,
+        "occupancy calculations for AMDGPU are not yet implemented");
+  }
+
   /// Print more elaborate kernel launch info for AMDGPU
   Error printLaunchInfoDetails(GenericDeviceTy &GenericDevice,
-                               KernelArgsTy &KernelArgs, uint32_t NumThreads,
-                               uint64_t NumBlocks) const override;
+                               KernelArgsTy &KernelArgs, uint32_t NumThreads[3],
+                               uint32_t NumBlocks[3], int64_t MultiDeviceLB,
+                               int64_t MultiDeviceUB) const override;
   /// Print the "old" AMD KernelTrace single-line format
   void printAMDOneLineKernelTrace(GenericDeviceTy &GenericDevice,
-                                  KernelArgsTy &KernelArgs, uint32_t NumThreads,
-                                  uint64_t NumBlocks) const;
+                                  KernelArgsTy &KernelArgs,
+                                  uint32_t NumThreads[3], uint32_t NumBlocks[3],
+                                  int64_t MultiDeviceLB,
+                                  int64_t MultiDeviceUB) const;
+
   /// Get group and private segment kernel size.
   uint32_t getGroupSize() const { return GroupSize; }
   uint32_t getPrivateSize() const { return PrivateSize; }
@@ -857,15 +830,31 @@ struct AMDGPUKernelTy : public GenericKernelTy {
   /// Get the HSA kernel object representing the kernel function.
   uint64_t getKernelObject() const { return KernelObject; }
 
-  /// Get the size of implicitargs based on the code object version
-  /// @return 56 for cov4 and 256 for cov5
+  /// Get the size of implicitargs based on the code object version.
   uint32_t getImplicitArgsSize() const { return ImplicitArgsSize; }
 
   /// Indicates whether or not we need to set up our own private segment size.
   bool usesDynamicStack() const { return DynamicStack; }
 
-  /// Envar to disable host-exec thread creation.
-  BoolEnvar OMPX_DisableHostExec;
+  bool isValidBlockSize(uint32_t BlockSize) const override {
+    return BlockSize <= ConstWGSize;
+  }
+
+  uint32_t getKernelLaunchId() const { return KernelLaunchId; }
+
+  void setKernelLaunchId(uint32_t Id) const { KernelLaunchId = Id; }
+
+  /// Envar to enable occupancy-based optimization for SPMD kernel.
+  BoolEnvar OMPX_SPMDOccupancyBasedOpt;
+
+  /// Envar to enable occupancy-based optimization for generic SPMD kernel.
+  BoolEnvar OMPX_GenericSPMDOccupancyBasedOpt;
+
+  /// Envar to enable occupancy-based optimization for big jump loop.
+  BoolEnvar OMPX_BigJumpLoopOccupancyBasedOpt;
+
+  /// Envar to enable occupancy-based optimization for cross team reduction.
+  BoolEnvar OMPX_XTeamReductionOccupancyBasedOpt;
 
 private:
   /// The kernel object to execute.
@@ -877,22 +866,19 @@ private:
   uint32_t PrivateSize;
   bool DynamicStack;
 
+  /// Device init sets this to true if image has symbol indicating that RPC
+  /// service threads are used in this image.  Only used for trace display.
+  bool HasRPC;
+
   /// The size of implicit kernel arguments.
   uint32_t ImplicitArgsSize;
 
   /// Additional Info for the AMD GPU Kernel
-  std::optional<utils::KernelMetaDataTy> KernelInfo;
+  std::optional<offloading::amdgpu::AMDGPUKernelMetaData> KernelInfo;
   /// CodeGen generate WGSize
   uint16_t ConstWGSize;
 
-  /// Indicate whether this Kernel requires host services
-  bool NeedsHostServices;
-
-  /// Global for host service device thread buffer
-  GlobalTy ServiceThreadDeviceBufferGlobal;
-
-  /// Global handler for hostservices buffer
-  GenericGlobalHandlerTy &HostServiceBufferHandler;
+  static thread_local uint32_t KernelLaunchId;
 
   /// Lower number of threads if tripcount is low. This should produce
   /// a larger number of teams if allowed by other constraints.
@@ -944,11 +930,27 @@ private:
     return std::make_pair(true, NumThreads);
   }
 
+  /// Optimize the number of teams based on the max occupancy value.
+  uint64_t OptimizeNumTeamsBaseOccupancy(GenericDeviceTy &GenericDevice,
+                                         uint32_t NumThreads) const {
+    unsigned NumWavesPerTeam =
+        divideCeil(NumThreads, GenericDevice.getWarpSize());
+    unsigned TotalWavesPerCU = MaxOccupancy * llvm::omp::amdgpu_arch::SIMDPerCU;
+    // Per device
+    unsigned TotalWavesPerDevice =
+        TotalWavesPerCU * GenericDevice.getNumComputeUnits();
+    unsigned NumTeams = divideCeil(TotalWavesPerDevice, NumWavesPerTeam);
+
+    return static_cast<uint64_t>(NumTeams);
+  }
+
   /// Get the number of threads and blocks for the kernel based on the
   /// user-defined threads and block clauses.
   uint32_t getNumThreads(GenericDeviceTy &GenericDevice,
                          uint32_t ThreadLimitClause[3]) const override {
-    assert(ThreadLimitClause[1] == 0 && ThreadLimitClause[2] == 0 &&
+    assert(!isBareMode() && "bare kernel should not call this function");
+
+    assert(ThreadLimitClause[1] == 1 && ThreadLimitClause[2] == 1 &&
            "Multi dimensional launch not supported yet.");
 
     // Honor OMP_TEAMS_THREAD_LIMIT environment variable and
@@ -969,7 +971,7 @@ private:
           TeamsThreadLimitEnvVar <= static_cast<int32_t>(ConstWGSize))
         return llvm::omp::getBlockSizeAsPowerOfTwo(TeamsThreadLimitEnvVar);
       if (ThreadLimitClause[0] > 0 && ThreadLimitClause[0] != (uint32_t)-1 &&
-          ThreadLimitClause[0] <= static_cast<int32_t>(ConstWGSize))
+          ThreadLimitClause[0] <= static_cast<uint32_t>(ConstWGSize))
         return llvm::omp::getBlockSizeAsPowerOfTwo(ThreadLimitClause[0]);
       assert(((ConstWGSize & (ConstWGSize - 1)) == 0) &&
              "XTeam Reduction blocksize must be a power of two");
@@ -994,11 +996,13 @@ private:
                                               ? ThreadLimitClause[0]
                                               : PreferredNumThreads);
   }
-  uint64_t getNumBlocks(GenericDeviceTy &GenericDevice,
+  uint32_t getNumBlocks(GenericDeviceTy &GenericDevice,
                         uint32_t NumTeamsClause[3], uint64_t LoopTripCount,
                         uint32_t &NumThreads,
                         bool IsNumThreadsFromUser) const override {
-    assert(NumTeamsClause[1] == 0 && NumTeamsClause[2] == 0 &&
+    assert(!isBareMode() && "bare kernel should not call this function");
+
+    assert(NumTeamsClause[1] == 1 && NumTeamsClause[2] == 1 &&
            "Multi dimensional launch not supported yet.");
 
     const auto getNumGroupsFromThreadsAndTripCount =
@@ -1017,6 +1021,7 @@ private:
         (NumThreads - 1) / GenericDevice.getWarpSize() + 1;
 
     if (isBigJumpLoopMode()) {
+      int32_t NumTeamsEnvVar = GenericDevice.getOMPNumTeams();
       uint64_t NumGroups = 1;
       // Cannot assert a non-zero tripcount. Instead, launch with 1 team if the
       // tripcount is indeed zero.
@@ -1025,8 +1030,8 @@ private:
             getNumGroupsFromThreadsAndTripCount(LoopTripCount, NumThreads);
 
       // Honor OMP_NUM_TEAMS environment variable for BigJumpLoop kernel type.
-      int32_t NumTeamsEnvVar = GenericDevice.getOMPNumTeams();
-      if (NumTeamsEnvVar > 0 && NumTeamsEnvVar <= GenericDevice.getBlockLimit())
+      if (NumTeamsEnvVar > 0 && static_cast<uint32_t>(NumTeamsEnvVar) <=
+                                    GenericDevice.getBlockLimit())
         NumGroups = std::min(static_cast<uint64_t>(NumTeamsEnvVar), NumGroups);
       // Honor num_teams clause but lower it if tripcount dictates.
       else if (NumTeamsClause[0] > 0 &&
@@ -1035,13 +1040,22 @@ private:
             std::min(static_cast<uint64_t>(NumTeamsClause[0]), NumGroups);
       } else {
         // num_teams clause is not specified. Choose lower of tripcount-based
-        // num-groups and a value that maximizes occupancy. At this point, aim
-        // to have 16 wavefronts in a CU. Allow for override with envar.
-        uint64_t MaxOccupancyFactor =
-            GenericDevice.getOMPXBigJumpLoopTeamsPerCU() > 0
-                ? GenericDevice.getOMPXBigJumpLoopTeamsPerCU()
-                : 16 / NumWavesInGroup;
-        NumGroups = std::min(NumGroups, MaxOccupancyFactor * DeviceNumCUs);
+        // NumGroups and a value determined as follows:
+        // - If the number of teams per CU is specified by the user with the
+        //   envar LIBOMPTARGET_AMDGPU_BIG_JUMP_LOOP_TEAMS_PER_CU, compute
+        //   NumGroups from that specified value. This envar is OFF by default.
+        // - Otherwise, use the max total teams specified with the envar
+        ///  LIBOMPTARGET_AMDGPU_BIG_JUMP_LOOP_MAX_TOTAL_TEAMS.
+        //   This envar is used by default with 1M as the default value.
+        if (GenericDevice.getOMPXBigJumpLoopTeamsPerCU() > 0) {
+          NumGroups =
+              std::min(NumGroups, GenericDevice.getOMPXBigJumpLoopTeamsPerCU() *
+                                      DeviceNumCUs);
+        } else {
+          NumGroups = std::min(
+              NumGroups, static_cast<uint64_t>(
+                             GenericDevice.getOMPXBigJumpLoopMaxTotalTeams()));
+        }
 
         // If the user specifies a number of teams for low trip count loops,
         // honor it.
@@ -1051,7 +1065,16 @@ private:
           NumGroups = LowTripCountBlocks;
         }
       }
-      return NumGroups;
+      // If envar OMPX_BIGJUMPLOOP_OCCUPANCY_BASED_OPT is set and no num_teams
+      // clause or OMP_NUM_TEAMS is specified, optimize the number of teams
+      // based on occupancy value.
+      if (OMPX_BigJumpLoopOccupancyBasedOpt && NumTeamsEnvVar == 0 &&
+          NumTeamsClause[0] == 0) {
+        return std::min(NumGroups, OptimizeNumTeamsBaseOccupancy(GenericDevice,
+                                                                 NumThreads));
+      }
+      return std::min(NumGroups,
+                      static_cast<uint64_t>(GenericDevice.getBlockLimit()));
     }
 
     if (isXTeamReductionsMode()) {
@@ -1059,6 +1082,12 @@ private:
       uint64_t NumGroups = DeviceNumCUs;
       // The number of teams must not exceed this upper limit.
       uint64_t MaxNumGroups = NumGroups;
+      // Honor OMP_NUM_TEAMS environment variable for XteamReduction kernel
+      // type, if possible.
+      int32_t NumTeamsEnvVar = GenericDevice.getOMPNumTeams();
+      // CU mulitiplier from envar.
+      uint32_t EnvarCUMultiplier = GenericDevice.getXTeamRedTeamsPerCU();
+
       if (GenericDevice.isFastReductionEnabled()) {
         // When fast reduction is enabled, the number of teams is capped by
         // the MaxCUMultiplier constant.
@@ -1076,9 +1105,15 @@ private:
         MaxNumGroups = DeviceNumCUs * CUMultiplier;
       }
 
-      // Honor OMP_NUM_TEAMS environment variable for XteamReduction kernel
-      // type, if possible.
-      int32_t NumTeamsEnvVar = GenericDevice.getOMPNumTeams();
+      // If envar OMPX_XTEAMREDUCTION_OCCUPANCY_BASED_OPT is set and no
+      // OMP_NUM_TEAMS or num_teams clause is specified, optimize the num of
+      // teams based on occupancy value.
+      if (OMPX_XTeamReductionOccupancyBasedOpt && NumTeamsEnvVar == 0 &&
+          NumTeamsClause[0] == 0) {
+        uint64_t newNumTeams =
+            OptimizeNumTeamsBaseOccupancy(GenericDevice, NumThreads);
+        return std::min(newNumTeams, MaxNumGroups);
+      }
 
       // Prefer num_teams clause over environment variable. There is a corner
       // case where inspite of the presence of a num_teams clause, CodeGen
@@ -1089,8 +1124,8 @@ private:
           NumTeamsClause[0] <= GenericDevice.getBlockLimit()) {
         NumGroups =
             std::min(static_cast<uint64_t>(NumTeamsClause[0]), MaxNumGroups);
-      } else if (NumTeamsEnvVar > 0 &&
-                 NumTeamsEnvVar <= GenericDevice.getBlockLimit()) {
+      } else if (NumTeamsEnvVar > 0 && static_cast<uint32_t>(NumTeamsEnvVar) <=
+                                           GenericDevice.getBlockLimit()) {
         NumGroups =
             std::min(static_cast<uint64_t>(NumTeamsEnvVar), MaxNumGroups);
       } else {
@@ -1103,11 +1138,6 @@ private:
 
         // Compute desired number of groups in the absence of user input
         // based on a factor controlled by an integer env-var.
-        // 0: disabled (default)
-        // 1: If the number of waves is lower than the default, increase
-        // the number of teams proportionally. Ideally, this would be the
-        // default behavior.
-        // > 1: Use as the scaling factor for the number of teams.
         // Note that the upper bound is MaxNumGroups.
         uint32_t AdjustFactor =
             GenericDevice.getOMPXAdjustNumTeamsForXteamRedSmallBlockSize();
@@ -1122,6 +1152,12 @@ private:
           }
           NumGroups = DesiredNumGroups;
         }
+
+        // Prefer OMPX_AdjustNumTeamsForXteamRedSmallBlockSize over
+        // OMPX_XTeamRedTeamsPerCU.
+        if (AdjustFactor == 0 && EnvarCUMultiplier > 0)
+          NumGroups = DeviceNumCUs * EnvarCUMultiplier;
+
         NumGroups = std::min(NumGroups, MaxNumGroups);
         NumGroups = std::min(NumGroups, NumGroupsFromTripCount);
 
@@ -1145,6 +1181,9 @@ private:
       return std::min(NumTeamsClause[0], GenericDevice.getBlockLimit());
     }
 
+    // If envar OMPX_SPMD_OCCUPANCY_BASED_OPT is set and no OMP_NUM_TEAMS is
+    // specified, optimize the num of teams based on occupancy value.
+    int32_t NumTeamsEnvVar = GenericDevice.getOMPNumTeams();
     uint64_t TripCountNumBlocks = std::numeric_limits<uint64_t>::max();
     if (LoopTripCount > 0) {
       if (isSPMDMode()) {
@@ -1170,6 +1209,12 @@ private:
         // loop.
         TripCountNumBlocks = LoopTripCount;
       }
+    }
+
+    if (isSPMDMode() && OMPX_SPMDOccupancyBasedOpt && NumTeamsEnvVar == 0 &&
+        NumTeamsClause[0] == 0) {
+      return std::min(TripCountNumBlocks,
+                      OptimizeNumTeamsBaseOccupancy(GenericDevice, NumThreads));
     }
 
     auto getAdjustedDefaultNumBlocks =
@@ -1205,13 +1250,109 @@ private:
     }
 
     uint64_t PreferredNumBlocks = TripCountNumBlocks;
-    // If the loops are long running we rather reuse blocks than spawn too many.
-    if (GenericDevice.getReuseBlocksForHighTripCount())
+    // Occupancy-based setting overrides block reuse.
+    if (OMPX_GenericSPMDOccupancyBasedOpt && NumTeamsEnvVar == 0 && NumTeamsClause[0] == 0) {
+      PreferredNumBlocks =
+          std::min(PreferredNumBlocks,
+                   OptimizeNumTeamsBaseOccupancy(GenericDevice, NumThreads));
+    } else if (GenericDevice.getReuseBlocksForHighTripCount()) {
+      // If the loops are long running we rather reuse blocks than spawn too
+      // many.
       PreferredNumBlocks = std::min(TripCountNumBlocks, AdjustedNumBlocks);
+    }
+
+    // For most generic-SPMD kernels, the tripcount of the outer distribute-loop
+    // determines the number of teams launched. The tripcounts of the inner
+    // parallel loops should determine the number of threads launched. However,
+    // the inner loop tripcounts are unknown, so the runtime just launches 256
+    // threads by default. But if the inner loop tripcount is lower than 256,
+    // many of the threads in every workgroup are idle and just waste resources.
+    // In order to reduce this wastage, we reduce the blocksize upto the
+    // wavefront size if the tripcount is large enough to proportionally
+    // increase the number of teams. The increase in the number of teams is
+    // required to preserve the occupancy in case the inner loop tripcounts are
+    // larger than the blocksize. This change is done only when the user has not
+    // specified the number of teams or threads.
+    if (isGenericSPMDMode() && !IsNumThreadsFromUser &&
+        NumTeamsClause[0] == 0 && NumTeamsEnvVar == 0 &&
+        GenericDevice.getOMPXGenericSpmdUseSmallBlockSize()) {
+      uint64_t TmpPreferredNumBlocks = PreferredNumBlocks << 1;
+      while (TmpPreferredNumBlocks <= LoopTripCount &&
+             NumThreads > GenericDevice.getWarpSize()) {
+        NumThreads >>= 1;
+        PreferredNumBlocks = TmpPreferredNumBlocks;
+        TmpPreferredNumBlocks <<= 1;
+      }
+    }
     return std::min(PreferredNumBlocks,
                     (uint64_t)GenericDevice.getBlockLimit());
   }
+
+  /// Compute the occupancy with the constraint on the number of SGPRs
+  /// Follow the logic on the backend
+  /// Ref:
+  /// llvm-project/llvm/lib/Target/AMDGPU/Utils/AMDGPUBaseInfo.cpp:getOccupancyWithNumSGPRs
+  unsigned getOccupancyWithNumSGPRs(unsigned SGPRCount) const {
+
+    if (SGPRCount <= llvm::omp::amdgpu_arch::SGPRCountOccupancy10) {
+      return 10;
+    } else if (SGPRCount <= llvm::omp::amdgpu_arch::SGPRCountOccupancy9) {
+      return 9;
+    } else if (SGPRCount <= llvm::omp::amdgpu_arch::SGPRCountOccupancy8) {
+      return 8;
+    }
+    return 7;
+  }
+
+  /// Compute the occupancy with the constraint on LDS
+  /// Follow the logic on the backend
+  /// Ref:
+  /// llvm-project/llvm/lib/Target/AMDGPU/Utils/AMDGPUBaseInfo.cpp:getOccupancyWithLocalMemSize
+  unsigned getOccupancyWithLDS(GenericDeviceTy &GenericDevice,
+                               uint32_t GroupSegmentSize,
+                               unsigned MaxWavesPerEU,
+                               uint32_t MaxFlatWorkgroupSize) const {
+
+    unsigned MaxWorkgroupNum =
+        llvm::omp::amdgpu_arch::LocalMemorySize / GroupSegmentSize;
+
+    // workgroup size
+    unsigned ThreadsPerWorkgroup = MaxFlatWorkgroupSize;
+    unsigned WavesPerWorkgroup =
+        divideCeil(ThreadsPerWorkgroup, GenericDevice.getWarpSize());
+
+    unsigned MaxWavesPerCU = MaxWavesPerEU * llvm::omp::amdgpu_arch::SIMDPerCU;
+
+    // if a workgroup has just one wavefront, the max # of workgroup per CU is
+    // 40 if a workgroup has more than one wavefront, the max # of workgroup per
+    // CU is 16 https://github.com/ROCm/ROCm/issues/746#issuecomment-474656922
+    if (WavesPerWorkgroup <= 1) {
+      MaxWorkgroupNum = std::min(MaxWorkgroupNum, MaxWavesPerCU);
+    } else {
+      MaxWorkgroupNum =
+          std::min(MaxWorkgroupNum, MaxWavesPerCU / WavesPerWorkgroup);
+      MaxWorkgroupNum = std::min(MaxWorkgroupNum,
+                                 llvm::omp::amdgpu_arch::MaxWorkgroupNumPerCU);
+    }
+
+    // per SIMD
+    unsigned WaveNumByLDS = divideCeil(WavesPerWorkgroup * MaxWorkgroupNum,
+                                       llvm::omp::amdgpu_arch::SIMDPerCU);
+    WaveNumByLDS = std::min(WaveNumByLDS, MaxWavesPerEU);
+
+    return WaveNumByLDS;
+  }
+
+  /// Compute the max kernel occupancy for AMD GPU
+  unsigned computeMaxOccupancy(GenericDeviceTy &Device) const override;
+
+  /// Compute the achieved kernel occupancy for AMD GPU.
+  unsigned computeAchievedOccupancy(GenericDeviceTy &Device,
+                                    uint32_t numThreads,
+                                    uint64_t numTeams) const override;
 };
+
+thread_local uint32_t AMDGPUKernelTy::KernelLaunchId = 0;
 
 /// Class representing an HSA signal. Signals are used to define dependencies
 /// between asynchronous operations: kernel launches and memory transfers.
@@ -1224,19 +1365,19 @@ struct AMDGPUSignalTy {
   Error init(uint32_t InitialValue = 1) {
     hsa_status_t Status =
         hsa_amd_signal_create(InitialValue, 0, nullptr, 0, &HSASignal);
-    return Plugin::check(Status, "Error in hsa_signal_create: %s");
+    return Plugin::check(Status, "error in hsa_signal_create: %s");
   }
 
   /// Deinitialize the signal.
   Error deinit() {
     hsa_status_t Status = hsa_signal_destroy(HSASignal);
-    return Plugin::check(Status, "Error in hsa_signal_destroy: %s");
+    return Plugin::check(Status, "error in hsa_signal_destroy: %s");
   }
 
   /// Wait until the signal gets a zero value.
-  Error wait(const uint64_t ActiveTimeout = 0, RPCServerTy *RPCServer = nullptr,
+  Error wait(const uint64_t ActiveTimeout = 0,
              GenericDeviceTy *Device = nullptr) const {
-    if (ActiveTimeout && !RPCServer) {
+    if (ActiveTimeout) {
       hsa_signal_value_t Got = 1;
       Got = hsa_signal_wait_scacquire(HSASignal, HSA_SIGNAL_CONDITION_EQ, 0,
                                       ActiveTimeout, HSA_WAIT_STATE_ACTIVE);
@@ -1245,14 +1386,11 @@ struct AMDGPUSignalTy {
     }
 
     // If there is an RPC device attached to this stream we run it as a server.
-    uint64_t Timeout = RPCServer ? 8192 : UINT64_MAX;
-    auto WaitState = RPCServer ? HSA_WAIT_STATE_ACTIVE : HSA_WAIT_STATE_BLOCKED;
+    uint64_t Timeout = UINT64_MAX;
+    auto WaitState = HSA_WAIT_STATE_BLOCKED;
     while (hsa_signal_wait_scacquire(HSASignal, HSA_SIGNAL_CONDITION_EQ, 0,
-                                     Timeout, WaitState) != 0) {
-      if (RPCServer && Device)
-        if (auto Err = RPCServer->runServer(*Device))
-          return Err;
-    }
+                                     Timeout, WaitState) != 0)
+      ;
     return Plugin::success();
   }
 
@@ -1299,15 +1437,17 @@ struct AMDGPUQueueTy {
   AMDGPUQueueTy() : Queue(nullptr), Mutex(), NumUsers(0) {}
 
   /// Lazily initialize a new queue belonging to a specific agent.
-  Error init(hsa_agent_t Agent, int32_t QueueSize,
+  Error init(GenericDeviceTy &Device, hsa_agent_t Agent, int32_t QueueSize,
              int OMPX_EnableQueueProfiling) {
     if (Queue)
       return Plugin::success();
     hsa_status_t Status =
         hsa_queue_create(Agent, QueueSize, HSA_QUEUE_TYPE_MULTI, callbackError,
-                         nullptr, UINT32_MAX, UINT32_MAX, &Queue);
-    OMPT_IF_TRACING_OR_ENV_VAR_ENABLED(
-        hsa_amd_profiling_set_profiler_enabled(Queue, /*Enable=*/1););
+                         &Device, UINT32_MAX, UINT32_MAX, &Queue);
+    if (Device.Plugin.getProfiler()->shouldEnableProfiling() ||
+        OMPX_EnableQueueProfiling)
+      hsa_amd_profiling_set_profiler_enabled(Queue, /*Enable=*/1);
+
     return Plugin::check(Status, "Error in hsa_queue_create: %s");
   }
 
@@ -1318,7 +1458,7 @@ struct AMDGPUQueueTy {
     if (!Queue)
       return Plugin::success();
     hsa_status_t Status = hsa_queue_destroy(Queue);
-    return Plugin::check(Status, "Error in hsa_queue_destroy: %s");
+    return Plugin::check(Status, "error in hsa_queue_destroy: %s");
   }
 
   /// Returns the number of streams, this queue is currently assigned to.
@@ -1336,8 +1476,8 @@ struct AMDGPUQueueTy {
   /// Push a kernel launch to the queue. The kernel launch requires an output
   /// signal and can define an optional input signal (nullptr if none).
   Error pushKernelLaunch(const AMDGPUKernelTy &Kernel, void *KernelArgs,
-                         uint32_t NumThreads, uint64_t NumBlocks,
-                         uint32_t GroupSize, uint32_t StackSize,
+                         uint32_t NumThreads[3], uint32_t NumBlocks[3],
+                         uint32_t GroupSize, uint64_t StackSize,
                          AMDGPUSignalTy *OutputSignal,
                          AMDGPUSignalTy *InputSignal) {
     assert(OutputSignal && "Invalid kernel output signal");
@@ -1363,17 +1503,23 @@ struct AMDGPUQueueTy {
     assert(Packet && "Invalid packet");
 
     // The first 32 bits of the packet are written after the other fields
-    uint16_t Setup = UINT16_C(1) << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS;
-    Packet->workgroup_size_x = NumThreads;
-    Packet->workgroup_size_y = 1;
-    Packet->workgroup_size_z = 1;
+    uint16_t Dims = NumBlocks[2] * NumThreads[2] > 1
+                        ? 3
+                        : 1 + (NumBlocks[1] * NumThreads[1] != 1);
+    uint16_t Setup = UINT16_C(Dims)
+                     << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS;
+    Packet->workgroup_size_x = NumThreads[0];
+    Packet->workgroup_size_y = NumThreads[1];
+    Packet->workgroup_size_z = NumThreads[2];
     Packet->reserved0 = 0;
-    Packet->grid_size_x = NumBlocks * NumThreads;
-    Packet->grid_size_y = 1;
-    Packet->grid_size_z = 1;
+    Packet->grid_size_x = NumBlocks[0] * NumThreads[0];
+    Packet->grid_size_y = NumBlocks[1] * NumThreads[1];
+    Packet->grid_size_z = NumBlocks[2] * NumThreads[2];
     Packet->private_segment_size =
-        Kernel.usesDynamicStack() ? std::max(Kernel.getPrivateSize(), StackSize)
-                                  : Kernel.getPrivateSize();
+        Kernel.usesDynamicStack()
+            ? std::max(static_cast<uint64_t>(Kernel.getPrivateSize()),
+                       StackSize)
+            : Kernel.getPrivateSize();
     Packet->group_segment_size = GroupSize;
     Packet->kernel_object = Kernel.getKernelObject();
     Packet->kernarg_address = KernelArgs;
@@ -1499,11 +1645,9 @@ private:
     hsa_signal_store_relaxed(Queue->doorbell_signal, PacketId);
   }
 
-  /// Callack that will be called when an error is detected on the HSA queue.
-  static void callbackError(hsa_status_t Status, hsa_queue_t *Source, void *) {
-    auto Err = Plugin::check(Status, "Received error in queue %p: %s", Source);
-    FATAL_MESSAGE(1, "%s", toString(std::move(Err)).data());
-  }
+  /// Callback that will be called when an error is detected on the HSA queue.
+  static void callbackError(hsa_status_t Status, hsa_queue_t *Source,
+                            void *Data);
 
   /// The HSA queue.
   hsa_queue_t *Queue;
@@ -1534,6 +1678,7 @@ private:
     void *Dst;
     const void *Src;
     size_t Size;
+    size_t NumTimes;
   };
 
   /// Utility struct holding arguments for freeing buffers to memory managers.
@@ -1554,6 +1699,38 @@ private:
     AMDGPUSignalTy *Signal;
     double TicksToTime;
   };
+
+  /// Utility struct holding arguments for post kernel run processing.
+  struct PostKernelRunProcessingArgsTy {
+    hsa_agent_t Agent;
+    AMDGPUSignalTy *Signal;
+    double TicksToTime;
+    std::string KernelName;
+    uint32_t NumTeams;
+    uint32_t NumThreads;
+    KernelRunRecordTy *KernelRunRecords;
+
+    PostKernelRunProcessingArgsTy()
+        : Agent{0}, Signal(nullptr), TicksToTime(setTicksToTime()), NumTeams(0),
+          NumThreads(0), KernelRunRecords(nullptr) {}
+  };
+
+  struct KernelDurationTracingArgsTy {
+    hsa_agent_t Agent;
+    AMDGPUSignalTy *Signal;
+    double TicksToTime;
+    int32_t DeviceId;
+    uint32_t LaunchId;
+    uint32_t NumTeams;
+    uint32_t NumThreads;
+
+    KernelDurationTracingArgsTy()
+        : Agent{0}, Signal(nullptr), TicksToTime(setTicksToTime()), DeviceId(0),
+          LaunchId(0), NumTeams(0), NumThreads(0) {}
+  };
+
+  using AMDGPUStreamCallbackTy = Error(void *Data);
+
   /// The stream is composed of N stream's slots. The struct below represents
   /// the fields of each slot. Each slot has a signal and an optional action
   /// function. When appending an HSA asynchronous operation to the stream, one
@@ -1561,7 +1738,7 @@ private:
   /// operation's output signal is set to the consumed slot's signal. If there
   /// is a previous asynchronous operation on the previous slot, the HSA async
   /// operation's input signal is set to the signal of the previous slot. This
-  /// way, we obtain a chain of dependant async operations. The action is a
+  /// way, we obtain a chain of dependent async operations. The action is a
   /// function that will be executed eventually after the operation is
   /// completed, e.g., for releasing a buffer.
   struct StreamSlotTy {
@@ -1569,119 +1746,118 @@ private:
     /// operation as input signal.
     AMDGPUSignalTy *Signal;
 
-    /// The action that must be performed after the operation's completion. Set
+    /// The actions that must be performed after the operation's completion. Set
     /// to nullptr when there is no action to perform.
-    Error (*ActionFunction)(void *);
-
-    /// The OMPT action that must be performed after the operation's completion.
-    /// Set to nullptr when there is no action to perform.
-    Error (*OmptActionFunction)(void *);
+    llvm::SmallVector<AMDGPUStreamCallbackTy *> Callbacks;
 
     /// Space for the action's arguments. A pointer to these arguments is passed
     /// to the action function. Notice the space of arguments is limited.
-    union {
+    union ActionArgsTy {
       MemcpyArgsTy MemcpyArgs;
       ReleaseBufferArgsTy ReleaseBufferArgs;
       ReleaseSignalArgsTy ReleaseSignalArgs;
-    } ActionArgs;
+      void *CallbackArgs;
+      ProfilingInfoTy ProfilerArgs;
+    };
 
-#ifdef OMPT_SUPPORT
-    /// Space for the OMPT action's arguments. A pointer to these arguments is
-    /// passed to the action function.
-    OmptKernelTimingArgsAsyncTy OmptKernelTimingArgsAsync;
-#endif
+    llvm::SmallVector<ActionArgsTy> ActionArgs;
 
     /// Create an empty slot.
-    StreamSlotTy()
-        : Signal(nullptr), ActionFunction(nullptr),
-          OmptActionFunction(nullptr) {}
+    StreamSlotTy() : Signal(nullptr), Callbacks({}), ActionArgs({}) {}
 
     /// Schedule a host memory copy action on the slot.
-    Error schedHostMemoryCopy(void *Dst, const void *Src, size_t Size) {
-      ActionFunction = memcpyAction;
-      ActionArgs.MemcpyArgs = MemcpyArgsTy{Dst, Src, Size};
+    ///
+    /// Num times will repeat the copy that many times, sequentually in the dest
+    /// buffer.
+    Error schedHostMemoryCopy(void *Dst, const void *Src, size_t Size,
+                              size_t NumTimes = 1) {
+      Callbacks.emplace_back(memcpyAction);
+      ActionArgs.emplace_back().MemcpyArgs =
+          MemcpyArgsTy{Dst, Src, Size, NumTimes};
       return Plugin::success();
     }
 
     /// Schedule a release buffer action on the slot.
     Error schedReleaseBuffer(void *Buffer, AMDGPUMemoryManagerTy &Manager) {
-      ActionFunction = releaseBufferAction;
-      ActionArgs.ReleaseBufferArgs = ReleaseBufferArgsTy{Buffer, &Manager};
+      Callbacks.emplace_back(releaseBufferAction);
+      ActionArgs.emplace_back().ReleaseBufferArgs =
+          ReleaseBufferArgsTy{Buffer, &Manager};
       return Plugin::success();
     }
 
     /// Schedule a signal release action on the slot.
     Error schedReleaseSignal(AMDGPUSignalTy *SignalToRelease,
                              AMDGPUSignalManagerTy *SignalManager) {
-      ActionFunction = releaseSignalAction;
-      ActionArgs.ReleaseSignalArgs =
+      Callbacks.emplace_back(releaseSignalAction);
+      ActionArgs.emplace_back().ReleaseSignalArgs =
           ReleaseSignalArgsTy{SignalToRelease, SignalManager};
       return Plugin::success();
     }
 
-#ifdef OMPT_SUPPORT
-    /// Schedule OMPT kernel timing on the slot.
-    Error schedOmptAsyncKernelTiming(
-        hsa_agent_t Agent, AMDGPUSignalTy *OutputSignal, double TicksToTime,
-        std::unique_ptr<ompt::OmptEventInfoTy> OMPTData) {
-      OmptActionFunction = timeKernelInNsAsync;
-      OmptKernelTimingArgsAsync = OmptKernelTimingArgsAsyncTy{
-          Agent, OutputSignal, TicksToTime, std::move(OMPTData)};
+    /// Register a callback to be called on compleition
+    Error schedCallback(AMDGPUStreamCallbackTy *Func, void *Data) {
+      Callbacks.emplace_back(Func);
+      ActionArgs.emplace_back().CallbackArgs = Data;
+
       return Plugin::success();
     }
 
-    /// Schedule OMPT data transfer timing on the slot
-    Error schedOmptAsyncD2HTransferTiming(
-        hsa_agent_t Agent, AMDGPUSignalTy *OutputSignal, double TicksToTime,
-        std::unique_ptr<ompt::OmptEventInfoTy> OmptInfoData) {
-      OmptActionFunction = timeDataTransferInNsAsync;
-      OmptKernelTimingArgsAsync = OmptKernelTimingArgsAsyncTy{
-          Agent, OutputSignal, TicksToTime, std::move(OmptInfoData)};
+    /// Schedule kernel timing measurement on the slot
+    Error schedProfilerKernelTiming(GenericDeviceTy *Device, hsa_agent_t Agent,
+                                    AMDGPUSignalTy *OutputSignal,
+                                    double TicksToTime,
+                                    ompt::OmptEventInfoTy *OmptData) {
+      Callbacks.emplace_back(timeKernelInNsAsync);
+      ActionArgs.emplace_back().ProfilerArgs = ProfilingInfoTy{
+          &(Device->Plugin), Agent, OutputSignal, TicksToTime, OmptData};
       return Plugin::success();
     }
-#endif
+
+    /// Schedule data transfer timing on the slot
+    Error schedProfilerDataTransferTiming(GenericDeviceTy *Device,
+                                          hsa_agent_t Agent,
+                                          AMDGPUSignalTy *OutputSignal,
+                                          double TicksToTime,
+                                          ompt::OmptEventInfoTy *OmptData) {
+      Callbacks.emplace_back(timeDataTransferInNsAsync);
+      ActionArgs.emplace_back().ProfilerArgs = ProfilingInfoTy{
+          &(Device->Plugin), Agent, OutputSignal, TicksToTime, OmptData};
+      return Plugin::success();
+    }
 
     // Perform the action if needed.
     Error performAction() {
-      if (!ActionFunction
-#ifdef OMPT_SUPPORT
-          && !OmptActionFunction
-#endif
-      )
+      if (Callbacks.empty())
         return Plugin::success();
 
       // Perform the action.
-      if (ActionFunction == memcpyAction) {
-        if (auto Err = memcpyAction(&ActionArgs))
-          return Err;
-      } else if (ActionFunction == releaseBufferAction) {
-        if (auto Err = releaseBufferAction(&ActionArgs))
-          return Err;
-      } else if (ActionFunction == releaseSignalAction) {
-        if (auto Err = releaseSignalAction(&ActionArgs))
-          return Err;
-      } else {
-        return Plugin::error("Unknown action function!");
+      assert(Callbacks.size() == ActionArgs.size() && "Size mismatch");
+      for (auto [Callback, ActionArg] : llvm::zip(Callbacks, ActionArgs)) {
+        // Perform the action.
+        if (Callback == memcpyAction) {
+          if (auto Err = memcpyAction(&ActionArg))
+            return Err;
+        } else if (Callback == releaseBufferAction) {
+          if (auto Err = releaseBufferAction(&ActionArg))
+            return Err;
+        } else if (Callback == releaseSignalAction) {
+          if (auto Err = releaseSignalAction(&ActionArg))
+            return Err;
+        } else if (Callback == timeKernelInNsAsync) {
+          if (auto Err = timeKernelInNsAsync(&ActionArg))
+            return Err;
+        } else if (Callback == timeDataTransferInNsAsync) {
+          if (auto Err = timeDataTransferInNsAsync(&ActionArg))
+            return Err;
+        } else if (Callback) {
+          if (auto Err = Callback(ActionArg.CallbackArgs))
+            return Err;
+        }
       }
 
-      // Invalidate the actions.
-      ActionFunction = nullptr;
-
-#ifdef OMPT_SUPPORT
-      OMPT_IF_TRACING_ENABLED(if (OmptActionFunction) {
-        if (OmptActionFunction == timeKernelInNsAsync) {
-          if (auto Err = timeKernelInNsAsync(&OmptKernelTimingArgsAsync))
-            return Err;
-        } else if (OmptActionFunction == timeDataTransferInNsAsync) {
-          if (auto Err = timeDataTransferInNsAsync(&OmptKernelTimingArgsAsync))
-            return Err;
-        } else {
-          return Plugin::error("Unknown ompt action function!");
-        }
-      });
-
-      OmptActionFunction = nullptr;
-#endif
+      // Invalidate the action.
+      Callbacks.clear();
+      ActionArgs.clear();
 
       return Plugin::success();
     }
@@ -1715,24 +1891,43 @@ private:
   /// operation that was already finalized in a previous stream sycnhronize.
   uint32_t SyncCycle;
 
-  /// A pointer associated with an RPC server running on the given device. If
-  /// RPC is not being used this will be a null pointer. Otherwise, this
-  /// indicates that an RPC server is expected to be run on this stream.
-  RPCServerTy *RPCServer;
-
   /// Mutex to protect stream's management.
   mutable std::mutex Mutex;
 
   /// Timeout hint for HSA actively waiting for signal value to change
   const uint64_t StreamBusyWaitMicroseconds;
 
-  /// Indicate to spread data transfers across all avilable SDMAs
+  /// Indicate to spread data transfers across all available SDMAs
   bool UseMultipleSdmaEngines;
 
   /// Use synchronous copy back.
   bool UseSyncCopyBack;
 
-  /// Return the current number of asychronous operations on the stream.
+  /// When copying data from one host buffer to another, only do it
+  /// asynchronously if `MinHostToHostAsyncCopySize <= size`.
+  UInt32Envar OMPX_MinHostToHostAsyncCopySize;
+
+  /// Arguments for the callback function.
+  PostKernelRunProcessingArgsTy PostKernelRunProcessingArgs;
+
+  /// Arguments for callback function to collect kernel duration.
+  KernelDurationTracingArgsTy KernelDurationTracingArgs;
+
+  /// Wrapper function for implementing host callbacks
+  static void CallbackWrapper(AMDGPUSignalTy *InputSignal,
+                              AMDGPUSignalTy *OutputSignal,
+                              void (*Callback)(void *), void *UserData) {
+    // The wait call will not error in this context.
+    if (InputSignal)
+      if (auto Err = InputSignal->wait())
+        reportFatalInternalError(std::move(Err));
+
+    Callback(UserData);
+
+    OutputSignal->signal();
+  }
+
+  /// Return the current number of asynchronous operations on the stream.
   uint32_t size() const { return NextSlot; }
 
   /// Return the last valid slot on the stream.
@@ -1784,13 +1979,26 @@ private:
     return Plugin::success();
   }
 
+  /// Complete pending post actions until and including the event in target
+  /// slot.
+  Error completeUntil(uint32_t TargetSlot) {
+    for (uint32_t Slot = 0; Slot <= TargetSlot; ++Slot) {
+      // Take the post action of the operation if any.
+      if (auto Err = Slots[Slot].performAction())
+        return Err;
+    }
+
+    return Plugin::success();
+  }
+
   /// Make the current stream wait on a specific operation of another stream.
   /// The idea is to make the current stream waiting on two signals: 1) the last
   /// signal of the current stream, and 2) the last signal of the other stream.
   /// Use a barrier packet with two input signals.
   Error waitOnStreamOperation(AMDGPUStreamTy &OtherStream, uint32_t Slot) {
     if (Queue == nullptr)
-      return Plugin::error("Target queue was nullptr");
+      return Plugin::error(ErrorCode::INVALID_NULL_POINTER,
+                           "target queue was nullptr");
 
     /// The signal that we must wait from the other stream.
     AMDGPUSignalTy *OtherSignal = OtherStream.Slots[Slot].Signal;
@@ -1813,7 +2021,6 @@ private:
       return Err;
 
     // Push a barrier into the queue with both input signals.
-    DP("Using Queue: %p with HSA Queue: %p\n", Queue, Queue->getHsaQueue());
     return Queue->pushBarrier(OutputSignal, InputSignal, OtherSignal);
   }
 
@@ -1830,12 +2037,12 @@ private:
     assert(Slot && "Invalid slot");
     assert(Slot->Signal && "Invalid signal");
 
-    // Peform the operation.
+    // Perform the operation.
     if (auto Err = Slot->performAction())
-      FATAL_MESSAGE(1, "Error peforming post action: %s",
+      FATAL_MESSAGE(1, "Error performing post action: %s",
                     toString(std::move(Err)).data());
 
-    // Signal the output signal to notify the asycnhronous operation finalized.
+    // Signal the output signal to notify the asynchronous operation finalized.
     Slot->Signal->signal();
 
     // Unregister callback.
@@ -1849,7 +2056,11 @@ private:
     assert(Args->Dst && "Invalid destination buffer");
     assert(Args->Src && "Invalid source buffer");
 
-    std::memcpy(Args->Dst, Args->Src, Args->Size);
+    auto *BasePtr = Args->Dst;
+    for (size_t I = 0; I < Args->NumTimes; I++) {
+      std::memcpy(BasePtr, Args->Src, Args->Size);
+      BasePtr = reinterpret_cast<uint8_t *>(BasePtr) + Args->Size;
+    }
 
     return Plugin::success();
   }
@@ -1858,9 +2069,9 @@ private:
   /// action. There are two kinds of memory buffers:
   ///   1. For kernel arguments. This buffer can be freed after receiving the
   ///   kernel completion signal.
-  ///   2. For H2D tranfers that need pinned memory space for staging. This
+  ///   2. For H2D transfers that need pinned memory space for staging. This
   ///   buffer can be freed after receiving the transfer completion signal.
-  ///   3. For D2H tranfers that need pinned memory space for staging. This
+  ///   3. For D2H transfers that need pinned memory space for staging. This
   ///   buffer cannot be freed after receiving the transfer completion signal
   ///   because of the following asynchronous H2H callback.
   ///      For this reason, This action can only be taken at
@@ -1871,7 +2082,6 @@ private:
     ReleaseBufferArgsTy *Args = reinterpret_cast<ReleaseBufferArgsTy *>(Data);
     assert(Args && "Invalid arguments");
     assert(Args->MemoryManager && "Invalid memory manager");
-    assert(Args->Buffer && "Invalid buffer");
 
     // Release the allocation to the memory manager.
     return Args->MemoryManager->deallocate(Args->Buffer);
@@ -1893,38 +2103,83 @@ private:
     return Plugin::success();
   }
 
-#ifdef OMPT_SUPPORT
-  static Error timeKernelInNsAsync(void *Data) {
-    assert(Data && "Invalid data pointer in OMPT profiling");
-    auto Args = getOmptTimingsArgs(Data);
+  template <typename Ty> static uint64_t getKernelDuration(Ty *Args) {
+    assert(Args->Signal &&
+           "Invalid AMDGPUSignal Pointer for obtaining kernel duration");
+    hsa_amd_profiling_dispatch_time_t TimeRec;
+    hsa_amd_profiling_get_dispatch_time(Args->Agent, Args->Signal->get(),
+                                        &TimeRec);
 
-    assert(Args && "Invalid args pointer in OMPT profiling");
-    auto [StartTime, EndTime] = getKernelStartAndEndTime(Args);
+    uint64_t StartTime = TimeRec.start * Args->TicksToTime;
+    uint64_t EndTime = TimeRec.end * Args->TicksToTime;
 
-    DP("OMPT-Async: Time kernel for asynchronous execution (Plugin): Start %lu "
-       "End %lu\n",
-       StartTime, EndTime);
+    return EndTime - StartTime;
+  }
 
-    assert(Args->OmptEventInfo && "Invalid OEI pointer in OMPT profiling");
-    auto OmptEventInfo = *Args->OmptEventInfo;
-    auto RIFunc = std::get<1>(OmptEventInfo.RIFunction);
+  /// Callback funtion to process the data for each kernel run.
+  static Error postKernelRunProcessingAction(void *Data) {
+    assert(Data && "Invalid data pointer for post kernel run processing");
+    PostKernelRunProcessingArgsTy *Args =
+        reinterpret_cast<PostKernelRunProcessingArgsTy *>(Data);
 
-    assert(OmptEventInfo.RegionInterface &&
-           "Invalid RegionInterface pointer in OMPT profiling");
-    assert(OmptEventInfo.TraceRecord && "Invalid TraceRecord");
-    std::invoke(RIFunc, OmptEventInfo.RegionInterface,
-                OmptEventInfo.TraceRecord, OmptEventInfo.NumTeams, StartTime,
-                EndTime);
+    KernelRunRecordTy *KernelRecord = Args->KernelRunRecords;
+    assert(KernelRecord && "KernelRunRecord is null!");
+
+    uint64_t KernelDuration =
+        getKernelDuration<PostKernelRunProcessingArgsTy>(Args);
+    KernelRecord->addEntry(Args->KernelName, Args->NumTeams, Args->NumThreads,
+                           KernelDuration);
+
+    if (getInfoLevel() & OMP_INFOTYPE_AMD_KERNEL_TRACE) {
+      fprintf(stderr,
+              "[Autotuning run] Kernel %s with %u teams and %u threads "
+              "completed in %lu ns.\n",
+              Args->KernelName.c_str(), Args->NumTeams, Args->NumThreads,
+              KernelDuration);
+    }
+    return Plugin::success();
+  }
+
+  /// Callback function to generate traces for kernel runtime.
+  static Error KernelDurationTracingAction(void *Data) {
+    assert(Data && "Invalid data pointer for tracing kernel duration");
+    KernelDurationTracingArgsTy *Args =
+        reinterpret_cast<KernelDurationTracingArgsTy *>(Data);
+
+    uint64_t KernelDuration =
+        getKernelDuration<KernelDurationTracingArgsTy>(Args);
+
+    fprintf(
+        stderr,
+        "DeviceID: %2d LaunchID: %2d TeamsXthrds:(%4uX%4d) Duration(ns): %lu\n",
+        Args->DeviceId, Args->LaunchId, Args->NumTeams, Args->NumThreads,
+        KernelDuration);
 
     return Plugin::success();
   }
-#endif
+
+  /// Callback function used by GenericProfiler to capture kernel exec times.
+  static Error timeKernelInNsAsync(void *Data) {
+    assert(Data && "Invalid data pointer timeKernelInNsAsync");
+    auto ProfilerInfo = getProfilingInfo(Data);
+
+    assert(ProfilerInfo && "Invalid args pointer in timeKernelInNsAsync");
+    assert(ProfilerInfo->ProfilerSpecificData &&
+           "Invalid ProfilerSpecificData in timeKernelInNsAsync");
+
+    auto [StartTime, EndTime] = getKernelStartAndEndTime(ProfilerInfo);
+
+    ProfilerInfo->Plugin->getProfiler()->handleKernelCompletion(
+        StartTime, EndTime, ProfilerInfo->ProfilerSpecificData);
+
+    return Plugin::success();
+  }
 
 public:
   /// Create an empty stream associated with a specific device.
   AMDGPUStreamTy(AMDGPUDeviceTy &Device);
 
-  /// Intialize the stream's signals.
+  /// Initialize the stream's signals.
   Error init() { return Plugin::success(); }
 
   /// Deinitialize the stream's signals.
@@ -1932,20 +2187,18 @@ public:
 
   hsa_queue_t *getHsaQueue() { return Queue->getHsaQueue(); }
 
-  /// Attach an RPC server to this stream.
-  void setRPCServer(RPCServerTy *Server) { RPCServer = Server; }
-
   /// Push a asynchronous kernel to the stream. The kernel arguments must be
   /// placed in a special allocation for kernel args and must keep alive until
   /// the kernel finalizes. Once the kernel is finished, the stream will release
   /// the kernel args buffer to the specified memory manager.
-  Error
-  pushKernelLaunch(const AMDGPUKernelTy &Kernel, void *KernelArgs,
-                   uint32_t NumThreads, uint64_t NumBlocks, uint32_t GroupSize,
-                   uint32_t StackSize, AMDGPUMemoryManagerTy &MemoryManager,
-                   std::unique_ptr<ompt::OmptEventInfoTy> OmptInfo = nullptr) {
+  Error pushKernelLaunch(const AMDGPUKernelTy &Kernel, void *KernelArgs,
+                         uint32_t NumThreads[3], uint32_t NumBlocks[3],
+                         uint32_t GroupSize, uint32_t StackSize,
+                         AMDGPUMemoryManagerTy &MemoryManager,
+                         ompt::OmptEventInfoTy *OmptInfo = nullptr) {
     if (Queue == nullptr)
-      return Plugin::error("Target queue was nullptr");
+      return Plugin::error(ErrorCode::INVALID_NULL_POINTER,
+                           "target queue was nullptr");
 
     // Retrieve an available signal for the operation's output.
     AMDGPUSignalTy *OutputSignal = nullptr;
@@ -1963,29 +2216,88 @@ public:
     if (auto Err = Slots[Curr].schedReleaseBuffer(KernelArgs, MemoryManager))
       return Err;
 
+      // TODO: Technically this conditional compilation is not needed anymore
 #ifdef OMPT_SUPPORT
     if (OmptInfo) {
       DP("OMPT-Async: Info in KernelTy >> TR ptr: %p\n", OmptInfo->TraceRecord);
 
       // OmptInfo holds function pointer to finish trace record once the kernel
       // completed.
-      if (auto Err = Slots[Curr].schedOmptAsyncKernelTiming(
-              Agent, OutputSignal, TicksToTime, std::move(OmptInfo)))
+      if (auto Err = Slots[Curr].schedProfilerKernelTiming(
+              &Device, Agent, OutputSignal, TicksToTime, OmptInfo))
         return Err;
     }
 #endif
 
+    // If runtime autotuning is enabled, setup the callback functions to process
+    // the data after kernel completed.
+    if (Device.enableRuntimeAutotuning() && Kernel.isSPMDMode()) {
+      std::string KernelName(Kernel.getName());
+      KernelRunRecordTy *KernelRecords = Device.getKernelRunRecords();
+      assert(KernelRecords && "No KernelRecords!");
+
+      // If this kernel has reached the run limit,
+      // skip registering the callback function.
+      if (!KernelRecords->reachedRunLimitForKernel(KernelName)) {
+        PostKernelRunProcessingArgs.Agent = Agent;
+        PostKernelRunProcessingArgs.Signal = OutputSignal;
+        PostKernelRunProcessingArgs.KernelName = KernelName;
+        PostKernelRunProcessingArgs.NumTeams = NumBlocks[0];
+        PostKernelRunProcessingArgs.NumThreads = NumThreads[0];
+        PostKernelRunProcessingArgs.KernelRunRecords = KernelRecords;
+
+        if (auto Err = Slots[Curr].schedCallback(postKernelRunProcessingAction,
+                                                 &PostKernelRunProcessingArgs))
+          return Err;
+      }
+    }
+
+    // When LIBOMPTARGET_KERNEL_EXE_TIME is set, register the callback function
+    // to get the kernel duration.
+    if (Device.enableKernelDurationTracing()) {
+      KernelDurationTracingArgs.Agent = Agent;
+      KernelDurationTracingArgs.Signal = OutputSignal;
+      KernelDurationTracingArgs.DeviceId = Device.getDeviceId();
+      KernelDurationTracingArgs.LaunchId = Kernel.getKernelLaunchId();
+      KernelDurationTracingArgs.NumTeams = NumBlocks[0];
+      KernelDurationTracingArgs.NumThreads = NumThreads[0];
+
+      if (auto Err = Slots[Curr].schedCallback(KernelDurationTracingAction,
+                                               &KernelDurationTracingArgs))
+        return Err;
+    }
+
     // Push the kernel with the output signal and an input signal (optional)
     DP("Using Queue: %p with HSA Queue: %p\n", Queue, Queue->getHsaQueue());
-    return Queue->pushKernelLaunch(Kernel, KernelArgs, NumThreads, NumBlocks,
-                                   GroupSize, StackSize, OutputSignal,
-                                   InputSignal);
+    // If we are running an RPC server we want to wake up the server thread
+    // whenever there is a kernel running and let it sleep otherwise.
+    if (Device.getRPCServer())
+      Device.Plugin.getRPCServer().Thread->notify();
+
+    // Push the kernel with the output signal and an input signal (optional)
+    if (auto Err = Queue->pushKernelLaunch(Kernel, KernelArgs, NumThreads,
+                                           NumBlocks, GroupSize, StackSize,
+                                           OutputSignal, InputSignal))
+      return Err;
+
+    // Register a callback to indicate when the kernel is complete.
+    if (Device.getRPCServer()) {
+      if (auto Err = Slots[Curr].schedCallback(
+              [](void *Data) -> llvm::Error {
+                GenericPluginTy &Plugin =
+                    *reinterpret_cast<GenericPluginTy *>(Data);
+                Plugin.getRPCServer().Thread->finish();
+                return Error::success();
+              },
+              &Device.Plugin))
+        return Err;
+    }
+    return Plugin::success();
   }
 
   /// Push an asynchronous memory copy between pinned memory buffers.
-  Error pushPinnedMemoryCopyAsync(
-      void *Dst, const void *Src, uint64_t CopySize,
-      std::unique_ptr<ompt::OmptEventInfoTy> OmptInfo = nullptr) {
+  Error pushPinnedMemoryCopyAsync(void *Dst, const void *Src, uint64_t CopySize,
+                                  ompt::OmptEventInfoTy *OmptInfo = nullptr) {
     // Retrieve an available signal for the operation's output.
     AMDGPUSignalTy *OutputSignal = nullptr;
     if (auto Err = SignalManager.getResource(OutputSignal))
@@ -1998,12 +2310,13 @@ public:
     // Consume stream slot and compute dependencies.
     auto [Curr, InputSignal] = consume(OutputSignal);
 
+    // TODO: Technically this conditional compilation is not needed anymore
 #ifdef OMPT_SUPPORT
     if (OmptInfo) {
       DP("OMPT-Async: Registering data timing in pushPinnedMemoryCopyAsync\n");
       // Capture the time the data transfer required for the d2h transfer.
-      if (auto Err = Slots[Curr].schedOmptAsyncD2HTransferTiming(
-              Agent, OutputSignal, TicksToTime, std::move(OmptInfo)))
+      if (auto Err = Slots[Curr].schedProfilerDataTransferTiming(
+              &Device, Agent, OutputSignal, TicksToTime, OmptInfo))
         return Err;
     }
 #endif
@@ -2011,25 +2324,26 @@ public:
     // Issue the async memory copy.
     if (InputSignal && InputSignal->load()) {
       hsa_signal_t InputSignalRaw = InputSignal->get();
-      return utils::asyncMemCopy(UseMultipleSdmaEngines, Dst, Agent, Src, Agent,
-                                 CopySize, 1, &InputSignalRaw,
-                                 OutputSignal->get());
+      return hsa_utils::asyncMemCopy(UseMultipleSdmaEngines, Dst, Agent, Src,
+                                     Agent, CopySize, 1, &InputSignalRaw,
+                                     OutputSignal->get());
     }
 
-    return utils::asyncMemCopy(UseMultipleSdmaEngines, Dst, Agent, Src, Agent,
-                               CopySize, 0, nullptr, OutputSignal->get());
+    return hsa_utils::asyncMemCopy(UseMultipleSdmaEngines, Dst, Agent, Src,
+                                   Agent, CopySize, 0, nullptr,
+                                   OutputSignal->get());
   }
 
   /// Push an asynchronous memory copy device-to-host involving an unpinned
   /// memory buffer. The operation consists of a two-step copy from the
   /// device buffer to an intermediate pinned host buffer, and then, to a
-  /// unpinned host buffer. Both operations are asynchronous and dependant.
+  /// unpinned host buffer. Both operations are asynchronous and dependent.
   /// The intermediate pinned buffer will be released to the specified memory
   /// manager once the operation completes.
-  Error pushMemoryCopyD2HAsync(
-      void *Dst, const void *Src, void *Inter, uint64_t CopySize,
-      AMDGPUMemoryManagerTy &MemoryManager,
-      std::unique_ptr<ompt::OmptEventInfoTy> OmptInfo = nullptr) {
+  Error pushMemoryCopyD2HAsync(void *Dst, const void *Src, void *Inter,
+                               uint64_t CopySize,
+                               AMDGPUMemoryManagerTy &MemoryManager,
+                               ompt::OmptEventInfoTy *OmptInfo = nullptr) {
     // Retrieve available signals for the operation's outputs.
     AMDGPUSignalTy *OutputSignals[2] = {};
     if (auto Err = SignalManager.getResources(/*Num=*/2, OutputSignals))
@@ -2050,16 +2364,16 @@ public:
 
     // Wait for kernel to finish before scheduling the asynchronous copy.
     if (UseSyncCopyBack && InputSignal && InputSignal->load())
-      if (auto Err = InputSignal->wait(StreamBusyWaitMicroseconds, RPCServer, &Device))
+      if (auto Err = InputSignal->wait(StreamBusyWaitMicroseconds, &Device))
         return Err;
 
+        // TODO: Technically this conditional compilation is not needed anymore
 #ifdef OMPT_SUPPORT
-
     if (OmptInfo) {
       DP("OMPT-Async: Registering data timing in pushMemoryCopyD2HAsync\n");
       // Capture the time the data transfer required for the d2h transfer.
-      if (auto Err = Slots[Curr].schedOmptAsyncD2HTransferTiming(
-              Agent, OutputSignals[0], TicksToTime, std::move(OmptInfo)))
+      if (auto Err = Slots[Curr].schedProfilerDataTransferTiming(
+              &Device, Agent, OutputSignals[0], TicksToTime, OmptInfo))
         return Err;
     }
 #endif
@@ -2068,15 +2382,23 @@ public:
     // dependency if already satisfied.
     if (InputSignal && InputSignal->load()) {
       hsa_signal_t InputSignalRaw = InputSignal->get();
-      if (auto Err = utils::asyncMemCopy(
+      if (auto Err = hsa_utils::asyncMemCopy(
               UseMultipleSdmaEngines, Inter, Agent, Src, Agent, CopySize, 1,
               &InputSignalRaw, OutputSignals[0]->get()))
         return Err;
     } else {
-      if (auto Err = utils::asyncMemCopy(UseMultipleSdmaEngines, Inter, Agent,
-                                         Src, Agent, CopySize, 0, nullptr,
-                                         OutputSignals[0]->get()))
+      if (auto Err = hsa_utils::asyncMemCopy(UseMultipleSdmaEngines, Inter,
+                                             Agent, Src, Agent, CopySize, 0,
+                                             nullptr, OutputSignals[0]->get()))
         return Err;
+    }
+
+    if (CopySize < OMPX_MinHostToHostAsyncCopySize) {
+      if (auto Err =
+              OutputSignals[0]->wait(StreamBusyWaitMicroseconds, &Device))
+        return Err;
+      std::memcpy(Dst, Inter, CopySize);
+      return Error::success();
     }
 
     // Consume another stream slot and compute dependencies.
@@ -2096,19 +2418,20 @@ public:
         InputSignal->get(), HSA_SIGNAL_CONDITION_EQ, 0, asyncActionCallback,
         (void *)&Slots[Curr]);
 
-    return Plugin::check(Status, "Error in hsa_amd_signal_async_handler: %s");
+    return Plugin::check(Status, "error in hsa_amd_signal_async_handler: %s");
   }
 
   /// Push an asynchronous memory copy host-to-device involving an unpinned
   /// memory buffer. The operation consists of a two-step copy from the
   /// unpinned host buffer to an intermediate pinned host buffer, and then, to
-  /// the pinned host buffer. Both operations are asynchronous and dependant.
+  /// the pinned host buffer. Both operations are asynchronous and dependent.
   /// The intermediate pinned buffer will be released to the specified memory
   /// manager once the operation completes.
-  Error pushMemoryCopyH2DAsync(
-      void *Dst, const void *Src, void *Inter, uint64_t CopySize,
-      AMDGPUMemoryManagerTy &MemoryManager,
-      std::unique_ptr<ompt::OmptEventInfoTy> OmptInfo = nullptr) {
+  Error pushMemoryCopyH2DAsync(void *Dst, const void *Src, void *Inter,
+                               uint64_t CopySize,
+                               AMDGPUMemoryManagerTy &MemoryManager,
+                               ompt::OmptEventInfoTy *OmptInfo = nullptr,
+                               size_t NumTimes = 1) {
     // Retrieve available signals for the operation's outputs.
     AMDGPUSignalTy *OutputSignals[2] = {};
     if (auto Err = SignalManager.getResources(/*Num=*/2, OutputSignals))
@@ -2130,7 +2453,8 @@ public:
       // The std::memcpy is done asynchronously using an async handler. We store
       // the function's information in the action but it is not actually a
       // post action.
-      if (auto Err = Slots[Curr].schedHostMemoryCopy(Inter, Src, CopySize))
+      if (auto Err =
+              Slots[Curr].schedHostMemoryCopy(Inter, Src, CopySize, NumTimes))
         return Err;
 
       // Make changes on this slot visible to the async handler's thread.
@@ -2141,7 +2465,7 @@ public:
           (void *)&Slots[Curr]);
 
       if (auto Err = Plugin::check(Status,
-                                   "Error in hsa_amd_signal_async_handler: %s"))
+                                   "error in hsa_amd_signal_async_handler: %s"))
         return Err;
 
       // Let's use now the second output signal.
@@ -2151,7 +2475,11 @@ public:
       std::tie(Curr, InputSignal) = consume(OutputSignal);
     } else {
       // All preceding operations completed, copy the memory synchronously.
-      std::memcpy(Inter, Src, CopySize);
+      auto *InterPtr = Inter;
+      for (size_t I = 0; I < NumTimes; I++) {
+        std::memcpy(InterPtr, Src, CopySize);
+        InterPtr = reinterpret_cast<uint8_t *>(InterPtr) + CopySize;
+      }
 
       // Return the second signal because it will not be used.
       OutputSignals[1]->decreaseUseCount();
@@ -2163,12 +2491,13 @@ public:
     if (auto Err = Slots[Curr].schedReleaseBuffer(Inter, MemoryManager))
       return Err;
 
+      // TODO: Technically, this conditional compilation is not needed anymore
 #ifdef OMPT_SUPPORT
     if (OmptInfo) {
       DP("OMPT-Async: Registering data timing in pushMemoryCopyH2DAsync\n");
       // Capture the time the data transfer required for the d2h transfer.
-      if (auto Err = Slots[Curr].schedOmptAsyncD2HTransferTiming(
-              Agent, OutputSignals[0], TicksToTime, std::move(OmptInfo)))
+      if (auto Err = Slots[Curr].schedProfilerDataTransferTiming(
+              &Device, Agent, OutputSignals[0], TicksToTime, OmptInfo))
         return Err;
     }
 #endif
@@ -2177,17 +2506,19 @@ public:
     // dependency if already satisfied.
     if (InputSignal && InputSignal->load()) {
       hsa_signal_t InputSignalRaw = InputSignal->get();
-      return utils::asyncMemCopy(UseMultipleSdmaEngines, Dst, Agent, Inter,
-                                 Agent, CopySize, 1, &InputSignalRaw,
-                                 OutputSignal->get());
+      return hsa_utils::asyncMemCopy(UseMultipleSdmaEngines, Dst, Agent, Inter,
+                                     Agent, CopySize * NumTimes, 1,
+                                     &InputSignalRaw, OutputSignal->get());
     }
-    return utils::asyncMemCopy(UseMultipleSdmaEngines, Dst, Agent, Inter, Agent,
-                               CopySize, 0, nullptr, OutputSignal->get());
+    return hsa_utils::asyncMemCopy(UseMultipleSdmaEngines, Dst, Agent, Inter,
+                                   Agent, CopySize * NumTimes, 0, nullptr,
+                                   OutputSignal->get());
   }
 
   // AMDGPUDeviceTy is incomplete here, passing the underlying agent instead
   Error pushMemoryCopyD2DAsync(void *Dst, hsa_agent_t DstAgent, const void *Src,
-                               hsa_agent_t SrcAgent, uint64_t CopySize) {
+                               hsa_agent_t SrcAgent, uint64_t CopySize,
+                               ompt::OmptEventInfoTy *OmptInfo = nullptr) {
     AMDGPUSignalTy *OutputSignal;
     if (auto Err = SignalManager.getResources(/*Num=*/1, &OutputSignal))
       return Err;
@@ -2199,6 +2530,17 @@ public:
     // Consume stream slot and compute dependencies.
     auto [Curr, InputSignal] = consume(OutputSignal);
 
+    // TODO: Technically, this conditional compilation is not needed anymore
+#ifdef OMPT_SUPPORT
+    if (OmptInfo) {
+      DP("OMPT-Async: Registering data timing in pushMemoryCopyD2DAsync\n");
+      // Capture the time the data transfer required for the d2h transfer.
+      if (auto Err = Slots[Curr].schedProfilerDataTransferTiming(
+              &Device, Agent, OutputSignal, TicksToTime, OmptInfo))
+        return Err;
+    }
+#endif
+
     // The agents need to have access to the corresponding memory
     // This is presently only true if the pointers were originally
     // allocated by this runtime or the caller made the appropriate
@@ -2206,13 +2548,38 @@ public:
 
     if (InputSignal && InputSignal->load()) {
       hsa_signal_t InputSignalRaw = InputSignal->get();
-      return utils::asyncMemCopy(UseMultipleSdmaEngines, Dst, DstAgent, Src,
-                                 SrcAgent, CopySize, 1, &InputSignalRaw,
-                                 OutputSignal->get());
+      return hsa_utils::asyncMemCopy(UseMultipleSdmaEngines, Dst, DstAgent, Src,
+                                     SrcAgent, CopySize, 1, &InputSignalRaw,
+                                     OutputSignal->get());
     }
-    return utils::asyncMemCopy(UseMultipleSdmaEngines, Dst, DstAgent, Src,
-                               SrcAgent, CopySize, 0, nullptr,
-                               OutputSignal->get());
+    return hsa_utils::asyncMemCopy(UseMultipleSdmaEngines, Dst, DstAgent, Src,
+                                   SrcAgent, CopySize, 0, nullptr,
+                                   OutputSignal->get());
+  }
+
+  Error pushHostCallback(void (*Callback)(void *), void *UserData) {
+    // Retrieve an available signal for the operation's output.
+    AMDGPUSignalTy *OutputSignal = nullptr;
+    if (auto Err = SignalManager.getResource(OutputSignal))
+      return Err;
+    OutputSignal->reset();
+    OutputSignal->increaseUseCount();
+
+    AMDGPUSignalTy *InputSignal;
+    {
+      std::lock_guard<std::mutex> Lock(Mutex);
+
+      // Consume stream slot and compute dependencies.
+      InputSignal = consume(OutputSignal).second;
+    }
+
+    // "Leaking" the thread here is consistent with other work added to the
+    // queue. The input and output signals will remain valid until the output is
+    // signaled.
+    std::thread(CallbackWrapper, InputSignal, OutputSignal, Callback, UserData)
+        .detach();
+
+    return Plugin::success();
   }
 
   /// Synchronize with the stream. The current thread waits until all operations
@@ -2226,13 +2593,21 @@ public:
       return Plugin::success();
 
     // Wait until all previous operations on the stream have completed.
-    if (auto Err = Slots[last()].Signal->wait(StreamBusyWaitMicroseconds,
-                                              RPCServer, &Device))
+    if (auto Err =
+            Slots[last()].Signal->wait(StreamBusyWaitMicroseconds, &Device))
       return Err;
 
     // Reset the stream and perform all pending post actions.
     return complete();
   }
+
+  /// Synchronize the stream until the given event. The current thread waits
+  /// until the provided event is finalized, and it performs the pending post
+  /// actions for that and prior events.
+  Error synchronizeOn(AMDGPUEventTy &Event);
+
+  /// Return true if the event from this queue is complete
+  Expected<bool> isEventComplete(const AMDGPUEventTy &Event);
 
   /// Query the stream and complete pending post actions if operations finished.
   /// Return whether all the operations completed. This operation does not block
@@ -2254,6 +2629,8 @@ public:
 
     return true;
   }
+
+  const AMDGPUQueueTy *getQueue() const { return Queue; }
 
   /// Record the state of the stream on an event.
   Error recordEvent(AMDGPUEventTy &Event) const;
@@ -2290,7 +2667,8 @@ struct AMDGPUEventTy {
     std::lock_guard<std::mutex> Lock(Mutex);
 
     if (!RecordedStream)
-      return Plugin::error("Event does not have any recorded stream");
+      return Plugin::error(ErrorCode::INVALID_ARGUMENT,
+                           "event does not have any recorded stream");
 
     // Synchronizing the same stream. Do nothing.
     if (RecordedStream == &Stream)
@@ -2302,6 +2680,21 @@ struct AMDGPUEventTy {
       return Plugin::success();
 
     return Stream.waitEvent(*this);
+  }
+
+  Error sync() {
+    std::lock_guard<std::mutex> Lock(Mutex);
+
+    if (!RecordedStream)
+      return Plugin::error(ErrorCode::INVALID_ARGUMENT,
+                           "event does not have any recorded stream");
+
+    // No need to wait on anything, the recorded stream already finished the
+    // corresponding operation.
+    if (RecordedSlot < 0)
+      return Plugin::success();
+
+    return RecordedStream->synchronizeOn(*this);
   }
 
 protected:
@@ -2359,17 +2752,57 @@ Error AMDGPUStreamTy::waitEvent(const AMDGPUEventTy &Event) {
   return waitOnStreamOperation(RecordedStream, Event.RecordedSlot);
 }
 
+Error AMDGPUStreamTy::synchronizeOn(AMDGPUEventTy &Event) {
+  std::lock_guard<std::mutex> Lock(Mutex);
+
+  // If this event was for an older sync cycle, it has already been finalized
+  if (Event.RecordedSyncCycle < SyncCycle)
+    return Plugin::success();
+  assert(Event.RecordedSyncCycle == SyncCycle && "event is from the future?");
+
+  // Wait until the requested slot has completed
+  if (auto Err = Slots[Event.RecordedSlot].Signal->wait(
+          StreamBusyWaitMicroseconds, &Device))
+    return Err;
+
+  // If the event is the last one in the stream, just do a full finalize
+  if (Event.RecordedSlot == last())
+    return complete();
+
+  // Otherwise, only finalize until the appropriate event
+  return completeUntil(Event.RecordedSlot);
+}
+
+Expected<bool> AMDGPUStreamTy::isEventComplete(const AMDGPUEventTy &Event) {
+  std::lock_guard<std::mutex> Lock(Mutex);
+  assert(Event.RecordedStream == this && "event is for a different stream");
+
+  if (Event.RecordedSyncCycle < SyncCycle) {
+    return true;
+  }
+  assert(Event.RecordedSyncCycle == SyncCycle && "event is from the future?");
+
+  return !Slots[Event.RecordedSlot].Signal->load();
+}
+
 struct AMDGPUStreamManagerTy final
     : GenericDeviceResourceManagerTy<AMDGPUResourceRef<AMDGPUStreamTy>> {
   using ResourceRef = AMDGPUResourceRef<AMDGPUStreamTy>;
   using ResourcePoolTy = GenericDeviceResourceManagerTy<ResourceRef>;
 
   AMDGPUStreamManagerTy(GenericDeviceTy &Device, hsa_agent_t HSAAgent)
-      : GenericDeviceResourceManagerTy(Device),
+      : GenericDeviceResourceManagerTy(Device), Device(Device),
         OMPX_QueueTracking("LIBOMPTARGET_AMDGPU_HSA_QUEUE_BUSY_TRACKING", true),
         OMPX_EnableQueueProfiling("LIBOMPTARGET_AMDGPU_ENABLE_QUEUE_PROFILING",
                                   false),
-        NextQueue(0), Agent(HSAAgent) {}
+        NextQueue(0), Agent(HSAAgent) {
+    // If OMPX_ENABLE_RUNTIME_AUTOTUNING or LIBOMPTARGET_KERNEL_EXE_TIME is
+    // enabled, set queue profiling to true.
+    if (Device.enableRuntimeAutotuning() ||
+        Device.enableKernelDurationTracing()) {
+      OMPX_EnableQueueProfiling = true;
+    }
+  }
 
   Error init(uint32_t InitialSize, int NumHSAQueues, int HSAQueueSize) {
     Queues = std::vector<AMDGPUQueueTy>(NumHSAQueues);
@@ -2377,7 +2810,7 @@ struct AMDGPUStreamManagerTy final
     MaxNumQueues = NumHSAQueues;
     // Initialize one queue eagerly
     if (auto Err =
-            Queues.front().init(Agent, QueueSize, OMPX_EnableQueueProfiling))
+            Queues.front().init(Device, Agent, QueueSize, OMPX_EnableQueueProfiling))
       return Err;
 
     return GenericDeviceResourceManagerTy::init(InitialSize);
@@ -2411,7 +2844,7 @@ struct AMDGPUStreamManagerTy final
   }
 
   /// Enable/disable profiling of the HSA queues.
-  void setOmptQueueProfile(int Enable) {
+  void setHSAQueueProfiling(int Enable) {
     // If queue profiling is enabled with an env-var, it means that
     // profiling is already ON and should remain so all the time.
     if (OMPX_EnableQueueProfiling)
@@ -2422,7 +2855,7 @@ struct AMDGPUStreamManagerTy final
   }
 
 private:
-  /// Search for and assign an prefereably idle queue to the given Stream. If
+  /// Search for and assign an preferably idle queue to the given Stream. If
   /// there is no queue without current users, choose the queue with the lowest
   /// user count. If utilization is ignored: use round robin selection.
   inline Error assignNextQueue(AMDGPUStreamTy *Stream) {
@@ -2446,13 +2879,16 @@ private:
 
     // Make sure the queue is initialized, then add user & assign.
     if (auto Err =
-            Queues[Index].init(Agent, QueueSize, OMPX_EnableQueueProfiling))
+            Queues[Index].init(Device, Agent, QueueSize, OMPX_EnableQueueProfiling))
       return Err;
     Queues[Index].addUser();
     Stream->Queue = &Queues[Index];
 
     return Plugin::success();
   }
+
+  /// The device associated with this stream.
+  GenericDeviceTy &Device;
 
   /// Envar for controlling the tracking of busy HSA queues.
   BoolEnvar OMPX_QueueTracking;
@@ -2591,7 +3027,7 @@ struct AMDHostDeviceTy : public AMDGenericDeviceTy {
   Error retrieveAllMemoryPools() override {
     // Iterate through the available pools across the host agents.
     for (hsa_agent_t Agent : Agents) {
-      Error Err = utils::iterateAgentMemoryPools(
+      Error Err = hsa_utils::iterateAgentMemoryPools(
           Agent, [&](hsa_amd_memory_pool_t HSAMemoryPool) {
             AMDGPUMemoryPoolTy *MemoryPool =
                 new AMDGPUMemoryPoolTy(HSAMemoryPool);
@@ -2610,13 +3046,13 @@ struct AMDHostDeviceTy : public AMDGenericDeviceTy {
   /// Get a memory pool for fine-grained allocations.
   AMDGPUMemoryPoolTy &getFineGrainedMemoryPool() {
     assert(!FineGrainedMemoryPools.empty() && "No fine-grained mempool");
-    // Retrive any memory pool.
+    // Retrieve any memory pool.
     return *FineGrainedMemoryPools[0];
   }
 
   AMDGPUMemoryPoolTy &getCoarseGrainedMemoryPool() {
     assert(!CoarseGrainedMemoryPools.empty() && "No coarse-grained mempool");
-    // Retrive any memory pool.
+    // Retrieve any memory pool.
     return *CoarseGrainedMemoryPools[0];
   }
 
@@ -2653,13 +3089,17 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
       : GenericDeviceTy(Plugin, DeviceId, NumDevices, {}), AMDGenericDeviceTy(),
         OMPX_NumQueues("LIBOMPTARGET_AMDGPU_NUM_HSA_QUEUES", 4),
         OMPX_QueueSize("LIBOMPTARGET_AMDGPU_HSA_QUEUE_SIZE", 512),
-        OMPX_DefaultTeamsPerCU("LIBOMPTARGET_AMDGPU_TEAMS_PER_CU", 6),
+        OMPX_DefaultTeamsPerCU("LIBOMPTARGET_AMDGPU_TEAMS_PER_CU", 4),
         OMPX_GenericSpmdTeamsPerCU(
             "LIBOMPTARGET_AMDGPU_GENERIC_SPMD_TEAMS_PER_CU", 6),
         OMPX_BigJumpLoopTeamsPerCU(
             "LIBOMPTARGET_AMDGPU_BIG_JUMP_LOOP_TEAMS_PER_CU", 0),
-        OMPX_LowTripCount("LIBOMPTARGET_AMDGPU_LOW_TRIPCOUNT", 2000),
-        OMPX_SmallBlockSize("LIBOMPTARGET_MIN_THREADS_FOR_LOW_TRIP_COUNT", 8),
+        OMPX_XTeamRedTeamsPerCU("LIBOMPTARGET_AMDGPU_XTEAM_RED_TEAMS_PER_CU",
+                                0),
+        OMPX_BigJumpLoopMaxTotalTeams(
+            "LIBOMPTARGET_AMDGPU_BIG_JUMP_LOOP_MAX_TOTAL_TEAMS", 1024 * 1024),
+        OMPX_LowTripCount("LIBOMPTARGET_AMDGPU_LOW_TRIPCOUNT", 9000),
+        OMPX_SmallBlockSize("LIBOMPTARGET_MIN_THREADS_FOR_LOW_TRIP_COUNT", 32),
         OMPX_NumBlocksForLowTripcount("LIBOMPTARGET_BLOCKS_FOR_LOW_TRIP_COUNT",
                                       0),
         OMPX_WavesPerCUForLowTripcount(
@@ -2667,9 +3107,11 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
         OMPX_AdjustNumTeamsForSmallBlockSize("LIBOMPTARGET_AMDGPU_ADJUST_TEAMS",
                                              0),
         OMPX_AdjustNumTeamsForXteamRedSmallBlockSize(
-            "LIBOMPTARGET_AMDGPU_ADJUST_XTEAM_RED_TEAMS", 0),
+            "LIBOMPTARGET_AMDGPU_ADJUST_XTEAM_RED_TEAMS", 1),
+        OMPX_GenericSpmdUseSmallBlockSize(
+            "LIBOMPTARGET_AMDGPU_GENERIC_SPMD_USE_SMALL_BLOCKSIZE", 1),
         OMPX_MaxAsyncCopyBytes("LIBOMPTARGET_AMDGPU_MAX_ASYNC_COPY_BYTES",
-                               1 * 1024 * 1024), // 1MB
+                               64 * 1024),
         OMPX_InitialNumSignals("LIBOMPTARGET_AMDGPU_NUM_INITIAL_HSA_SIGNALS",
                                64),
         OMPX_ForceSyncRegions("OMPX_FORCE_SYNC_REGIONS", 0),
@@ -2684,14 +3126,23 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
             "OMPX_ENABLE_GFX90A_COARSE_GRAIN_SHARED_ALLOC", false),
         OMPX_StrictSanityChecks("OMPX_STRICT_SANITY_CHECKS", false),
         OMPX_SyncCopyBack("LIBOMPTARGET_SYNC_COPY_BACK", true),
-        OMPX_APUPrefaultMemcopy("LIBOMPTARGET_APU_PREFAULT_MEMCOPY", "true"),
+        OMPX_APUPrefaultMemcopy("LIBOMPTARGET_APU_PREFAULT_MEMCOPY", true),
         OMPX_APUPrefaultMemcopySize("LIBOMPTARGET_APU_PREFAULT_MEMCOPY_SIZE",
                                     1 * 1024 * 1024), // 1MB
         OMPX_DGPUMaps("OMPX_DGPU_MAPS", false),
+        OMPX_SharedDescriptorMaxSize("LIBOMPTARGET_SHARED_DESCRIPTOR_MAX_SIZE",
+                                     0),
         OMPX_EnableDevice2DeviceMemAccess(
             "OMPX_ENABLE_DEVICE_TO_DEVICE_MEM_ACCESS", false),
         AMDGPUStreamManager(*this, Agent), AMDGPUEventManager(*this),
-        AMDGPUSignalManager(*this), Agent(Agent), HostDevice(HostDevice) {}
+        AMDGPUSignalManager(*this), Agent(Agent), HostDevice(HostDevice) {
+    // Get config for envars.
+    const DeviceEnvarConfigTy &EnvarConfig = getEnvarConfig();
+    // Check each envar if it was set by user.
+    if (!OMPX_UseMultipleSdmaEngines.isPresent()) {
+      OMPX_UseMultipleSdmaEngines = EnvarConfig.OMPX_UseMultipleSdmaEngines;
+    }
+  }
 
   ~AMDGPUDeviceTy() {}
 
@@ -2720,6 +3171,12 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
   }
   virtual uint32_t getOMPXBigJumpLoopTeamsPerCU() const override {
     return OMPX_BigJumpLoopTeamsPerCU;
+  }
+  virtual uint32_t getXTeamRedTeamsPerCU() const override {
+    return OMPX_XTeamRedTeamsPerCU;
+  }
+  virtual uint32_t getOMPXBigJumpLoopMaxTotalTeams() const override {
+    return OMPX_BigJumpLoopMaxTotalTeams;
   }
   virtual uint32_t getOMPXLowTripCount() const override {
     return OMPX_LowTripCount;
@@ -2785,6 +3242,11 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
   getOMPXAdjustNumTeamsForXteamRedSmallBlockSize() const override {
     return OMPX_AdjustNumTeamsForXteamRedSmallBlockSize;
   }
+  virtual bool getOMPXGenericSpmdUseSmallBlockSize() const override {
+    return OMPX_GenericSpmdUseSmallBlockSize;
+  }
+
+  uint64_t getDeviceTimeStamp() override { return getSystemTimestampInNs(); }
 
   /// Initialize the device, its resources and get its properties.
   Error initImpl(GenericPluginTy &Plugin) override {
@@ -2792,9 +3254,8 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
     if (auto Err = initMemoryPools())
       return Err;
 
-    OMPT_IF_ENABLED(::setOmptTicksToTime(););
+    setHSATicksToTimeConstant();
 
-#ifdef OMPT_SUPPORT
     // At init we capture two time points for host and device. The two
     // timepoints are spaced out to help smooth out their accuracy
     // differences.
@@ -2802,11 +3263,7 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
     // the value for omp_get_wtime. So we use the same clock here to calculate
     // the slope/offset and convert device time to omp_get_wtime via
     // translate_time.
-    double HostRef1 = 0;
-    uint64_t DeviceRef1 = 0;
-#endif
-    // Take the first timepoints.
-    OMPT_IF_ENABLED(startH2DTimeRate(&HostRef1, &DeviceRef1););
+    auto StartTime = getDHTime();
 
     if (auto Err = preAllocateDeviceMemoryPool())
       return Err;
@@ -2829,13 +3286,14 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
                          ClockFrequency) != HSA_STATUS_SUCCESS)
       ClockFrequency = 0;
 
-    // Load the grid values dependending on the wavefront.
+    // Load the grid values depending on the wavefront.
     if (WavefrontSize == 32)
       GridValues = getAMDGPUGridValues<32>();
     else if (WavefrontSize == 64)
       GridValues = getAMDGPUGridValues<64>();
     else
-      return Plugin::error("Unexpected AMDGPU wavefront %d", WavefrontSize);
+      return Plugin::error(ErrorCode::UNSUPPORTED,
+                           "unexpected AMDGPU wavefront %d", WavefrontSize);
 
     // To determine the correct scratch memory size per thread, we need to check
     // the device architecure generation. Hence, we slice the major GFX version
@@ -2844,7 +3302,7 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
     unsigned GfxGen = 0u;
     if (!llvm::to_integer(Arch.slice(sizeof("gfx") - 1, Arch.size() - 2),
                           GfxGen))
-      return Plugin::error("Invalid GFX architecture string");
+      return Plugin::error(ErrorCode::UNKNOWN, "Invalid GFX architecture string");
 
     // TODO: Will try to eliminate this calculation, since its duplicated.
     // See: 'getMaxWaveScratchSize' in 'llvm/lib/Target/AMDGPU/GCNSubtarget.h'.
@@ -2869,7 +3327,8 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
 
     GridValues.GV_Max_Teams = GridMaxDim.x / GridValues.GV_Max_WG_Size;
     if (GridValues.GV_Max_Teams == 0)
-      return Plugin::error("Maximum number of teams cannot be zero");
+      return Plugin::error(ErrorCode::INVALID_ARGUMENT,
+                           "maximum number of teams cannot be zero");
 
     // Compute the default number of teams.
     uint32_t ComputeUnits = 0;
@@ -2913,7 +3372,8 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
       return Err;
 
     // Take the second timepoints and compute the required metadata.
-    OMPT_IF_ENABLED(completeH2DTimeRate(HostRef1, DeviceRef1););
+    auto EndTime = getDHTime();
+    deriveHostToDeviceClockOffset(StartTime, EndTime);
 
     uint32_t NumSdmaEngines = 0;
     if (auto Err =
@@ -2927,9 +3387,13 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
       return Err;
     DP("The number of XGMI Engines: %i\n", NumXGmiEngines);
 
+    // Detect if we are in Multi-Device mode
+    if (OMPX_NumMultiDevices > 0)
+      IsMultiDeviceEnabled = true;
+
     // Detect if XNACK is enabled
     SmallVector<SmallString<32>> Targets;
-    if (auto Err = utils::getTargetTripleAndFeatures(Agent, Targets))
+    if (auto Err = hsa_utils::getTargetTripleAndFeatures(Agent, Targets))
       return Err;
     if (!Targets.empty() && Targets[0].str().contains("xnack+"))
       IsXnackEnabled = true;
@@ -2957,6 +3421,18 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
     return Plugin::success();
   }
 
+  Error unloadBinaryImpl(DeviceImageTy *Image) override {
+    AMDGPUDeviceImageTy &AMDImage = static_cast<AMDGPUDeviceImageTy &>(*Image);
+
+    // Unload the executable of the image.
+    if (auto Err = AMDImage.unloadExecutable())
+      return Err;
+
+    // Destroy the associated memory and invalidate the object.
+    Plugin.free(Image);
+    return Error::success();
+  }
+
   /// Deinitialize the device and release its resources.
   Error deinitImpl() override {
     // Deinitialize the stream and event pools.
@@ -2969,19 +3445,6 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
     if (auto Err = AMDGPUSignalManager.deinit())
       return Err;
 
-    // Close modules if necessary.
-    if (!LoadedImages.empty()) {
-      // Each image has its own module.
-      for (DeviceImageTy *Image : LoadedImages) {
-        AMDGPUDeviceImageTy &AMDImage =
-            static_cast<AMDGPUDeviceImageTy &>(*Image);
-
-        // Unload the executable of the image.
-        if (auto Err = AMDImage.unloadExecutable())
-          return Err;
-      }
-    }
-
     // Invalidate agent reference.
     Agent = {0};
 
@@ -2992,18 +3455,12 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
 
   virtual Error callGlobalConstructors(GenericPluginTy &Plugin,
                                        DeviceImageTy &Image) override {
-    GenericGlobalHandlerTy &Handler = Plugin.getGlobalHandler();
-    if (Handler.isSymbolInImage(*this, Image, "amdgcn.device.fini"))
-      Image.setPendingGlobalDtors();
-
     return callGlobalCtorDtorCommon(Plugin, Image, /*IsCtor=*/true);
   }
 
   virtual Error callGlobalDestructors(GenericPluginTy &Plugin,
                                       DeviceImageTy &Image) override {
-    if (Image.hasPendingGlobalDtors())
-      return callGlobalCtorDtorCommon(Plugin, Image, /*IsCtor=*/false);
-    return Plugin::success();
+    return callGlobalCtorDtorCommon(Plugin, Image, /*IsCtor=*/false);
   }
 
   uint64_t getStreamBusyWaitMicroseconds() const { return OMPX_StreamBusyWait; }
@@ -3017,7 +3474,8 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
     std::error_code EC = sys::fs::createTemporaryFile("amdgpu-pre-link-jit",
                                                       "o", LinkerInputFilePath);
     if (EC)
-      return Plugin::error("Failed to create temporary file for linker");
+      return Plugin::error(ErrorCode::HOST_IO,
+                           "failed to create temporary file for linker");
 
     // Write the file's contents to the output file.
     Expected<std::unique_ptr<FileOutputBuffer>> OutputOrErr =
@@ -3033,16 +3491,17 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
     EC = sys::fs::createTemporaryFile("amdgpu-pre-link-jit", "so",
                                       LinkerOutputFilePath);
     if (EC)
-      return Plugin::error("Failed to create temporary file for linker");
+      return Plugin::error(ErrorCode::HOST_IO,
+                           "failed to create temporary file for linker");
 
     const auto &ErrorOrPath = sys::findProgramByName("lld");
     if (!ErrorOrPath)
-      return createStringError(inconvertibleErrorCode(),
-                               "Failed to find `lld` on the PATH.");
+      return createStringError(ErrorCode::HOST_TOOL_NOT_FOUND,
+                               "failed to find `lld` on the PATH.");
 
     std::string LLDPath = ErrorOrPath.get();
     INFO(OMP_INFOTYPE_PLUGIN_KERNEL, getDeviceId(),
-         "Using `%s` to link JITed amdgcn ouput.", LLDPath.c_str());
+         "Using `%s` to link JITed amdgcn output.", LLDPath.c_str());
 
     std::string MCPU = "-plugin-opt=mcpu=" + getComputeUnitKind();
     StringRef Args[] = {LLDPath,
@@ -3058,18 +3517,22 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
     std::string Error;
     int RC = sys::ExecuteAndWait(LLDPath, Args, std::nullopt, {}, 0, 0, &Error);
     if (RC)
-      return Plugin::error("Linking optimized bitcode failed: %s",
+      return Plugin::error(ErrorCode::LINK_FAILURE,
+                           "linking optimized bitcode failed: %s",
                            Error.c_str());
 
     auto BufferOrErr = MemoryBuffer::getFileOrSTDIN(LinkerOutputFilePath);
     if (!BufferOrErr)
-      return Plugin::error("Failed to open temporary file for lld");
+      return Plugin::error(ErrorCode::HOST_IO,
+                           "failed to open temporary file for lld");
 
     // Clean up the temporary files afterwards.
     if (sys::fs::remove(LinkerOutputFilePath))
-      return Plugin::error("Failed to remove temporary output file for lld");
+      return Plugin::error(ErrorCode::HOST_IO,
+                           "failed to remove temporary output file for lld");
     if (sys::fs::remove(LinkerInputFilePath))
-      return Plugin::error("Failed to remove temporary input file for lld");
+      return Plugin::error(ErrorCode::HOST_IO,
+                           "failed to remove temporary input file for lld");
 
     return std::move(*BufferOrErr);
   }
@@ -3087,7 +3550,8 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
     // Allocate and construct the AMDGPU kernel.
     AMDGPUKernelTy *AMDGPUKernel = Plugin.allocate<AMDGPUKernelTy>();
     if (!AMDGPUKernel)
-      return Plugin::error("Failed to allocate memory for AMDGPU kernel");
+      return Plugin::error(ErrorCode::OUT_OF_RESOURCES,
+                           "failed to allocate memory for AMDGPU kernel");
 
     new (AMDGPUKernel) AMDGPUKernelTy(Name, Plugin.getGlobalHandler());
 
@@ -3105,38 +3569,32 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
   }
 
   /// We want to set up the RPC server for host services to the GPU if it is
-  /// availible.
-  bool shouldSetupRPCServer() const override {
-    return libomptargetSupportsRPC();
-  }
+  /// available.
+  bool shouldSetupRPCServer() const override { return true; }
 
-  /// The RPC interface should have enough space for all availible parallelism.
+  /// The RPC interface should have enough space for all available parallelism.
   uint64_t requestedRPCPortCount() const override {
     return getHardwareParallelism();
   }
 
-  /// Get the stream of the asynchronous info sructure or get a new one.
+  /// Get the stream of the asynchronous info structure or get a new one.
   Error getStream(AsyncInfoWrapperTy &AsyncInfoWrapper,
                   AMDGPUStreamTy *&Stream) {
-    // Get the stream (if any) from the async info.
-    Stream = AsyncInfoWrapper.getQueueAs<AMDGPUStreamTy *>();
-    if (!Stream) {
-      // There was no stream; get an idle one.
-      if (auto Err = AMDGPUStreamManager.getResource(Stream))
-        return Err;
-
-      // Modify the async info's stream.
-      AsyncInfoWrapper.setQueueAs<AMDGPUStreamTy *>(Stream);
-    }
+    auto WrapperStream =
+        AsyncInfoWrapper.getOrInitQueue<AMDGPUStreamTy *>(AMDGPUStreamManager);
+    if (!WrapperStream)
+      return WrapperStream.takeError();
+    Stream = *WrapperStream;
     return Plugin::success();
   }
 
   /// Load the binary image into the device and allocate an image object.
-  Expected<DeviceImageTy *> loadBinaryImpl(const __tgt_device_image *TgtImage,
-                                           int32_t ImageId) override {
+  Expected<DeviceImageTy *>
+  loadBinaryImpl(std::unique_ptr<MemoryBuffer> &&TgtImage,
+                 int32_t ImageId) override {
     // Allocate and initialize the image object.
     AMDGPUDeviceImageTy *AMDImage = Plugin.allocate<AMDGPUDeviceImageTy>();
-    new (AMDImage) AMDGPUDeviceImageTy(ImageId, *this, TgtImage);
+    new (AMDImage) AMDGPUDeviceImageTy(ImageId, *this, std::move(TgtImage));
 
     // Load the HSA executable.
     if (Error Err = AMDImage->loadExecutable(*this))
@@ -3145,18 +3603,17 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
   }
 
   /// Allocate memory on the device or related to the device.
-  void *allocate(size_t Size, void *, TargetAllocTy Kind) override;
+  Expected<void *> allocate(size_t Size, void *, TargetAllocTy Kind) override;
 
   /// Deallocate memory on the device or related to the device.
-  int free(void *TgtPtr, TargetAllocTy Kind) override {
+  Error free(void *TgtPtr, TargetAllocTy Kind) override {
     if (TgtPtr == nullptr)
-      return OFFLOAD_SUCCESS;
+      return Plugin::success();
 
     AMDGPUMemoryPoolTy *MemoryPool = nullptr;
     switch (Kind) {
     case TARGET_ALLOC_DEFAULT:
     case TARGET_ALLOC_DEVICE:
-    case TARGET_ALLOC_DEVICE_NON_BLOCKING:
       MemoryPool = CoarseGrainedMemoryPools[0];
       break;
     case TARGET_ALLOC_HOST:
@@ -3167,21 +3624,19 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
       break;
     }
 
-    if (!MemoryPool) {
-      REPORT("No memory pool for the specified allocation kind\n");
-      return OFFLOAD_FAIL;
-    }
+    if (!MemoryPool)
+      return Plugin::error(ErrorCode::OUT_OF_RESOURCES,
+                           "no memory pool for the specified allocation kind");
 
-    if (Error Err = MemoryPool->deallocate(TgtPtr)) {
-      REPORT("%s\n", toString(std::move(Err)).data());
-      return OFFLOAD_FAIL;
-    }
+    if (auto Err = MemoryPool->deallocate(TgtPtr))
+      return Err;
 
-    return OFFLOAD_SUCCESS;
+    return Plugin::success();
   }
 
   /// Synchronize current thread with the pending operations on the async info.
-  Error synchronizeImpl(__tgt_async_info &AsyncInfo) override {
+  Error synchronizeImpl(__tgt_async_info &AsyncInfo,
+                        bool ReleaseQueue) override {
     AMDGPUStreamTy *Stream =
         reinterpret_cast<AMDGPUStreamTy *>(AsyncInfo.Queue);
     assert(Stream && "Invalid stream");
@@ -3192,8 +3647,11 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
     // Once the stream is synchronized, return it to stream pool and reset
     // AsyncInfo. This is to make sure the synchronization only works for its
     // own tasks.
-    AsyncInfo.Queue = nullptr;
-    return AMDGPUStreamManager.returnResource(Stream);
+    if (ReleaseQueue) {
+      AsyncInfo.Queue = nullptr;
+      return AMDGPUStreamManager.returnResource(Stream);
+    }
+    return Plugin::success();
   }
 
   /// Query for the completion of the pending operations on the async info.
@@ -3224,7 +3682,7 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
 
     hsa_status_t Status =
         hsa_amd_memory_lock(HstPtr, Size, nullptr, 0, &PinnedPtr);
-    if (auto Err = Plugin::check(Status, "Error in hsa_amd_memory_lock: %s\n"))
+    if (auto Err = Plugin::check(Status, "error in hsa_amd_memory_lock: %s\n"))
       return std::move(Err);
 
     return PinnedPtr;
@@ -3233,7 +3691,7 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
   /// Unpin the host buffer.
   Error dataUnlockImpl(void *HstPtr) override {
     hsa_status_t Status = hsa_amd_memory_unlock(HstPtr);
-    return Plugin::check(Status, "Error in hsa_amd_memory_unlock: %s\n");
+    return Plugin::check(Status, "error in hsa_amd_memory_unlock: %s\n");
   }
 
   /// Check through the HSA runtime whether the \p HstPtr buffer is pinned.
@@ -3243,11 +3701,10 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
     hsa_amd_pointer_info_t Info;
     Info.size = sizeof(hsa_amd_pointer_info_t);
 
-    hsa_status_t Status =
-        hsa_amd_pointer_info(HstPtr, &Info, /*Allocator=*/nullptr,
-                             /* Number of accessible agents (out) */ nullptr,
-                             /* Accessible agents */ nullptr);
-    if (auto Err = Plugin::check(Status, "Error in hsa_amd_pointer_info: %s"))
+    hsa_status_t Status = hsa_amd_pointer_info(
+        HstPtr, &Info, /*Allocator=*/nullptr, /*num_agents_accessible=*/nullptr,
+        /*accessible=*/nullptr);
+    if (auto Err = Plugin::check(Status, "error in hsa_amd_pointer_info: %s"))
       return std::move(Err);
 
     // The buffer may be locked or allocated through HSA allocators. Assume that
@@ -3294,12 +3751,19 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
         return Err;
       DP("OMPT-Async: Pinned Copy\n");
       return Stream->pushPinnedMemoryCopyAsync(TgtPtr, PinnedPtr, Size,
-                                               std::move(LocalOmptEventInfo));
+                                               LocalOmptEventInfo);
     }
 
     // For large transfers use synchronous behavior.
-    // If OMPT is enabled or synchronous behavior is explicitly requested:
+    // FIXME: Currently hsa async copy fails to see completion signal for
+    //        non-x86 dataSubmit/Retrieve. Other non-x86 calls to asyncMemCopy
+    //        work. So for now, skip async copy for non-x86 for dataSubmit
+    //        and dataRetrive only.
+#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86)
     if (OMPX_ForceSyncRegions || Size >= OMPX_MaxAsyncCopyBytes) {
+#else
+    if (false) {
+#endif
       if (AsyncInfoWrapper.hasQueue())
         if (auto Err = synchronize(AsyncInfoWrapper))
           return Err;
@@ -3308,7 +3772,7 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
       Status = hsa_amd_memory_lock(const_cast<void *>(HstPtr), Size, nullptr, 0,
                                    &PinnedPtr);
       if (auto Err =
-              Plugin::check(Status, "Error in hsa_amd_memory_lock: %s\n"))
+              Plugin::check(Status, "error in hsa_amd_memory_lock: %s\n"))
         return Err;
 
       AMDGPUSignalTy Signal;
@@ -3316,7 +3780,7 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
         return Err;
 
       DP("OMPT-Async: Sync Copy\n");
-      if (auto Err = utils::asyncMemCopy(useMultipleSdmaEngines(), TgtPtr,
+      if (auto Err = hsa_utils::asyncMemCopy(useMultipleSdmaEngines(), TgtPtr,
                                          Agent, PinnedPtr, Agent, Size, 0,
                                          nullptr, Signal.get()))
         return Err;
@@ -3326,8 +3790,9 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
 
 #ifdef OMPT_SUPPORT
       if (LocalOmptEventInfo) {
-        OmptKernelTimingArgsAsyncTy OmptKernelTimingArgsAsync{
-            Agent, &Signal, TicksToTime, std::move(LocalOmptEventInfo)};
+        ProfilingInfoTy OmptKernelTimingArgsAsync{
+            &Plugin, Agent, &Signal, TicksToTime, LocalOmptEventInfo};
+
         if (auto Err = timeDataTransferInNsAsync(&OmptKernelTimingArgsAsync))
           return Err;
       }
@@ -3337,7 +3802,7 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
         return Err;
 
       Status = hsa_amd_memory_unlock(const_cast<void *>(HstPtr));
-      return Plugin::check(Status, "Error in hsa_amd_memory_unlock: %s\n");
+      return Plugin::check(Status, "error in hsa_amd_memory_unlock: %s\n");
     }
 
     // Otherwise, use two-step copy with an intermediate pinned host buffer.
@@ -3352,7 +3817,7 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
     DP("OMPT-Async: ASync Copy\n");
     return Stream->pushMemoryCopyH2DAsync(TgtPtr, HstPtr, PinnedPtr, Size,
                                           PinnedMemoryManager,
-                                          std::move(LocalOmptEventInfo));
+                                          LocalOmptEventInfo);
   }
 
   /// Retrieve data from the device (device to host transfer).
@@ -3381,12 +3846,20 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
         return Err;
       DP("OMPT-Async: Pinned Copy\n");
       return Stream->pushPinnedMemoryCopyAsync(PinnedPtr, TgtPtr, Size,
-                                               std::move(LocalOmptEventInfo));
+                                               LocalOmptEventInfo);
     }
 
     // For large transfers use synchronous behavior.
     // If OMPT is enabled or synchronous behavior is explicitly requested:
+    // FIXME: Currently hsa async copy fails to see completion signal for
+    //        non-x86 dataSubmit/Retrieve. Other non-x86 calls to asyncMemCopy
+    //        work. So for now, skip async copy for non-x86 for dataSubmit
+    //        and dataRetrive only.
+#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86)
     if (OMPX_ForceSyncRegions || Size >= OMPX_MaxAsyncCopyBytes) {
+#else
+    if (false) {
+#endif
       if (AsyncInfoWrapper.hasQueue())
         if (auto Err = synchronize(AsyncInfoWrapper))
           return Err;
@@ -3395,16 +3868,16 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
       Status = hsa_amd_memory_lock(const_cast<void *>(HstPtr), Size, nullptr, 0,
                                    &PinnedPtr);
       if (auto Err =
-              Plugin::check(Status, "Error in hsa_amd_memory_lock: %s\n"))
+              Plugin::check(Status, "error in hsa_amd_memory_lock: %s\n"))
         return Err;
 
       AMDGPUSignalTy Signal;
       if (auto Err = Signal.init())
         return Err;
 
-      if (auto Err = utils::asyncMemCopy(useMultipleSdmaEngines(), PinnedPtr,
-                                         Agent, TgtPtr, Agent, Size, 0, nullptr,
-                                         Signal.get()))
+      if (auto Err = hsa_utils::asyncMemCopy(useMultipleSdmaEngines(),
+                                             PinnedPtr, Agent, TgtPtr, Agent,
+                                             Size, 0, nullptr, Signal.get()))
         return Err;
 
       if (auto Err = Signal.wait(getStreamBusyWaitMicroseconds()))
@@ -3412,8 +3885,9 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
 
 #ifdef OMPT_SUPPORT
       if (LocalOmptEventInfo) {
-        OmptKernelTimingArgsAsyncTy OmptKernelTimingArgsAsync{
-            Agent, &Signal, TicksToTime, std::move(LocalOmptEventInfo)};
+        ProfilingInfoTy OmptKernelTimingArgsAsync{
+            &Plugin, Agent, &Signal, TicksToTime, LocalOmptEventInfo};
+
         if (auto Err = timeDataTransferInNsAsync(&OmptKernelTimingArgsAsync))
           return Err;
       }
@@ -3423,7 +3897,7 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
         return Err;
 
       Status = hsa_amd_memory_unlock(const_cast<void *>(HstPtr));
-      return Plugin::check(Status, "Error in hsa_amd_memory_unlock: %s\n");
+      return Plugin::check(Status, "error in hsa_amd_memory_unlock: %s\n");
     }
 
     // Otherwise, use two-step copy with an intermediate pinned host buffer.
@@ -3437,7 +3911,7 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
 
     return Stream->pushMemoryCopyD2HAsync(HstPtr, TgtPtr, PinnedPtr, Size,
                                           PinnedMemoryManager,
-                                          std::move(LocalOmptEventInfo));
+                                          LocalOmptEventInfo);
   }
 
   /// Exchange data between two devices within the plugin.
@@ -3446,10 +3920,12 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
                          AsyncInfoWrapperTy &AsyncInfoWrapper) override {
     AMDGPUDeviceTy &DstDevice = static_cast<AMDGPUDeviceTy &>(DstGenericDevice);
 
+    DP("OMPT-Async: dataExchangeImpl\n");
+    auto LocalOmptEventInfo = getOrNullOmptEventInfo(AsyncInfoWrapper);
+
     // For large transfers use synchronous behavior.
     // If OMPT is enabled or synchronous behavior is explicitly requested:
-    if (OMPT_IF_BUILT(ompt::TracingActive ||) OMPX_ForceSyncRegions ||
-        Size >= OMPX_MaxAsyncCopyBytes) {
+    if (OMPX_ForceSyncRegions || Size >= OMPX_MaxAsyncCopyBytes) {
       if (AsyncInfoWrapper.hasQueue())
         if (auto Err = synchronize(AsyncInfoWrapper))
           return Err;
@@ -3458,7 +3934,7 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
       if (auto Err = Signal.init())
         return Err;
 
-      if (auto Err = utils::asyncMemCopy(
+      if (auto Err = hsa_utils::asyncMemCopy(
               useMultipleSdmaEngines(), DstPtr, DstDevice.getAgent(), SrcPtr,
               getAgent(), (uint64_t)Size, 0, nullptr, Signal.get()))
         return Err;
@@ -3466,7 +3942,15 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
       if (auto Err = Signal.wait(getStreamBusyWaitMicroseconds()))
         return Err;
 
-      OMPT_IF_TRACING_ENABLED(recordCopyTimingInNs(Signal.get()););
+#ifdef OMPT_SUPPORT
+      if (LocalOmptEventInfo) {
+        ProfilingInfoTy OmptKernelTimingArgsAsync{
+            &Plugin, Agent, &Signal, TicksToTime, LocalOmptEventInfo};
+
+        if (auto Err = timeDataTransferInNsAsync(&OmptKernelTimingArgsAsync))
+          return Err;
+      }
+#endif
 
       return Signal.deinit();
     }
@@ -3478,7 +3962,86 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
       return Plugin::success();
 
     return Stream->pushMemoryCopyD2DAsync(DstPtr, DstDevice.getAgent(), SrcPtr,
-                                          getAgent(), (uint64_t)Size);
+                                          getAgent(), (uint64_t)Size,
+                                          LocalOmptEventInfo);
+  }
+
+  /// Insert a data fence between previous data operations and the following
+  /// operations. This is a no-op for AMDGPU devices as operations inserted into
+  /// a queue are in-order.
+  Error dataFence(__tgt_async_info *Async) override {
+    return Plugin::success();
+  }
+
+  Error dataFillImpl(void *TgtPtr, const void *PatternPtr, int64_t PatternSize,
+                     int64_t Size,
+                     AsyncInfoWrapperTy &AsyncInfoWrapper) override {
+    // Fast case, where we can use the 4 byte hsa_amd_memory_fill
+    if (Size % 4 == 0 &&
+        (PatternSize == 4 || PatternSize == 2 || PatternSize == 1)) {
+      uint32_t Pattern;
+      if (PatternSize == 1) {
+        auto *Byte = reinterpret_cast<const uint8_t *>(PatternPtr);
+        Pattern = *Byte | *Byte << 8 | *Byte << 16 | *Byte << 24;
+      } else if (PatternSize == 2) {
+        auto *Word = reinterpret_cast<const uint16_t *>(PatternPtr);
+        Pattern = *Word | (*Word << 16);
+      } else if (PatternSize == 4) {
+        Pattern = *reinterpret_cast<const uint32_t *>(PatternPtr);
+      } else {
+        // Shouldn't be here if the pattern size is outwith those values
+        llvm_unreachable("Invalid pattern size");
+      }
+
+      if (hasPendingWorkImpl(AsyncInfoWrapper)) {
+        AMDGPUStreamTy *Stream = nullptr;
+        if (auto Err = getStream(AsyncInfoWrapper, Stream))
+          return Err;
+
+        struct MemFillArgsTy {
+          void *Dst;
+          uint32_t Pattern;
+          int64_t Size;
+        };
+        auto *Args = new MemFillArgsTy{TgtPtr, Pattern, Size / 4};
+        auto Fill = [](void *Data) {
+          MemFillArgsTy *Args = reinterpret_cast<MemFillArgsTy *>(Data);
+          assert(Args && "Invalid arguments");
+
+          auto Status =
+              hsa_amd_memory_fill(Args->Dst, Args->Pattern, Args->Size);
+          delete Args;
+          auto Err =
+              Plugin::check(Status, "error in hsa_amd_memory_fill: %s\n");
+          if (Err) {
+            FATAL_MESSAGE(1, "error performing async fill: %s",
+                          toString(std::move(Err)).data());
+          }
+        };
+
+        // hsa_amd_memory_fill doesn't signal completion using a signal, so use
+        // the existing host callback logic to handle that instead
+        return Stream->pushHostCallback(Fill, Args);
+      }
+      // If there is no pending work, do the fill synchronously
+      auto Status = hsa_amd_memory_fill(TgtPtr, Pattern, Size / 4);
+      return Plugin::check(Status, "error in hsa_amd_memory_fill: %s\n");
+    }
+
+    // Slow case; allocate an appropriate memory size and enqueue copies
+    void *PinnedPtr = nullptr;
+    AMDGPUMemoryManagerTy &PinnedMemoryManager =
+        HostDevice.getPinnedMemoryManager();
+    if (auto Err = PinnedMemoryManager.allocate(Size, &PinnedPtr))
+      return Err;
+
+    AMDGPUStreamTy *Stream = nullptr;
+    if (auto Err = getStream(AsyncInfoWrapper, Stream))
+      return Err;
+
+    return Stream->pushMemoryCopyH2DAsync(TgtPtr, PatternPtr, PinnedPtr,
+                                          PatternSize, PinnedMemoryManager,
+                                          nullptr, Size / PatternSize);
   }
 
   /// Initialize the async info for interoperability purposes.
@@ -3502,7 +4065,7 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
     // If the table has not yet been created, check if the gpu arch is
     // MI200 and create it, but only if USM Map is enabled.
     if (!IsEquippedWithGFX90A || !EnableGFX90ACoarseGrainUsmMaps)
-      return Plugin::error("Invalid request to set coarse grain mode");
+      return Plugin::error(ErrorCode::UNKNOWN, "Invalid request to set coarse grain mode");
     if (!CoarseGrainMemoryTable)
       CoarseGrainMemoryTable = new AMDGPUMemTypeBitFieldTable(
           AMDGPU_X86_64_SystemConfiguration::max_addressable_byte +
@@ -3523,7 +4086,7 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
       tt.value = HSA_AMD_SVM_GLOBAL_FLAG_COARSE_GRAINED;
       hsa_status_t err = hsa_amd_svm_attributes_set(ptr, size, &tt, 1);
       if (err != HSA_STATUS_SUCCESS) {
-        return Plugin::error("Failed to switch memotry to coarse grain mode.");
+        return Plugin::error(ErrorCode::UNKNOWN, "Failed to switch memotry to coarse grain mode.");
       }
     }
 
@@ -3548,11 +4111,50 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
     tt.value = Agent.handle;
     hsa_status_t err = hsa_amd_svm_attributes_set(ptr, size, &tt, 1);
     if (err != HSA_STATUS_SUCCESS) {
-      return Plugin::error("Failed to prepopulate GPU page table.");
+      return Plugin::error(ErrorCode::UNKNOWN, "Failed to prepopulate GPU page table.");
     }
-
     return Plugin::success();
   }
+
+  interop_spec_t selectInteropPreference(int32_t InteropType,
+                                         int32_t NumPrefers,
+                                         interop_spec_t *Prefers) override {
+    // TODO: update once targetsync is supported
+    if (InteropType == kmp_interop_type_target)
+      return interop_spec_t{tgt_fr_hsa, {false, 0}, 0};
+    return interop_spec_t{tgt_fr_none, {false, 0}, 0};
+  }
+
+  Expected<omp_interop_val_t *>
+  createInterop(int32_t InteropType, interop_spec_t &InteropSpec) override {
+    auto *Ret = new omp_interop_val_t(
+        DeviceId, static_cast<kmp_interop_type_t>(InteropType));
+    Ret->fr_id = tgt_fr_hsa;
+    Ret->vendor_id = omp_vendor_amd;
+
+    // TODO: implement targetsync support
+
+    Ret->device_info.Platform = nullptr;
+    Ret->device_info.Device = reinterpret_cast<void *>(Agent.handle);
+    Ret->device_info.Context = nullptr;
+
+    return Ret;
+  }
+
+  Error releaseInterop(omp_interop_val_t *Interop) override {
+    if (Interop)
+      delete Interop;
+    return Plugin::success();
+  }
+
+  Error enqueueHostCallImpl(void (*Callback)(void *), void *UserData,
+                            AsyncInfoWrapperTy &AsyncInfo) override {
+    AMDGPUStreamTy *Stream = nullptr;
+    if (auto Err = getStream(AsyncInfo, Stream))
+      return Err;
+
+    return Stream->pushHostCallback(Callback, UserData);
+  };
 
   /// Create an event.
   Error createEventImpl(void **EventPtrStorage) override {
@@ -3591,13 +4193,32 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
     return Event->wait(*Stream);
   }
 
+  Expected<bool> hasPendingWorkImpl(AsyncInfoWrapperTy &AsyncInfo) override {
+    auto *Stream = AsyncInfo.getQueueAs<AMDGPUStreamTy *>();
+    if (!Stream)
+      return false;
+
+    auto Query = Stream->query();
+    if (Query)
+      return !*Query;
+    return Query.takeError();
+  }
+
+  Expected<bool> isEventCompleteImpl(void *EventPtr,
+                                     AsyncInfoWrapperTy &AsyncInfo) override {
+    AMDGPUEventTy *Event = reinterpret_cast<AMDGPUEventTy *>(EventPtr);
+    auto *Stream = AsyncInfo.getQueueAs<AMDGPUStreamTy *>();
+    return Stream && Stream->isEventComplete(*Event);
+  }
+
   /// Synchronize the current thread with the event.
   Error syncEventImpl(void *EventPtr) override {
-    return Plugin::error("Synchronize event not implemented");
+    AMDGPUEventTy *Event = reinterpret_cast<AMDGPUEventTy *>(EventPtr);
+    return Event->sync();
   }
 
   /// Print information about the device.
-  Error obtainInfoImpl(InfoQueueTy &Info) override {
+  Expected<InfoTreeNode> obtainInfoImpl() override {
     char TmpChar[1000];
     const char *TmpCharPtr = "Unknown";
     uint16_t Major, Minor;
@@ -3608,31 +4229,42 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
     uint16_t WorkgrpMaxDim[3];
     hsa_dim3_t GridMaxDim;
     hsa_status_t Status, Status2;
+    InfoTreeNode Info;
 
     Status = hsa_system_get_info(HSA_SYSTEM_INFO_VERSION_MAJOR, &Major);
     Status2 = hsa_system_get_info(HSA_SYSTEM_INFO_VERSION_MINOR, &Minor);
     if (Status == HSA_STATUS_SUCCESS && Status2 == HSA_STATUS_SUCCESS)
       Info.add("HSA Runtime Version",
-               std::to_string(Major) + "." + std::to_string(Minor));
+               std::to_string(Major) + "." + std::to_string(Minor), "",
+               DeviceInfo::DRIVER_VERSION);
 
     Info.add("HSA OpenMP Device Number", DeviceId);
 
     Status = getDeviceAttrRaw(HSA_AMD_AGENT_INFO_PRODUCT_NAME, TmpChar);
     if (Status == HSA_STATUS_SUCCESS)
-      Info.add("Product Name", TmpChar);
+      Info.add("Product Name", TmpChar, "", DeviceInfo::PRODUCT_NAME);
 
     Status = getDeviceAttrRaw(HSA_AGENT_INFO_NAME, TmpChar);
     if (Status == HSA_STATUS_SUCCESS)
-      Info.add("Device Name", TmpChar);
+      Info.add("Device Name", TmpChar, "", DeviceInfo::NAME);
 
     Status = getDeviceAttrRaw(HSA_AGENT_INFO_VENDOR_NAME, TmpChar);
     if (Status == HSA_STATUS_SUCCESS)
-      Info.add("Vendor Name", TmpChar);
+      Info.add("Vendor Name", TmpChar, "", DeviceInfo::VENDOR);
+
+    Info.add("Vendor ID", uint64_t{4130}, "", DeviceInfo::VENDOR_ID);
+
+    hsa_machine_model_t MachineModel;
+    Status = getDeviceAttrRaw(HSA_AGENT_INFO_MACHINE_MODEL, MachineModel);
+    if (Status == HSA_STATUS_SUCCESS)
+      Info.add("Memory Address Size",
+               uint64_t{MachineModel == HSA_MACHINE_MODEL_SMALL ? 32u : 64u},
+               "bits", DeviceInfo::ADDRESS_BITS);
 
     hsa_device_type_t DevType;
     Status = getDeviceAttrRaw(HSA_AGENT_INFO_DEVICE, DevType);
     if (Status == HSA_STATUS_SUCCESS) {
-      switch (DevType) {
+      switch (static_cast<int>(DevType)) {
       case HSA_DEVICE_TYPE_CPU:
         TmpCharPtr = "CPU";
         break;
@@ -3641,6 +4273,9 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
         break;
       case HSA_DEVICE_TYPE_DSP:
         TmpCharPtr = "DSP";
+        break;
+      default:
+        TmpCharPtr = "Unknown";
         break;
       }
       Info.add("Device Type", TmpCharPtr);
@@ -3663,11 +4298,11 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
     // runtime.
     Status = getDeviceAttrRaw(HSA_AGENT_INFO_CACHE_SIZE, CacheSize);
     if (Status == HSA_STATUS_SUCCESS) {
-      Info.add("Cache");
+      auto &Cache = *Info.add("Cache");
 
       for (int I = 0; I < 4; I++)
         if (CacheSize[I])
-          Info.add<InfoLevel2>("L" + std::to_string(I), CacheSize[I]);
+          Cache.add("L" + std::to_string(I), CacheSize[I]);
     }
 
     Status = getDeviceAttrRaw(HSA_AMD_AGENT_INFO_CACHELINE_SIZE, TmpUInt);
@@ -3676,11 +4311,17 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
 
     Status = getDeviceAttrRaw(HSA_AMD_AGENT_INFO_MAX_CLOCK_FREQUENCY, TmpUInt);
     if (Status == HSA_STATUS_SUCCESS)
-      Info.add("Max Clock Freq", TmpUInt, "MHz");
+      Info.add("Max Clock Freq", TmpUInt, "MHz",
+               DeviceInfo::MAX_CLOCK_FREQUENCY);
+
+    Status = getDeviceAttrRaw(HSA_AMD_AGENT_INFO_MEMORY_MAX_FREQUENCY, TmpUInt);
+    if (Status == HSA_STATUS_SUCCESS)
+      Info.add("Max Memory Clock Freq", TmpUInt, "MHz",
+               DeviceInfo::MEMORY_CLOCK_RATE);
 
     Status = getDeviceAttrRaw(HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT, TmpUInt);
     if (Status == HSA_STATUS_SUCCESS)
-      Info.add("Compute Units", TmpUInt);
+      Info.add("Compute Units", TmpUInt, "", DeviceInfo::NUM_COMPUTE_UNITS);
 
     Status = getDeviceAttrRaw(HSA_AMD_AGENT_INFO_NUM_SIMDS_PER_CU, TmpUInt);
     if (Status == HSA_STATUS_SUCCESS)
@@ -3696,14 +4337,17 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
 
     Status = getDeviceAttrRaw(HSA_AGENT_INFO_WORKGROUP_MAX_SIZE, TmpUInt);
     if (Status == HSA_STATUS_SUCCESS)
-      Info.add("Workgroup Max Size", TmpUInt);
+      Info.add("Workgroup Max Size", TmpUInt, "",
+               DeviceInfo::MAX_WORK_GROUP_SIZE);
 
     Status = getDeviceAttrRaw(HSA_AGENT_INFO_WORKGROUP_MAX_DIM, WorkgrpMaxDim);
     if (Status == HSA_STATUS_SUCCESS) {
-      Info.add("Workgroup Max Size per Dimension");
-      Info.add<InfoLevel2>("x", WorkgrpMaxDim[0]);
-      Info.add<InfoLevel2>("y", WorkgrpMaxDim[1]);
-      Info.add<InfoLevel2>("z", WorkgrpMaxDim[2]);
+      auto &MaxSize =
+          *Info.add("Workgroup Max Size per Dimension", std::monostate{}, "",
+                    DeviceInfo::MAX_WORK_GROUP_SIZE_PER_DIMENSION);
+      MaxSize.add("x", WorkgrpMaxDim[0]);
+      MaxSize.add("y", WorkgrpMaxDim[1]);
+      MaxSize.add("z", WorkgrpMaxDim[2]);
     }
 
     Status = getDeviceAttrRaw(
@@ -3715,21 +4359,22 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
 
     Status = getDeviceAttrRaw(HSA_AGENT_INFO_GRID_MAX_SIZE, TmpUInt);
     if (Status == HSA_STATUS_SUCCESS)
-      Info.add("Grid Max Size", TmpUInt);
+      Info.add("Grid Max Size", TmpUInt, "", DeviceInfo::MAX_WORK_SIZE);
 
     Status = getDeviceAttrRaw(HSA_AGENT_INFO_GRID_MAX_DIM, GridMaxDim);
     if (Status == HSA_STATUS_SUCCESS) {
-      Info.add("Grid Max Size per Dimension");
-      Info.add<InfoLevel2>("x", GridMaxDim.x);
-      Info.add<InfoLevel2>("y", GridMaxDim.y);
-      Info.add<InfoLevel2>("z", GridMaxDim.z);
+      auto &MaxDim = *Info.add("Grid Max Size per Dimension", std::monostate{},
+                               "", DeviceInfo::MAX_WORK_SIZE_PER_DIMENSION);
+      MaxDim.add("x", GridMaxDim.x);
+      MaxDim.add("y", GridMaxDim.y);
+      MaxDim.add("z", GridMaxDim.z);
     }
 
     Status = getDeviceAttrRaw(HSA_AGENT_INFO_FBARRIER_MAX_SIZE, TmpUInt);
     if (Status == HSA_STATUS_SUCCESS)
       Info.add("Max fbarriers/Workgrp", TmpUInt);
 
-    Info.add("Memory Pools");
+    auto &RootPool = *Info.add("Memory Pools");
     for (AMDGPUMemoryPoolTy *Pool : AllMemoryPools) {
       std::string TmpStr, TmpStr2;
 
@@ -3744,7 +4389,7 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
       else
         TmpStr = "Unknown";
 
-      Info.add<InfoLevel2>(std::string("Pool ") + TmpStr);
+      auto &PoolNode = *RootPool.add(std::string("Pool ") + TmpStr);
 
       if (Pool->isGlobal()) {
         if (Pool->isFineGrained())
@@ -3754,39 +4399,43 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
         if (Pool->supportsKernelArgs())
           TmpStr2 += "Kernarg ";
 
-        Info.add<InfoLevel3>("Flags", TmpStr2);
+        PoolNode.add("Flags", TmpStr2);
       }
 
       Status = Pool->getAttrRaw(HSA_AMD_MEMORY_POOL_INFO_SIZE, TmpSt);
       if (Status == HSA_STATUS_SUCCESS)
-        Info.add<InfoLevel3>("Size", TmpSt, "bytes");
+        PoolNode.add(
+            "Size", TmpSt, "bytes",
+            (Pool->isGlobal() && Pool->isCoarseGrained())
+                ? std::optional<DeviceInfo>{DeviceInfo::GLOBAL_MEM_SIZE}
+                : std::nullopt);
 
       Status = Pool->getAttrRaw(HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALLOWED,
                                 TmpBool);
       if (Status == HSA_STATUS_SUCCESS)
-        Info.add<InfoLevel3>("Allocatable", TmpBool);
+        PoolNode.add("Allocatable", TmpBool);
 
       Status = Pool->getAttrRaw(HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_GRANULE,
                                 TmpSt);
       if (Status == HSA_STATUS_SUCCESS)
-        Info.add<InfoLevel3>("Runtime Alloc Granule", TmpSt, "bytes");
+        PoolNode.add("Runtime Alloc Granule", TmpSt, "bytes");
 
       Status = Pool->getAttrRaw(
           HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALIGNMENT, TmpSt);
       if (Status == HSA_STATUS_SUCCESS)
-        Info.add<InfoLevel3>("Runtime Alloc Alignment", TmpSt, "bytes");
+        PoolNode.add("Runtime Alloc Alignment", TmpSt, "bytes");
 
       Status =
           Pool->getAttrRaw(HSA_AMD_MEMORY_POOL_INFO_ACCESSIBLE_BY_ALL, TmpBool);
       if (Status == HSA_STATUS_SUCCESS)
-        Info.add<InfoLevel3>("Accessable by all", TmpBool);
+        PoolNode.add("Accessible by all", TmpBool);
     }
 
-    Info.add("ISAs");
-    auto Err = utils::iterateAgentISAs(getAgent(), [&](hsa_isa_t ISA) {
+    auto &ISAs = *Info.add("ISAs");
+    auto Err = hsa_utils::iterateAgentISAs(getAgent(), [&](hsa_isa_t ISA) {
       Status = hsa_isa_get_info_alt(ISA, HSA_ISA_INFO_NAME, TmpChar);
       if (Status == HSA_STATUS_SUCCESS)
-        Info.add<InfoLevel2>("Name", TmpChar);
+        ISAs.add("Name", TmpChar);
 
       return Status;
     });
@@ -3795,23 +4444,7 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
     if (Err)
       consumeError(std::move(Err));
 
-    return Plugin::success();
-  }
-
-  /// Get the HSA system timestamps for the input signal associated with an
-  /// async copy and pass the information to libomptarget
-  void recordCopyTimingInNs(hsa_signal_t signal) {
-    hsa_amd_profiling_async_copy_time_t time_rec;
-    hsa_status_t Status =
-        hsa_amd_profiling_get_async_copy_time(signal, &time_rec);
-    if (Status != HSA_STATUS_SUCCESS) {
-      DP("Error while getting async copy time\n");
-      return;
-    }
-#ifdef OMPT_SUPPORT
-    ompt::setOmptTimestamp(time_rec.start * TicksToTime,
-                           time_rec.end * TicksToTime);
-#endif
+    return Info;
   }
 
   /// Returns true if auto zero-copy the best configuration for the current
@@ -3838,9 +4471,12 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
     // Implementation sanity checks: either unified_shared_memory or auto
     // zero-copy, not both
     if (isUnifiedSharedMemory && isAutoZeroCopy)
-      return Plugin::error("Internal runtime error: cannot be both "
+      return Plugin::error(ErrorCode::UNKNOWN,
+                           "Internal runtime error: cannot be both "
                            "unified_shared_memory and auto zero-copy.");
 
+    // The following IsXnackEnable variables comes from compiler flags so it
+    // might be true even when we run with HSA_XNACK=0.
     if (IsXnackEnabled)
       INFO(OMP_INFOTYPE_USER_DIAGNOSTIC, getDeviceId(), "XNACK is enabled.\n");
     else
@@ -3909,10 +4545,11 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
       if (Pool->isGlobal()) {
         hsa_status_t Status =
             Pool->getAttrRaw(HSA_AMD_MEMORY_POOL_INFO_SIZE, Value);
-        return Plugin::check(Status, "Error in getting device memory size: %s");
+        return Plugin::check(Status, "error in getting device memory size: %s");
       }
     }
-    return Plugin::error("getDeviceMemorySize:: no global pool");
+    return Plugin::error(ErrorCode::UNSUPPORTED,
+                         "getDeviceMemorySize:: no global pool");
   }
 
   /// AMDGPU-specific function to get device attributes.
@@ -3936,7 +4573,7 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
   /// Retrieve and construct all memory pools of the device agent.
   Error retrieveAllMemoryPools() override {
     // Iterate through the available pools of the device agent.
-    return utils::iterateAgentMemoryPools(
+    return hsa_utils::iterateAgentMemoryPools(
         Agent, [&](hsa_amd_memory_pool_t HSAMemoryPool) {
           AMDGPUMemoryPoolTy *MemoryPool =
               Plugin.allocate<AMDGPUMemoryPoolTy>();
@@ -3947,8 +4584,8 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
   }
 
   /// Propagate the enable/disable profiling request to the StreamManager.
-  void setOmptQueueProfile(int Enable) {
-    AMDGPUStreamManager.setOmptQueueProfile(Enable);
+  void setHSAQueueProfiling(int Enable) {
+    AMDGPUStreamManager.setHSAQueueProfiling(Enable);
   }
 
   /// Get the address of pointer to the preallocated device memory pool.
@@ -3959,9 +4596,6 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
   /// Allocate and zero initialize a small memory pool from the coarse grained
   /// device memory of each device.
   Error preAllocateDeviceMemoryPool() {
-    Error Err = retrieveAllMemoryPools();
-    if (Err)
-      return Plugin::error("Unable to retieve all memmory pools");
 
     void *DevPtr;
     for (AMDGPUMemoryPoolTy *MemoryPool : AllMemoryPools) {
@@ -3970,19 +4604,19 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
 
       if (MemoryPool->isCoarseGrained()) {
         DevPtr = nullptr;
-        size_t PreAllocSize = utils::PER_DEVICE_PREALLOC_SIZE;
+        size_t PreAllocSize = hsa_utils::PER_DEVICE_PREALLOC_SIZE;
 
-        Err = MemoryPool->allocate(PreAllocSize, &DevPtr);
+        Error Err = MemoryPool->allocate(PreAllocSize, &DevPtr);
         if (Err)
-          return Plugin::error("Device memory pool preallocation failed");
+          return Plugin::error(ErrorCode::UNKNOWN, "Device memory pool preallocation failed");
 
         Err = MemoryPool->enableAccess(DevPtr, PreAllocSize, {getAgent()});
         if (Err)
-          return Plugin::error("Preallocated device memory pool inaccessible");
+          return Plugin::error(ErrorCode::UNKNOWN, "Preallocated device memory pool inaccessible");
 
         Err = MemoryPool->zeroInitializeMemory(DevPtr, PreAllocSize);
         if (Err)
-          return Plugin::error(
+          return Plugin::error(ErrorCode::UNKNOWN,
               "Zero initialization of preallocated device memory pool failed");
 
         PreAllocatedDeviceMemoryPool = DevPtr;
@@ -3992,6 +4626,12 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
   }
 
   bool useMultipleSdmaEngines() const { return OMPX_UseMultipleSdmaEngines; }
+
+  bool useSharedMemForDescriptor(int64_t Size) override {
+    return Size <= OMPX_SharedDescriptorMaxSize;
+  }
+
+  bool useStrictSanityChecks() const { return OMPX_StrictSanityChecks; }
 
 private:
   using AMDGPUEventRef = AMDGPUResourceRef<AMDGPUEventTy>;
@@ -4006,7 +4646,7 @@ private:
     // Perform a quick check for the named kernel in the image. The kernel
     // should be created by the 'amdgpu-lower-ctor-dtor' pass.
     GenericGlobalHandlerTy &Handler = Plugin.getGlobalHandler();
-    if (IsCtor && !Handler.isSymbolInImage(*this, Image, KernelName))
+    if (!Handler.isSymbolInImage(*this, Image, KernelName))
       return Plugin::success();
 
     // Allocate and construct the AMDGPU kernel.
@@ -4017,10 +4657,10 @@ private:
     AsyncInfoWrapperTy AsyncInfoWrapper(*this, nullptr);
 
     KernelArgsTy KernelArgs = {};
-    if (auto Err =
-            AMDGPUKernel.launchImpl(*this, /*NumThread=*/1u,
-                                    /*NumBlocks=*/1ul, KernelArgs,
-                                    KernelLaunchParamsTy{}, AsyncInfoWrapper))
+    uint32_t NumBlocksAndThreads[3] = {1u, 1u, 1u};
+    if (auto Err = AMDGPUKernel.launchImpl(
+            *this, NumBlocksAndThreads, NumBlocksAndThreads, KernelArgs,
+            KernelLaunchParamsTy{}, AsyncInfoWrapper))
       return Err;
 
     Error Err = Plugin::success();
@@ -4034,16 +4674,10 @@ private:
     // TODO: replace with ROCr API once it becomes available.
     // MI300A
     llvm::StringRef StrGfxName(ComputeUnitKind);
-    IsAPU = llvm::StringSwitch<bool>(StrGfxName)
-                .Case("gfx940", true)
-                .Default(false);
-    if (IsAPU)
-      return Plugin::success();
-
     bool MayBeAPU = llvm::StringSwitch<bool>(StrGfxName)
                         .Case("gfx942", true)
                         .Default(false);
-    if (!MayBeAPU) // not gfx90a, gfx940, gfx941, or or gfx942
+    if (!MayBeAPU) // not gfx90a or gfx942
       return Plugin::success();
 
     // Can be MI300A or MI300X
@@ -4067,12 +4701,6 @@ private:
 
   Error checkIfMI300x() {
     llvm::StringRef StrGfxName(ComputeUnitKind);
-    IsEquippedWithMI300X = llvm::StringSwitch<bool>(StrGfxName)
-                               .Case("gfx941", true)
-                               .Default(false);
-
-    if (IsEquippedWithMI300X)
-      return Plugin::success();
 
     bool isMI300 = llvm::StringSwitch<bool>(StrGfxName)
                        .Case("gfx942", true)
@@ -4093,36 +4721,34 @@ private:
 
   bool checkIfCoarseGrainMemoryNearOrAbove64GB() {
     for (AMDGPUMemoryPoolTy *Pool : AllMemoryPools) {
-      if (Pool->isGlobal() && Pool->isCoarseGrained()) {
-	uint64_t Value;
-        hsa_status_t Status =
-            Pool->getAttrRaw(HSA_AMD_MEMORY_POOL_INFO_SIZE, Value);
-        if (Status != HSA_STATUS_SUCCESS) continue;
-	constexpr uint64_t Almost64Gig = 0xFF0000000;
-	if (Value >= Almost64Gig) return true;
-      }
+      if (!Pool->isGlobal() || !Pool->isCoarseGrained())
+        continue;
+      uint64_t Value;
+      hsa_status_t Status =
+          Pool->getAttrRaw(HSA_AMD_MEMORY_POOL_INFO_SIZE, Value);
+      if (Status != HSA_STATUS_SUCCESS)
+        continue;
+      constexpr uint64_t Almost64Gig = 0xFF0000000;
+      if (Value >= Almost64Gig)
+        return true;
     }
     return false; // CoarseGrain pool w/ 64GB or more capacity not found
   }
 
   size_t getMemoryManagerSizeThreshold() override {
-    // TODO: check performance on lower memory capacity GPU
-    // for lowering the threshold from 64GB.
+    // Targeting high memory capacity GPUs such as
+    // data center GPUs.
     if (checkIfCoarseGrainMemoryNearOrAbove64GB()) {
-      // Set GenericDeviceTy::MemoryManager's Threshold to ~2GB,
-      // used if not set by LIBOMPTARGET_MEMORY_MANAGER_THRESHOLD
-      // ENV var. This MemoryManager is used for
-      // omp_target_alloc(), OpenMP (non-usm) map clause, etc.
+      // Set GenericDeviceTy::MemoryManager's Threshold to 3GiB,
+      // if threshold is not already set by ENV var
+      // LIBOMPTARGET_MEMORY_MANAGER_THRESHOLD.
+      // This MemoryManager is used for omp_target_alloc(), OpenMP
+      // (non-usm) map clause, etc.
       //
-      // TODO 1: Fine tune to lower the threshold closer to 1GB.
-      // TODO 2: HSA-level memory manager on the user-side such that
-      // memory management is shared with HIP and OpenCL.
-      //
-      // If this value needs to go above UINT_MAX, consider
-      // adding sizeof(size_t) check to avoid unpleasant truncation
-      // surprises where size_t is still 32bit.
-      constexpr size_t Almost2Gig = 2000000000u;
-      return Almost2Gig;
+      // Ideally, this kind of pooling is best performed at
+      // a common level (e.g, user side of HSA) between OpenMP and HIP
+      // but that feature does not exist (yet).
+      return 3ul * 1024 * 1024 * 1024 /* 3 GiB */;
     }
     return 0;
   }
@@ -4151,6 +4777,26 @@ private:
   /// the current configuration.
   bool supportsUnifiedMemoryImpl() override final { return IsXnackEnabled; }
 
+  /// Get the normalized marketing name of the device.
+  /// It only targets Instinct MI series for now.
+  /// e.g AMD Instinct MI210 => MI210
+  std::string getNormMarketingName() const {
+    char MarketingName[64];
+    hsa_status_t Status = hsa_agent_get_info(
+        Agent, static_cast<hsa_agent_info_t>(HSA_AMD_AGENT_INFO_PRODUCT_NAME),
+        MarketingName);
+
+    if (Status != HSA_STATUS_SUCCESS)
+      return "UNKNOWN";
+
+    // Normalize
+    const char *MIPos = strstr(MarketingName, "MI");
+    if (MIPos)
+      return std::string(MIPos);
+
+    return "UNKNOWN";
+  }
+
   /// Envar for controlling the number of HSA queues per device. High number of
   /// queues may degrade performance.
   UInt32Envar OMPX_NumQueues;
@@ -4177,6 +4823,16 @@ private:
   /// is not specified. If non-zero, the number of teams =
   /// OMPX_BigJumpLoopTeamsPerCU * #CUs.
   UInt32Envar OMPX_BigJumpLoopTeamsPerCU;
+
+  /// Envar for controlling the number of teams relative to the number of
+  /// compute units (CUs) for cross-team-reduction kernels. 0 indicates that
+  /// this value is not specified. If non-zero, the number of teams =
+  /// OMPX_XTeamRedTeamsPerCU * #CUs.
+  UInt32Envar OMPX_XTeamRedTeamsPerCU;
+
+  /// Envar controlling the maximum number of teams per device for
+  /// Big-Jump-Loop kernels.
+  UInt32Envar OMPX_BigJumpLoopMaxTotalTeams;
 
   /// Envar specifying tripcount below which the blocksize should be adjusted.
   UInt32Envar OMPX_LowTripCount;
@@ -4207,14 +4863,21 @@ private:
   /// done.
   UInt32Envar OMPX_AdjustNumTeamsForSmallBlockSize;
 
-  /// Envar to allow scaling up the number of teams for Xteam-Reduction
-  /// whenever the blocksize has been reduced from the default. The env-var
-  /// default of 0 means that the scaling is not done by default.
+  /// Envar to allow scaling up the number of teams for Xteam-Reduction,
+  /// whenever the blocksize has been reduced from the max. The value 0
+  /// indicates that this functionality is disabled. The default value is 1,
+  /// indicating that if the number of waves is lower than the max, increase the
+  /// number of teams proportionally. A value greater than 1 indicates that the
+  /// value should be used as the scaling factor for the number of teams.
   UInt32Envar OMPX_AdjustNumTeamsForXteamRedSmallBlockSize;
+
+  /// Envar indicating whether, for generic-SPMD kernels, the blocksize should
+  /// be reduced and the corresponding number of teams adjusted.
+  BoolEnvar OMPX_GenericSpmdUseSmallBlockSize;
 
   /// Envar specifying the maximum size in bytes where the memory copies are
   /// asynchronous operations. Up to this transfer size, the memory copies are
-  /// asychronous operations pushed to the corresponding stream. For larger
+  /// asynchronous operations pushed to the corresponding stream. For larger
   /// transfers, they are synchronous transfers.
   UInt32Envar OMPX_MaxAsyncCopyBytes;
 
@@ -4275,6 +4938,10 @@ private:
   /// Value of OMPX_DGPU_MAPS. When enabled, it will always perform
   /// copy on APUs regardless of the setting of HSA_XNACK.
   BoolEnvar OMPX_DGPUMaps;
+
+  /// Descriptors of size <= to this value will be allocated using shared
+  /// memory. Default value is 48.
+  UInt32Envar OMPX_SharedDescriptorMaxSize;
 
   // Determines whether we call HSA API, upon device memory allocation,
   // for making the memory acceccible from other agents.
@@ -4353,6 +5020,64 @@ private:
   /// True if in multi-device mode.
   bool IsMultiDeviceEnabled = false;
 
+  /// Struct holding time in ns at a point in time for both host and device
+  /// This is used to compute a device-to-host offset and skew. Required for
+  /// OMPT function translate_time.
+  struct DevHostTimePair {
+    uint64_t Device;
+    double Host;
+  };
+
+  /// Get a DHTimepoint
+  DevHostTimePair getDHTime() const {
+    return DevHostTimePair{getSystemTimestampInNs(), getTimeOfDay()};
+  }
+
+  /// Compute time differences for host and device between Start and End
+  /// Assume host (h) timing is related to device (d) timing as
+  /// h = m.d + o, where m is the slope and o is the offset.
+  /// Calculate slope and offset from the two host and device timepoints.
+  void deriveHostToDeviceClockOffset(DevHostTimePair Start, DevHostTimePair End) {
+    double HostDiff = End.Host - Start.Host;
+    uint64_t DeviceDiff = End.Device - Start.Device;
+    double Slope = DeviceDiff != 0 ? (HostDiff / DeviceDiff) : HostDiff;
+    double Offset = Start.Host - Slope * Start.Device;
+    DP("Translate time Slope: %f Offset: %f\n", Slope, Offset);
+    Plugin.getProfiler()->setTimeConversionFactors(Slope, Offset);
+  }
+
+  /// Representing all the runtime envar configs for a device.
+  struct DeviceEnvarConfigTy {
+    bool
+        OMPX_UseMultipleSdmaEngines; // LIBOMPTARGET_AMDGPU_USE_MULTIPLE_SDMA_ENGINES
+  };
+
+  static inline const std::unordered_map<std::string, DeviceEnvarConfigTy>
+      EnvarConfigs = {{"MI210", {.OMPX_UseMultipleSdmaEngines = true}},
+                      {"MI300A", {.OMPX_UseMultipleSdmaEngines = false}},
+                      {"MI300X", {.OMPX_UseMultipleSdmaEngines = true}},
+                      // Default config for unknown devices.
+                      {"DEFAULT", {.OMPX_UseMultipleSdmaEngines = false}}};
+
+  const DeviceEnvarConfigTy &getEnvarConfig() const {
+    std::string DeviceMarketingName = getNormMarketingName();
+    auto It = EnvarConfigs.find(DeviceMarketingName);
+
+    if (DeviceMarketingName == "UNKNOWN" || It == EnvarConfigs.end()) {
+      // Return default config
+      DP("Default envar config is used.\n");
+      auto DefaultIt = EnvarConfigs.find("DEFAULT");
+
+      assert(DefaultIt != EnvarConfigs.end() &&
+             "Default envar config not found!\n");
+      return DefaultIt->second;
+    }
+
+    DP("Envar config for %s is used.\n", DeviceMarketingName.c_str());
+
+    return It->second;
+  }
+
 public:
   /// Return if it is an MI300 series device.
   bool checkIfMI300Device() {
@@ -4365,51 +5090,45 @@ public:
 };
 
 Error AMDGPUDeviceImageTy::loadExecutable(const AMDGPUDeviceTy &Device) {
-  hsa_status_t Status;
-  Status = hsa_code_object_deserialize(getStart(), getSize(), "", &CodeObject);
-  if (auto Err =
-          Plugin::check(Status, "Error in hsa_code_object_deserialize: %s"))
+  hsa_code_object_reader_t Reader;
+  hsa_status_t Status =
+      hsa_code_object_reader_create_from_memory(getStart(), getSize(), &Reader);
+  if (auto Err = Plugin::check(
+          Status, "error in hsa_code_object_reader_create_from_memory: %s"))
     return Err;
 
   Status = hsa_executable_create_alt(
       HSA_PROFILE_FULL, HSA_DEFAULT_FLOAT_ROUNDING_MODE_ZERO, "", &Executable);
   if (auto Err =
-          Plugin::check(Status, "Error in hsa_executable_create_alt: %s"))
+          Plugin::check(Status, "error in hsa_executable_create_alt: %s"))
     return Err;
 
-#if SANITIZER_AMDGPU
-  Status = hsa_code_object_reader_create_from_memory(getStart(), getSize(),
-                                                     &CodeObjectReader);
-  if (auto Err = Plugin::check(
-          Status, "Error in hsa_code_object_reader_from_memory: %s"))
-    return Err;
-
+  hsa_loaded_code_object_t Object;
   Status = hsa_executable_load_agent_code_object(Executable, Device.getAgent(),
-                                                 CodeObjectReader, "", nullptr);
-  if (auto Err =
-          Plugin::check(Status, "Error in hsa_executable_load_code_object: %s"))
+                                                 Reader, "", &Object);
+  if (auto Err = Plugin::check(
+          Status, "error in hsa_executable_load_agent_code_object: %s"))
     return Err;
-#else
-  Status = hsa_executable_load_code_object(Executable, Device.getAgent(),
-                                           CodeObject, "");
-  if (auto Err =
-          Plugin::check(Status, "Error in hsa_executable_load_code_object: %s"))
-    return Err;
-#endif
 
   Status = hsa_executable_freeze(Executable, "");
-  if (auto Err = Plugin::check(Status, "Error in hsa_executable_freeze: %s"))
+  if (auto Err = Plugin::check(Status, "error in hsa_executable_freeze: %s"))
     return Err;
 
   uint32_t Result;
   Status = hsa_executable_validate(Executable, &Result);
-  if (auto Err = Plugin::check(Status, "Error in hsa_executable_validate: %s"))
+  if (auto Err = Plugin::check(Status, "error in hsa_executable_validate: %s"))
     return Err;
 
   if (Result)
-    return Plugin::error("Loaded HSA executable does not validate");
+    return Plugin::error(ErrorCode::INVALID_BINARY,
+                         "loaded HSA executable does not validate");
 
-  if (auto Err = utils::readAMDGPUMetaDataFromImage(
+  Status = hsa_code_object_reader_destroy(Reader);
+  if (auto Err =
+          Plugin::check(Status, "error in hsa_code_object_reader_destroy: %s"))
+    return Err;
+
+  if (auto Err = hsa_utils::readAMDGPUMetaDataFromImage(
           getMemoryBuffer(), KernelInfoMap, ELFABIVersion))
     return Err;
 
@@ -4426,7 +5145,7 @@ AMDGPUDeviceImageTy::findDeviceSymbol(GenericDeviceTy &Device,
   hsa_status_t Status = hsa_executable_get_symbol_by_name(
       Executable, SymbolName.data(), &Agent, &Symbol);
   if (auto Err = Plugin::check(
-          Status, "Error in hsa_executable_get_symbol_by_name(%s): %s",
+          Status, "error in hsa_executable_get_symbol_by_name(%s): %s",
           SymbolName.data()))
     return std::move(Err);
 
@@ -4446,7 +5165,8 @@ bool AMDGPUDeviceImageTy::hasDeviceSymbol(GenericDeviceTy &Device,
 template <typename ResourceTy>
 Error AMDGPUResourceRef<ResourceTy>::create(GenericDeviceTy &Device) {
   if (Resource)
-    return Plugin::error("Creating an existing resource");
+    return Plugin::error(ErrorCode::INVALID_ARGUMENT,
+                         "creating an existing resource");
 
   AMDGPUDeviceTy &AMDGPUDevice = static_cast<AMDGPUDeviceTy &>(Device);
 
@@ -4459,10 +5179,12 @@ AMDGPUStreamTy::AMDGPUStreamTy(AMDGPUDeviceTy &Device)
     : Agent(Device.getAgent()), Queue(nullptr),
       SignalManager(Device.getSignalManager()), Device(Device),
       // Initialize the std::deque with some empty positions.
-      Slots(32), NextSlot(0), SyncCycle(0), RPCServer(nullptr),
+      Slots(32), NextSlot(0), SyncCycle(0),
       StreamBusyWaitMicroseconds(Device.getStreamBusyWaitMicroseconds()),
       UseMultipleSdmaEngines(Device.useMultipleSdmaEngines()),
-      UseSyncCopyBack(Device.syncCopyBack()) {}
+      UseSyncCopyBack(Device.syncCopyBack()),
+      OMPX_MinHostToHostAsyncCopySize(
+          "LIBOMPTARGET_AMDGPU_MIN_HOST_TO_HOST_ASYNC_COPY_SIZE", 2048) {}
 
 /// Class implementing the AMDGPU-specific functionalities of the global
 /// handler.
@@ -4496,19 +5218,21 @@ struct AMDGPUGlobalHandlerTy final : public GenericGlobalHandlerTy {
     for (auto &Info : RequiredInfos) {
       Status = hsa_executable_symbol_get_info(Symbol, Info.first, Info.second);
       if (auto Err = Plugin::check(
-              Status, "Error in hsa_executable_symbol_get_info: %s"))
+              Status, "error in hsa_executable_symbol_get_info: %s"))
         return Err;
     }
 
     // Check the size of the symbol.
-    if (SymbolSize != DeviceGlobal.getSize())
+    if (DeviceGlobal.getSize() && SymbolSize != DeviceGlobal.getSize())
       return Plugin::error(
-          "Failed to load global '%s' due to size mismatch (%zu != %zu)",
+          ErrorCode::INVALID_BINARY,
+          "failed to load global '%s' due to size mismatch (%zu != %zu)",
           DeviceGlobal.getName().data(), SymbolSize,
           (size_t)DeviceGlobal.getSize());
 
-    // Store the symbol address on the device global metadata.
+    // Store the symbol address and size on the device global metadata.
     DeviceGlobal.setPtr(reinterpret_cast<void *>(SymbolAddr));
+    DeviceGlobal.setSize(SymbolSize);
 
     return Plugin::success();
   }
@@ -4543,16 +5267,16 @@ struct AMDGPUPluginTy final : public GenericPluginTy {
     llvm::omp::target::plugin::PrintKernelTrace = KernTrace.get();
 
     // Register event handler to detect memory errors on the devices.
-    Status = hsa_amd_register_system_event_handler(eventHandler, nullptr);
+    Status = hsa_amd_register_system_event_handler(eventHandler, this);
     if (auto Err = Plugin::check(
-            Status, "Error in hsa_amd_register_system_event_handler: %s"))
+            Status, "error in hsa_amd_register_system_event_handler: %s"))
       return std::move(Err);
 
     // List of host (CPU) agents.
     llvm::SmallVector<hsa_agent_t> HostAgents;
 
     // Count the number of available agents.
-    auto Err = utils::iterateAgents([&](hsa_agent_t Agent) {
+    auto Err = hsa_utils::iterateAgents([&](hsa_agent_t Agent) {
       // Get the device type of the agent.
       hsa_device_type_t DeviceType;
       hsa_status_t Status =
@@ -4586,7 +5310,7 @@ struct AMDGPUPluginTy final : public GenericPluginTy {
     // There are kernel agents but there is no host agent. That should be
     // treated as an error.
     if (HostAgents.empty())
-      return Plugin::error("No AMDGPU host agents");
+      return Plugin::error(ErrorCode::BACKEND_FAILURE, "no AMDGPU host agents");
 
     // Initialize the host device using host agents.
     HostDevice = allocate<AMDHostDeviceTy>();
@@ -4601,7 +5325,6 @@ struct AMDGPUPluginTy final : public GenericPluginTy {
 
   /// Deinitialize the plugin.
   Error deinitImpl() override {
-    utils::hostrpc_terminate();
     // The HSA runtime was not initialized, so nothing from the plugin was
     // actually initialized.
     if (!Initialized)
@@ -4613,7 +5336,7 @@ struct AMDGPUPluginTy final : public GenericPluginTy {
 
     // Finalize the HSA runtime.
     hsa_status_t Status = hsa_shut_down();
-    return Plugin::check(Status, "Error in hsa_shut_down: %s");
+    return Plugin::check(Status, "error in hsa_shut_down: %s");
   }
 
   /// Creates an AMDGPU device.
@@ -4647,7 +5370,7 @@ struct AMDGPUPluginTy final : public GenericPluginTy {
   }
 
   void checkInvalidImage(__tgt_device_image *TgtImage) override final {
-    utils::checkImageCompatibilityWithSystemXnackMode(TgtImage,
+    hsa_utils::checkImageCompatibilityWithSystemXnackMode(TgtImage,
                                                       IsXnackEnabled());
   }
 
@@ -4665,11 +5388,11 @@ struct AMDGPUPluginTy final : public GenericPluginTy {
       return false;
 
     SmallVector<SmallString<32>> Targets;
-    if (auto Err = utils::getTargetTripleAndFeatures(
+    if (auto Err = hsa_utils::getTargetTripleAndFeatures(
             getKernelAgent(DeviceId), Targets))
       return Err;
     for (auto &Target : Targets)
-      if (utils::isImageCompatibleWithEnv(
+      if (offloading::amdgpu::isImageCompatibleWithEnv(
               Processor ? *Processor : "", ElfOrErr->getPlatformFlags(),
               Target.str()))
         return true;
@@ -4699,7 +5422,8 @@ struct AMDGPUPluginTy final : public GenericPluginTy {
 
 private:
   /// Event handler that will be called by ROCr if an event is detected.
-  static hsa_status_t eventHandler(const hsa_amd_event_t *Event, void *) {
+  static hsa_status_t eventHandler(const hsa_amd_event_t *Event,
+                                   void *PluginPtr) {
     if (Event->event_type != HSA_AMD_GPU_MEMORY_FAULT_EVENT)
       return HSA_STATUS_SUCCESS;
 
@@ -4730,9 +5454,39 @@ private:
     uint32_t Node = -1;
     hsa_agent_get_info(Event->memory_fault.agent, HSA_AGENT_INFO_NODE, &Node);
 
+    AMDGPUPluginTy &Plugin = *reinterpret_cast<AMDGPUPluginTy *>(PluginPtr);
+    for (uint32_t I = 0, E = Plugin.getNumDevices();
+         Node != uint32_t(-1) && I < E; ++I) {
+      AMDGPUDeviceTy &AMDGPUDevice =
+          reinterpret_cast<AMDGPUDeviceTy &>(Plugin.getDevice(I));
+      auto KernelTraceInfoRecord =
+          AMDGPUDevice.KernelLaunchTraces.getExclusiveAccessor();
+
+      uint32_t DeviceNode = -1;
+      if (auto Err =
+              AMDGPUDevice.getDeviceAttr(HSA_AGENT_INFO_NODE, DeviceNode)) {
+        consumeError(std::move(Err));
+        continue;
+      }
+      if (DeviceNode != Node)
+        continue;
+      void *DevicePtr = (void *)Event->memory_fault.virtual_address;
+      std::string S;
+      llvm::raw_string_ostream OS(S);
+      OS << llvm::format("memory access fault by GPU %" PRIu32
+                         " (agent 0x%" PRIx64
+                         ") at virtual address %p. Reasons: %s",
+                         Node, Event->memory_fault.agent.handle,
+                         (void *)Event->memory_fault.virtual_address,
+                         llvm::join(Reasons, ", ").c_str());
+      ErrorReporter::reportKernelTraces(AMDGPUDevice, *KernelTraceInfoRecord);
+      ErrorReporter::reportMemoryAccessError(AMDGPUDevice, DevicePtr, S,
+                                             /*Abort*/ true);
+    }
+
     // Abort the execution since we do not recover from this error.
     FATAL_MESSAGE(1,
-                  "Memory access fault by GPU %" PRIu32 " (agent 0x%" PRIx64
+                  "memory access fault by GPU %" PRIu32 " (agent 0x%" PRIx64
                   ") at virtual address %p. Reasons: %s",
                   Node, Event->memory_fault.agent.handle,
                   (void *)Event->memory_fault.virtual_address,
@@ -4771,13 +5525,14 @@ private:
 };
 
 Error AMDGPUKernelTy::launchImpl(GenericDeviceTy &GenericDevice,
-                                 uint32_t NumThreads, uint64_t NumBlocks,
+                                 uint32_t NumThreads[3], uint32_t NumBlocks[3],
                                  KernelArgsTy &KernelArgs,
                                  KernelLaunchParamsTy LaunchParams,
                                  AsyncInfoWrapperTy &AsyncInfoWrapper) const {
   if (ArgsSize != LaunchParams.Size &&
-      ArgsSize != LaunchParams.Size + getImplicitArgsSize())
-    return Plugin::error("Mismatch of kernel arguments size");
+      ArgsSize > LaunchParams.Size + getImplicitArgsSize())
+    return Plugin::error(ErrorCode::INVALID_ARGUMENT,
+                         "invalid kernel arguments size");
 
   AMDGPUPluginTy &AMDGPUPlugin =
       static_cast<AMDGPUPluginTy &>(GenericDevice.Plugin);
@@ -4799,69 +5554,51 @@ Error AMDGPUKernelTy::launchImpl(GenericDeviceTy &GenericDevice,
   if (auto Err = GenericDevice.getDeviceStackSize(StackSize))
     return Err;
 
-  utils::AMDGPUImplicitArgsTy *ImplArgs = nullptr;
-  if (ArgsSize == LaunchParams.Size + getImplicitArgsSize()) {
-    // Initialize implicit arguments.
-    ImplArgs = reinterpret_cast<utils::AMDGPUImplicitArgsTy *>(
-        advanceVoidPtr(AllArgs, LaunchParams.Size));
-
-    // Initialize the implicit arguments to zero.
-    std::memset(ImplArgs, 0, getImplicitArgsSize());
-  }
-
   // Copy the explicit arguments.
   // TODO: We should expose the args memory manager alloc to the common part as
   // 	   alternative to copying them twice.
   if (LaunchParams.Size)
     std::memcpy(AllArgs, LaunchParams.Data, LaunchParams.Size);
 
-  uint64_t Buffer = 0;
   AMDGPUDeviceTy &AMDGPUDevice = static_cast<AMDGPUDeviceTy &>(GenericDevice);
   AMDGPUStreamTy *Stream = nullptr;
   if (auto Err = AMDGPUDevice.getStream(AsyncInfoWrapper, Stream))
     return Err;
-  if (NeedsHostServices) {
-    int32_t DevID = AMDGPUDevice.getDeviceId();
-    hsa_amd_memory_pool_t HostMemPool =
-        HostDevice.getFineGrainedMemoryPool().get();
-    hsa_amd_memory_pool_t DeviceMemPool =
-        AMDGPUDevice.getCoarseGrainedMemoryPool()->get();
-    hsa_queue_t *HsaQueue = Stream->getHsaQueue();
-    Buffer = utils::hostrpc_assign_buffer(AMDGPUDevice.getAgent(), HsaQueue,
-                                          DevID, HostMemPool, DeviceMemPool);
-    GlobalTy ServiceThreadHostBufferGlobal("service_thread_buf",
-                                           sizeof(uint64_t), &Buffer);
-    if (auto Err = HostServiceBufferHandler.writeGlobalToDevice(
-            AMDGPUDevice, ServiceThreadHostBufferGlobal,
-            ServiceThreadDeviceBufferGlobal)) {
-      DP("Missing symbol %s, continue execution anyway.\n",
-         ServiceThreadHostBufferGlobal.getName().data());
-      consumeError(std::move(Err));
-    }
-    DP("Hostrpc buffer allocated at %p and service thread started\n",
-       (void *)Buffer);
-  } else {
-    DP("No hostrpc buffer or service thread required\n");
-  }
 
-  // If this kernel requires an RPC server we attach its pointer to the stream.
-  if (GenericDevice.getRPCServer())
-    Stream->setRPCServer(GenericDevice.getRPCServer());
+  uint64_t ImplArgsOffset = utils::roundUp(
+      LaunchParams.Size, alignof(hsa_utils::AMDGPUImplicitArgsTy));
+  if (ArgsSize > ImplArgsOffset) {
+    hsa_utils::AMDGPUImplicitArgsTy *ImplArgs =
+        reinterpret_cast<hsa_utils::AMDGPUImplicitArgsTy *>(
+            utils::advancePtr(AllArgs, ImplArgsOffset));
 
-  // Only COV5 implicitargs needs to be set. COV4 implicitargs are not used.
-  if (ImplArgs &&
-      getImplicitArgsSize() == sizeof(utils::AMDGPUImplicitArgsTy)) {
     DP("Setting fields of ImplicitArgs for COV5\n");
-    ImplArgs->BlockCountX = NumBlocks;
-    ImplArgs->BlockCountY = 1;
-    ImplArgs->BlockCountZ = 1;
-    ImplArgs->GroupSizeX = NumThreads;
-    ImplArgs->GroupSizeY = 1;
-    ImplArgs->GroupSizeZ = 1;
-    ImplArgs->GridDims = 1;
-    ImplArgs->HeapV1Ptr =
-        (uint64_t)AMDGPUDevice.getPreAllocatedDeviceMemoryPool();
-    ImplArgs->DynamicLdsSize = KernelArgs.DynCGroupMem;
+    // Set the COV5+ implicit arguments to the appropriate values if present.
+    uint64_t ImplArgsSize = ArgsSize - ImplArgsOffset;
+    std::memset(ImplArgs, 0, ImplArgsSize);
+
+    using ImplArgsTy = hsa_utils::AMDGPUImplicitArgsTy;
+    hsa_utils::initImplArg(ImplArgs, &ImplArgsTy::BlockCountX, ImplArgsSize,
+                           NumBlocks[0]);
+    hsa_utils::initImplArg(ImplArgs, &ImplArgsTy::BlockCountY, ImplArgsSize,
+                           NumBlocks[1]);
+    hsa_utils::initImplArg(ImplArgs, &ImplArgsTy::BlockCountZ, ImplArgsSize,
+                           NumBlocks[2]);
+
+    hsa_utils::initImplArg(ImplArgs, &ImplArgsTy::GroupSizeX, ImplArgsSize,
+                           NumThreads[0]);
+    hsa_utils::initImplArg(ImplArgs, &ImplArgsTy::GroupSizeY, ImplArgsSize,
+                           NumThreads[1]);
+    hsa_utils::initImplArg(ImplArgs, &ImplArgsTy::GroupSizeZ, ImplArgsSize,
+                           NumThreads[2]);
+
+    hsa_utils::initImplArg(ImplArgs, &ImplArgsTy::GridDims, ImplArgsSize,
+                           NumBlocks[2] * NumThreads[2] > 1
+                               ? 3
+                               : 1 + (NumBlocks[1] * NumThreads[1] != 1));
+
+    hsa_utils::initImplArg(ImplArgs, &ImplArgsTy::DynamicLdsSize, ImplArgsSize,
+                           KernelArgs.DynCGroupMem);
   }
 
   // Get required OMPT-related data
@@ -4870,42 +5607,74 @@ Error AMDGPUKernelTy::launchImpl(GenericDeviceTy &GenericDevice,
   // Push the kernel launch into the stream.
   return Stream->pushKernelLaunch(*this, AllArgs, NumThreads, NumBlocks,
                                   GroupSize, static_cast<uint32_t>(StackSize),
-                                  ArgsMemoryManager,
-                                  std::move(LocalOmptEventInfo));
+                                  ArgsMemoryManager, LocalOmptEventInfo);
 }
 
 void AMDGPUKernelTy::printAMDOneLineKernelTrace(GenericDeviceTy &GenericDevice,
                                                 KernelArgsTy &KernelArgs,
-                                                uint32_t NumThreads,
-                                                uint64_t NumBlocks) const {
+                                                uint32_t NumThreads[3],
+                                                uint32_t NumBlocks[3],
+                                                int64_t MultiDeviceLB,
+                                                int64_t MultiDeviceUB) const {
   auto GroupSegmentSize = (*KernelInfo).GroupSegmentList;
   auto SGPRCount = (*KernelInfo).SGPRCount;
   auto VGPRCount = (*KernelInfo).VGPRCount;
+  auto AGPRCount = (*KernelInfo).AGPRCount;
   auto SGPRSpillCount = (*KernelInfo).SGPRSpillCount;
   auto VGPRSpillCount = (*KernelInfo).VGPRSpillCount;
   // auto MaxFlatWorkgroupSize = (*KernelInfo).MaxFlatWorkgroupSize;
 
-  // This line should print exactly as the one in the old plugin.
-  fprintf(stderr,
-          "DEVID: %2d SGN:%d ConstWGSize:%-4d args:%2d teamsXthrds:(%4luX%4d) "
-          "reqd:(%4dX%4d) lds_usage:%uB sgpr_count:%u vgpr_count:%u "
-          "sgpr_spill_count:%u vgpr_spill_count:%u tripcount:%lu rpc:%d n:%s\n",
-          GenericDevice.getDeviceId(), getExecutionModeFlags(), ConstWGSize,
-          KernelArgs.NumArgs, NumBlocks, NumThreads, 0, 0, GroupSegmentSize,
-          SGPRCount, VGPRCount, SGPRSpillCount, VGPRSpillCount,
-          KernelArgs.Tripcount, NeedsHostServices, getName());
+  if (GenericDevice.enableKernelDurationTracing()) {
+    uint32_t LaunchId = GenericDevice.getAndIncrementLaunchId();
+    setKernelLaunchId(LaunchId);
+
+    // Print Launch Id after Device Id.
+    fprintf(stderr,
+            "DEVID: %2d LaunchId: %u SGN:%d ConstWGSize:%-4d args:%2d "
+            "teamsXthrds:(%4uX%4d) "
+            "reqd:(%4dX%4d) lds_usage:%uB sgpr_count:%u vgpr_count:%u "
+            "agpr_count:%u "
+            "sgpr_spill_count:%u vgpr_spill_count:%u tripcount:%lu rpc:%d "
+            "md:%d md_LB:%ld md_UB:%ld Max Occupancy: %u Achieved Occupancy: "
+            "%d%% n:%s\n",
+            GenericDevice.getDeviceId(), LaunchId, getExecutionModeFlags(),
+            ConstWGSize, KernelArgs.NumArgs, NumBlocks[0], NumThreads[0], 0, 0,
+            GroupSegmentSize, SGPRCount, VGPRCount, AGPRCount, SGPRSpillCount,
+            VGPRSpillCount, KernelArgs.Tripcount, HasRPC, isMultiDeviceKernel(),
+            MultiDeviceLB, MultiDeviceUB, MaxOccupancy, AchievedOccupancy,
+            getName());
+  } else {
+
+    // This line should print exactly as the one in the old plugin.
+    fprintf(stderr,
+            "DEVID: %2d SGN:%d ConstWGSize:%-4d args:%2d teamsXthrds:(%4uX%4d) "
+            "reqd:(%4dX%4d) lds_usage:%uB sgpr_count:%u vgpr_count:%u "
+            "agpr_count:%u "
+            "sgpr_spill_count:%u vgpr_spill_count:%u tripcount:%lu rpc:%d "
+            "md:%d md_LB:%ld md_UB:%ld Max Occupancy: %u Achieved Occupancy: "
+            "%d%% n:%s\n",
+            GenericDevice.getDeviceId(), getExecutionModeFlags(), ConstWGSize,
+            KernelArgs.NumArgs, NumBlocks[0], NumThreads[0], 0, 0,
+            GroupSegmentSize, SGPRCount, VGPRCount, AGPRCount, SGPRSpillCount,
+            VGPRSpillCount, KernelArgs.Tripcount, HasRPC, isMultiDeviceKernel(),
+            MultiDeviceLB, MultiDeviceUB, MaxOccupancy, AchievedOccupancy,
+            getName());
+  }
 }
 
 Error AMDGPUKernelTy::printLaunchInfoDetails(GenericDeviceTy &GenericDevice,
                                              KernelArgsTy &KernelArgs,
-                                             uint32_t NumThreads,
-                                             uint64_t NumBlocks) const {
+                                             uint32_t NumThreads[3],
+                                             uint32_t NumBlocks[3],
+                                             int64_t MultiDeviceLB,
+                                             int64_t MultiDeviceUB) const {
   // When LIBOMPTARGET_KERNEL_TRACE is set, print the single-line kernel trace
   // info present in the old ASO plugin, and continue with the upstream 2-line
   // info, should LIBOMPTARGET_INFO be a meaningful value, otherwise return.
-  if (getInfoLevel() & OMP_INFOTYPE_AMD_KERNEL_TRACE)
-    printAMDOneLineKernelTrace(GenericDevice, KernelArgs, NumThreads,
-                               NumBlocks);
+  if ((getInfoLevel() & OMP_INFOTYPE_AMD_KERNEL_TRACE) ||
+      GenericDevice.enableKernelDurationTracing())
+    printAMDOneLineKernelTrace(GenericDevice, KernelArgs, NumThreads, NumBlocks,
+                               MultiDeviceLB, MultiDeviceUB);
 
   // Only do all this when the output is requested
   if (!(getInfoLevel() & OMP_INFOTYPE_PLUGIN_KERNEL))
@@ -4916,8 +5685,8 @@ Error AMDGPUKernelTy::printLaunchInfoDetails(GenericDeviceTy &GenericDevice,
     return Plugin::success();
 
   // General Info
-  auto NumGroups = NumBlocks;
-  auto ThreadsPerGroup = NumThreads;
+  auto *NumGroups = NumBlocks;
+  auto *ThreadsPerGroup = NumThreads;
 
   // Kernel Arguments Info
   auto ArgNum = KernelArgs.NumArgs;
@@ -4943,12 +5712,13 @@ Error AMDGPUKernelTy::printLaunchInfoDetails(GenericDeviceTy &GenericDevice,
   // S/VGPR Spill Count: how many S/VGPRs are spilled by the kernel
   // Tripcount: loop tripcount for the kernel
   INFO(OMP_INFOTYPE_PLUGIN_KERNEL, GenericDevice.getDeviceId(),
-       "#Args: %d Teams x Thrds: %4lux%4u (MaxFlatWorkGroupSize: %u) LDS "
+       "#Args: %d Teams x Thrds: %4ux%4u (MaxFlatWorkGroupSize: %u) LDS "
        "Usage: %uB #SGPRs/VGPRs: %u/%u #SGPR/VGPR Spills: %u/%u Tripcount: "
        "%lu\n",
-       ArgNum, NumGroups, ThreadsPerGroup, MaxFlatWorkgroupSize,
-       GroupSegmentSize, SGPRCount, VGPRCount, SGPRSpillCount, VGPRSpillCount,
-       LoopTripCount);
+       ArgNum, NumGroups[0] * NumGroups[1] * NumGroups[2],
+       ThreadsPerGroup[0] * ThreadsPerGroup[1] * ThreadsPerGroup[2],
+       MaxFlatWorkgroupSize, GroupSegmentSize, SGPRCount, VGPRCount,
+       SGPRSpillCount, VGPRSpillCount, LoopTripCount);
 
   return Plugin::success();
 }
@@ -4957,25 +5727,36 @@ template <typename... ArgsTy>
 static Error Plugin::check(int32_t Code, const char *ErrFmt, ArgsTy... Args) {
   hsa_status_t ResultCode = static_cast<hsa_status_t>(Code);
   if (ResultCode == HSA_STATUS_SUCCESS || ResultCode == HSA_STATUS_INFO_BREAK)
-    return Error::success();
+    return Plugin::success();
 
-  const char *Desc = "Unknown error";
+  const char *Desc = "unknown error";
   hsa_status_t Ret = hsa_status_string(ResultCode, &Desc);
   if (Ret != HSA_STATUS_SUCCESS)
     REPORT("Unrecognized " GETNAME(TARGET_NAME) " error code %d\n", Code);
 
-  return createStringError<ArgsTy..., const char *>(inconvertibleErrorCode(),
-                                                    ErrFmt, Args..., Desc);
+  // TODO: Add more entries to this switch
+  ErrorCode OffloadErrCode;
+  switch (ResultCode) {
+  case HSA_STATUS_ERROR_INVALID_SYMBOL_NAME:
+    OffloadErrCode = ErrorCode::NOT_FOUND;
+    break;
+  case HSA_STATUS_ERROR_INVALID_CODE_OBJECT:
+    OffloadErrCode = ErrorCode::INVALID_BINARY;
+    break;
+  default:
+    OffloadErrCode = ErrorCode::UNKNOWN;
+  }
+
+  return Plugin::error(OffloadErrCode, ErrFmt, Args..., Desc);
 }
 
-void *AMDGPUMemoryManagerTy::allocate(size_t Size, void *HstPtr,
-                                      TargetAllocTy Kind) {
+Expected<void *> AMDGPUMemoryManagerTy::allocate(size_t Size, void *HstPtr,
+                                                 TargetAllocTy Kind) {
   // Allocate memory from the pool.
   void *Ptr = nullptr;
-  if (auto Err = MemoryPool->allocate(Size, &Ptr)) {
-    consumeError(std::move(Err));
-    return nullptr;
-  }
+  if (auto Err = MemoryPool->allocate(Size, &Ptr))
+    return std::move(Err);
+
   assert(Ptr && "Invalid pointer");
 
   // Get a list of agents that can access this memory pool.
@@ -4985,14 +5766,13 @@ void *AMDGPUMemoryManagerTy::allocate(size_t Size, void *HstPtr,
       [&](hsa_agent_t Agent) { return MemoryPool->canAccess(Agent); });
 
   // Allow all valid kernel agents to access the allocation.
-  if (auto Err = MemoryPool->enableAccess(Ptr, Size, Agents)) {
-    REPORT("%s\n", toString(std::move(Err)).data());
-    return nullptr;
-  }
+  if (auto Err = MemoryPool->enableAccess(Ptr, Size, Agents))
+    return std::move(Err);
   return Ptr;
 }
 
-void *AMDGPUDeviceTy::allocate(size_t Size, void *, TargetAllocTy Kind) {
+Expected<void *> AMDGPUDeviceTy::allocate(size_t Size, void *,
+                                          TargetAllocTy Kind) {
   if (Size == 0)
     return nullptr;
 
@@ -5001,7 +5781,6 @@ void *AMDGPUDeviceTy::allocate(size_t Size, void *, TargetAllocTy Kind) {
   switch (Kind) {
   case TARGET_ALLOC_DEFAULT:
   case TARGET_ALLOC_DEVICE:
-  case TARGET_ALLOC_DEVICE_NON_BLOCKING:
     MemoryPool = CoarseGrainedMemoryPools[0];
     break;
   case TARGET_ALLOC_HOST:
@@ -5017,17 +5796,15 @@ void *AMDGPUDeviceTy::allocate(size_t Size, void *, TargetAllocTy Kind) {
     MemoryPool = CoarseGrainedMemoryPools[0];
   }
 
-  if (!MemoryPool) {
-    REPORT("No memory pool for the specified allocation kind\n");
-    return nullptr;
-  }
+  if (!MemoryPool)
+    return Plugin::error(ErrorCode::UNSUPPORTED,
+                         "no memory pool for the specified allocation kind");
 
   // Allocate from the corresponding memory pool.
   void *Alloc = nullptr;
-  if (Error Err = MemoryPool->allocate(Size, &Alloc)) {
-    REPORT("%s\n", toString(std::move(Err)).data());
-    return nullptr;
-  }
+  if (auto Err = MemoryPool->allocate(Size, &Alloc))
+    return std::move(Err);
+
   if (MemoryPool == CoarseGrainedMemoryPools[0] && IsEquippedWithGFX90A &&
       EnableGFX90ACoarseGrainUsmMaps) {
     // Need to register in the coarse grain usm map table
@@ -5050,38 +5827,43 @@ void *AMDGPUDeviceTy::allocate(size_t Size, void *, TargetAllocTy Kind) {
                   });
 
     // Enable all valid kernel agents to access the buffer.
-    if (auto Err = MemoryPool->enableAccess(Alloc, Size, Agents)) {
-      REPORT("%s\n", toString(std::move(Err)).data());
-      return nullptr;
-    }
+    if (auto Err = MemoryPool->enableAccess(Alloc, Size, Agents))
+      return std::move(Err);
   }
 
   return Alloc;
 }
 
-#ifdef OMPT_SUPPORT
-/// Casts and validated the OMPT-related info passed to the action function.
-static OmptKernelTimingArgsAsyncTy *getOmptTimingsArgs(void *Data) {
-  OmptKernelTimingArgsAsyncTy *Args =
-      reinterpret_cast<OmptKernelTimingArgsAsyncTy *>(Data);
+/// Casts and checks the Profiler related information to not be nullptr.
+static ProfilingInfoTy *getProfilingInfo(void *Data) {
+  ProfilingInfoTy *Args = reinterpret_cast<ProfilingInfoTy *>(Data);
+
+  // The ProfilerSpecific part can be nullptr, do not check here.
   assert(Args && "Invalid argument pointer");
+  assert(Args->Plugin && "Invalid plugin");
   assert(Args->Signal && "Invalid signal");
-  assert(Args->OmptEventInfo && "Invalid OMPT Async data (nullptr)");
-  assert(Args->OmptEventInfo->TraceRecord && "Invalid Trace Record Pointer");
-  assert(Args->OmptEventInfo->RegionInterface &&
-         "Invalid RegionInterface pointer");
-  assert((!std::holds_alternative<std::monostate>(
-             Args->OmptEventInfo->RIFunction)) &&
-         "Unset OMPT Interface Function Pointer Set");
+
   return Args;
 }
 
 static std::pair<uint64_t, uint64_t>
-getKernelStartAndEndTime(const OmptKernelTimingArgsAsyncTy *Args) {
-  assert(Args->Signal && "Invalid AMDGPUSignal Pointer in OMPT profiling");
-  hsa_amd_profiling_dispatch_time_t TimeRec;
+getKernelStartAndEndTime(const ProfilingInfoTy *Args) {
+  assert(Args->Plugin && "Invalid GenericPlugin pointer in OMPT profiling");
+  assert(Args->Signal && "Invalid AMDGPUSignal pointer in OMPT profiling");
+
+  hsa_amd_profiling_dispatch_time_t TimeRec{0, 0};
   hsa_status_t Status = hsa_amd_profiling_get_dispatch_time(
       Args->Agent, Args->Signal->get(), &TimeRec);
+  if (auto Err = Plugin::check(
+          Status,
+          "WARNING Could not retrieve kernel dispatch timestamps: %s")) {
+    MESSAGE0(toString(std::move(Err)).data());
+
+    // XXX Is this important enough to keep it?
+    // auto *AMDGPUDevice = reinterpret_cast<AMDGPUDeviceTy *>(Args->Device);
+    // if (AMDGPUDevice->useStrictSanityChecks())
+    //   llvm_unreachable("User-requested hard stop on sanity check errors.");
+  }
 
   uint64_t StartTime = TimeRec.start * Args->TicksToTime;
   uint64_t EndTime = TimeRec.end * Args->TicksToTime;
@@ -5090,17 +5872,150 @@ getKernelStartAndEndTime(const OmptKernelTimingArgsAsyncTy *Args) {
 }
 
 static std::pair<uint64_t, uint64_t>
-getCopyStartAndEndTime(const OmptKernelTimingArgsAsyncTy *Args) {
+getCopyStartAndEndTime(const ProfilingInfoTy *Args) {
   assert(Args->Signal && "Invalid AMDGPUSignal Pointer in OMPT profiling");
-  hsa_amd_profiling_async_copy_time_t TimeRec;
+
+  hsa_amd_profiling_async_copy_time_t TimeRec{0, 0};
   hsa_status_t Status =
       hsa_amd_profiling_get_async_copy_time(Args->Signal->get(), &TimeRec);
+  if (auto Err = Plugin::check(
+          Status, "WARNING Could not retrieve data-copy timestamps: %s")) {
+    MESSAGE0(toString(std::move(Err)).data());
+
+    // XXX Is this important enough to keep it?
+    // auto *AMDGPUDevice = reinterpret_cast<AMDGPUDeviceTy *>(Args->Device);
+    // if (AMDGPUDevice->useStrictSanityChecks())
+    //   llvm_unreachable("User-requested hard stop on sanity check errors.");
+  }
+
   uint64_t StartTime = TimeRec.start * Args->TicksToTime;
   uint64_t EndTime = TimeRec.end * Args->TicksToTime;
 
   return {StartTime, EndTime};
 }
-#endif
+
+void AMDGPUQueueTy::callbackError(hsa_status_t Status, hsa_queue_t *Source,
+                                  void *Data) {
+  auto &AMDGPUDevice = *reinterpret_cast<AMDGPUDeviceTy *>(Data);
+
+  if (Status == HSA_STATUS_ERROR_EXCEPTION) {
+    auto KernelTraceInfoRecord =
+        AMDGPUDevice.KernelLaunchTraces.getExclusiveAccessor();
+    std::function<bool(__tgt_async_info &)> AsyncInfoWrapperMatcher =
+        [=](__tgt_async_info &AsyncInfo) {
+          auto *Stream = reinterpret_cast<AMDGPUStreamTy *>(AsyncInfo.Queue);
+          if (!Stream || !Stream->getQueue())
+            return false;
+          return Stream->getQueue()->Queue == Source;
+        };
+    ErrorReporter::reportTrapInKernel(AMDGPUDevice, *KernelTraceInfoRecord,
+                                      AsyncInfoWrapperMatcher);
+  }
+
+  auto Err = Plugin::check(Status, "received error in queue %p: %s", Source);
+  FATAL_MESSAGE(1, "%s", toString(std::move(Err)).data());
+}
+
+/// Compute the max kernel occupancy for AMD GPU
+unsigned AMDGPUKernelTy::computeMaxOccupancy(GenericDeviceTy &Device) const {
+  uint32_t GroupSegmentSize = (*KernelInfo).GroupSegmentList;
+  uint32_t SGPRCount = (*KernelInfo).SGPRCount;
+  uint32_t VGPRCount = (*KernelInfo).VGPRCount;
+  uint32_t MaxFlatWorkgroupSize = (*KernelInfo).MaxFlatWorkgroupSize;
+
+  // Default number of waves per EU
+  unsigned MaxWavesPerEU = llvm::omp::amdgpu_arch::MaxWavesPerEU10;
+
+  // Get GPU info
+  AMDGPUDeviceTy &AMDDevice = static_cast<AMDGPUDeviceTy &>(Device);
+  bool IsEquippedWithGFX90A = Device.hasGfx90aDevice();
+  bool IsEquippedWithMI300 = AMDDevice.checkIfMI300Device();
+
+  if (IsEquippedWithGFX90A || IsEquippedWithMI300) {
+    MaxWavesPerEU = llvm::omp::amdgpu_arch::MaxWavesPerEU8;
+  }
+
+  unsigned Occupancy = INT_MAX;
+
+  // Contraint on SGPR
+  if (SGPRCount) {
+    Occupancy = getOccupancyWithNumSGPRs(SGPRCount);
+  }
+
+  Occupancy = std::min(Occupancy, MaxWavesPerEU);
+
+  // Constraint on VGPR
+  // Follow the logic on the backend
+  // Ref:
+  // llvm-project/llvm/lib/Target/AMDGPU/Utils/AMDGPUBaseInfo.cpp:getNumWavesPerEUWithNumVGPRs
+  if (VGPRCount) {
+    unsigned WaveNumByVGPR =
+        llvm::omp::amdgpu_arch::VGPRNumPerThread / VGPRCount;
+    Occupancy = std::min(Occupancy, WaveNumByVGPR);
+  }
+
+  // Constraint on LDS
+  if (GroupSegmentSize) {
+    unsigned WaveNumByLDS = getOccupancyWithLDS(
+        Device, GroupSegmentSize, MaxWavesPerEU, MaxFlatWorkgroupSize);
+    Occupancy = std::min(Occupancy, WaveNumByLDS);
+  } else {
+    // If 0 LDS required by the kernel
+    Occupancy = std::min(Occupancy, MaxWavesPerEU);
+  }
+
+  // Cache the value before return
+  MaxOccupancy = Occupancy;
+
+  return Occupancy;
+}
+
+/// Compute the achieved kernel occupancy for AMD GPU.
+unsigned AMDGPUKernelTy::computeAchievedOccupancy(GenericDeviceTy &Device,
+                                                  uint32_t numThreads,
+                                                  uint64_t numTeams) const {
+  // Check if max occupancy is available
+  if (MaxOccupancy <= 0) {
+    return 0;
+  }
+
+  // Default number of waves per EU.
+  unsigned MaxWavesPerEU = llvm::omp::amdgpu_arch::MaxWavesPerEU10;
+
+  // Get GPU info.
+  AMDGPUDeviceTy &AMDDevice = static_cast<AMDGPUDeviceTy &>(Device);
+  bool IsEquippedWithGFX90A = Device.hasGfx90aDevice();
+  bool IsEquippedWithMI300 = AMDDevice.checkIfMI300Device();
+
+  if (IsEquippedWithGFX90A || IsEquippedWithMI300) {
+    MaxWavesPerEU = llvm::omp::amdgpu_arch::MaxWavesPerEU8;
+  }
+
+  // Get the max number of waves per CU.
+  unsigned MaxNumWaves = MaxOccupancy * llvm::omp::amdgpu_arch::SIMDPerCU;
+  // Get the number of waves from the kernel launch parameters.
+  unsigned AchievedNumWaves =
+      divideCeil(numThreads, AMDDevice.getWarpSize()) * numTeams;
+  // Get the number of waves per CU.
+  AchievedNumWaves = divideCeil(AchievedNumWaves, Device.getNumComputeUnits());
+  // Get the min waves.
+  AchievedNumWaves = std::min(MaxNumWaves, AchievedNumWaves);
+  // Total number of wave slots each CU supports.
+  unsigned TotalWaveSlotsPerCU =
+      MaxWavesPerEU * llvm::omp::amdgpu_arch::SIMDPerCU;
+  // Compute occupancy ratio representing in percentage.
+  unsigned Occupancy = (AchievedNumWaves * 100) / TotalWaveSlotsPerCU;
+
+  // Cache the result.
+  AchievedOccupancy = Occupancy;
+
+  return Occupancy;
+}
+
+/// Enable profiling of HSA queues
+void setHSAQueueProfiling(void *Device, int Enable) {
+  reinterpret_cast<AMDGPUDeviceTy *>(Device)->setHSAQueueProfiling(Enable);
+}
 
 } // namespace plugin
 } // namespace target
@@ -5112,15 +6027,14 @@ namespace llvm::omp::target::plugin {
 
 /// Enable/disable kernel profiling for the given device.
 void setOmptQueueProfile(void *Device, int Enable) {
-  reinterpret_cast<llvm::omp::target::plugin::AMDGPUDeviceTy *>(Device)
-      ->setOmptQueueProfile(Enable);
+  setHSAQueueProfiling(Device, Enable);
 }
 
 } // namespace llvm::omp::target::plugin
 
 /// Enable/disable kernel profiling for the given device.
 void setGlobalOmptKernelProfile(void *Device, int Enable) {
-  llvm::omp::target::plugin::setOmptQueueProfile(Device, Enable);
+  llvm::omp::target::plugin::setHSAQueueProfiling(Device, Enable);
 }
 
 #endif

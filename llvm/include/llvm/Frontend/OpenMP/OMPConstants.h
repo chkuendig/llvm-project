@@ -190,6 +190,9 @@ enum class OMPScheduleType {
   LLVM_MARK_AS_BITMASK_ENUM(/* LargestValue */ ModifierMask)
 };
 
+// Default OpenMP mapper name suffix.
+inline constexpr const char *OmpDefaultMapperName = ".omp.default.mapper";
+
 /// Values for bit flags used to specify the mapping type for
 /// offloading.
 enum class OpenMPOffloadMappingFlags : uint64_t {
@@ -236,6 +239,8 @@ enum class OpenMPOffloadMappingFlags : uint64_t {
   // dynamic.
   // This is an OpenMP extension for the sake of OpenACC support.
   OMP_MAP_OMPX_HOLD = 0x2000,
+  // Mapping is for a descriptor (a.k.a. dope vector)
+  OMP_MAP_DESCRIPTOR = 0x4000,
   /// Signal that the runtime library should use args as an array of
   /// descriptor_dim pointers and use args_size as dims. Used when we have
   /// non-contiguous list items in target update directive
@@ -280,17 +285,18 @@ enum class RTLDependenceKindTy {
 };
 
 namespace xteam_red {
-// Upper limit on CU multiplier for computing number of teams.
+// Upper limit on CU multiplier for computing number of teams. Assuming a
+// maximum of 32 wave slots per CU.
 constexpr int16_t MaxCUMultiplier = 32;
 
 // Maximum number of threads allowed per CU.
 constexpr int16_t MaxThreadsPerCU = 2048;
 
-// Desired number of wavefronts per CU.
+// Desired number of wavefronts per CU. Aiming for 50% occupancy.
 constexpr int16_t DesiredWavesPerCU = 16;
 
-// Default block size, currently different from other kernel types.
-constexpr int16_t DefaultBlockSize = 1024;
+// Default block size, potentially different from other kernel types.
+constexpr int16_t DefaultBlockSize = 512;
 
 // Max block size, same as other kernel types, but maintaining it here
 // so that it is accessible for all targets.
@@ -326,6 +332,28 @@ static inline uint32_t getBlockSizeAsPowerOfTwo(uint32_t BlockSize) {
   } while (Tmp != 0);
   return BlockSize;
 }
+
+/// AMD GPU specs for computing kernel occupancy
+namespace amdgpu_arch {
+// Local memory size
+constexpr unsigned LocalMemorySize = 32768;
+// SIMD unit per CU
+constexpr unsigned SIMDPerCU = 4;
+// Max waves each SIMD supports
+constexpr unsigned MaxWavesPerEU8 = 8;
+constexpr unsigned MaxWavesPerEU10 = 10;
+// Number of VGPR for each thread
+constexpr unsigned VGPRNumPerThread = 512;
+// flat work group size
+constexpr unsigned FlatWorkgroupSize = 1024;
+// Max number of workgroup per CU
+constexpr unsigned MaxWorkgroupNumPerCU = 16;
+// Occupancy computation conditions by SGPRs
+constexpr unsigned SGPRCountOccupancy10 = 80;
+constexpr unsigned SGPRCountOccupancy9 = 88;
+constexpr unsigned SGPRCountOccupancy8 = 100;
+
+} // end namespace amdgpu_arch
 
 } // end namespace omp
 

@@ -39,6 +39,7 @@ public:
   bool Verbose = false;
   llvm::compression::Format CompressionFormat;
   int CompressionLevel;
+  uint16_t CompressedBundleVersion;
 
   unsigned BundleAlignment = 1;
   unsigned HostInputIndex = ~0u;
@@ -100,33 +101,30 @@ struct OffloadTargetInfo {
 // - Version (2 bytes)
 // - Compression Method (2 bytes) - Uses the values from
 // llvm::compression::Format.
-// - Total file size (4 bytes). Available in version 2 and above.
-// - Uncompressed Size (4 bytes).
+// - Total file size (4 bytes in V2, 8 bytes in V3).
+// - Uncompressed Size (4 bytes in V1/V2, 8 bytes in V3).
 // - Truncated MD5 Hash (8 bytes).
 // - Compressed Data (variable length).
-
 class CompressedOffloadBundle {
 private:
-  static inline const size_t MagicSize = 4;
-  static inline const size_t VersionFieldSize = sizeof(uint16_t);
-  static inline const size_t MethodFieldSize = sizeof(uint16_t);
-  static inline const size_t FileSizeFieldSize = sizeof(uint32_t);
-  static inline const size_t UncompressedSizeFieldSize = sizeof(uint32_t);
-  static inline const size_t HashFieldSize = sizeof(uint64_t);
   static inline const llvm::StringRef MagicNumber = "CCOB";
-  static inline const uint16_t Version = 2;
 
 public:
-  static inline const size_t V1HeaderSize =
-      MagicSize + VersionFieldSize + MethodFieldSize +
-      UncompressedSizeFieldSize + HashFieldSize;
-  static inline const size_t V2HeaderSize =
-      MagicSize + VersionFieldSize + FileSizeFieldSize + MethodFieldSize +
-      UncompressedSizeFieldSize + HashFieldSize;
+  struct CompressedBundleHeader {
+    unsigned Version;
+    llvm::compression::Format CompressionFormat;
+    std::optional<size_t> FileSize;
+    size_t UncompressedFileSize;
+    uint64_t Hash;
+
+    static llvm::Expected<CompressedBundleHeader> tryParse(llvm::StringRef);
+  };
+
+  static inline const uint16_t DefaultVersion = 3;
 
   static llvm::Expected<std::unique_ptr<llvm::MemoryBuffer>>
   compress(llvm::compression::Params P, const llvm::MemoryBuffer &Input,
-           bool Verbose = false);
+           uint16_t Version, bool Verbose = false);
   static llvm::Expected<std::unique_ptr<llvm::MemoryBuffer>>
   decompress(const llvm::MemoryBuffer &Input, bool Verbose = false);
 };

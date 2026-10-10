@@ -165,16 +165,37 @@ public:
   /// Get the number of blocks on the GPU
   llvm::Value *getGPUNumBlocks(CodeGenFunction &CGF);
 
-  std::pair<llvm::Value *, llvm::Value *>
-  getXteamRedFunctionPtrs(CodeGenFunction &CGF, llvm::Type *RedVarType);
+  /// Initialization for a specialized kernel.
+  llvm::Value *initSpecializedKernel(CodeGenFunction &CGF);
 
-  /// Call cross-team sum
-  llvm::Value *getXteamRedSum(CodeGenFunction &CGF, llvm::Value *Val,
-                              llvm::Value *SumPtr, llvm::Value *DTeamVals,
-                              llvm::Value *DTeamsDonePtr,
-                              llvm::Value *ThreadStartIndex,
-                              llvm::Value *NumTeams, int BlockSize,
-                              bool IsFast);
+  std::pair<llvm::Value *, llvm::Value *>
+  getXteamRedFunctionPtrs(CodeGenFunction &CGF, llvm::Type *RedVarType,
+                          CodeGenModule::XteamRedOpKind Opcode);
+
+  /// Generate a call to cross-team operation.
+  llvm::Value *getXteamRedOperation(CodeGenFunction &CGF, llvm::Value *Val,
+                                    llvm::Value *OrigVarPtr,
+                                    llvm::Value *DTeamVals,
+                                    llvm::Value *DTeamsDonePtr,
+                                    llvm::Value *ThreadStartIndex,
+                                    llvm::Value *NumTeams, int BlockSize,
+                                    CodeGenModule::XteamRedOpKind, bool IsFast);
+
+  /// Emit call to Cross-team scan entry points
+  llvm::Value *
+  getXteamScanSum(CodeGenFunction &CGF, llvm::Value *Val, llvm::Value *SumPtr,
+                  llvm::Value *DTeamVals, llvm::Value *DTeamsDonePtr,
+                  llvm::Value *DScanStorage, llvm::Value *ThreadStartIndex,
+                  llvm::Value *NumTeams, int BlockSize, bool IsFast);
+
+  /// Emit calls to Cross-team scan Phase 2 entry points
+  llvm::Value *getXteamScanPhaseTwo(CodeGenFunction &CGF, llvm::Value *Val,
+                                    llvm::Value *SegmentSize,
+                                    llvm::Value *DTeamVals,
+                                    llvm::Value *DScanStorage,
+                                    llvm::Value *DSegmentVals,
+                                    llvm::Value *ThreadStartIndex,
+                                    int BlockSize, bool IsInclusiveScan);
 
   // Returns whether the hint expressions for an architecture should be
   // evaluated to decide which kind of atomic ops should be generated.
@@ -189,11 +210,6 @@ public:
                                                BinaryOperatorKind BO,
                                                bool IsXBinopExpr) override;
 
-  /// Return whether the current architecture must emit CAS loop runtime call
-  /// for given type and atomic operation
-  bool mustEmitSafeAtomic(CodeGenFunction &CGF, LValue X, RValue Update,
-                          BinaryOperatorKind BO) override;
-
   // Emit call to CAS loop
   std::pair<bool, RValue> emitAtomicCASLoop(CodeGenFunction &CGF, LValue X,
                                             RValue Update,
@@ -205,12 +221,24 @@ public:
                           llvm::omp::ProcBindKind ProcBind,
                           SourceLocation Loc) override;
 
+  // Currently unsupported on the device.
+  llvm::Value *emitMessageClause(CodeGenFunction &CGF, const Expr *Message,
+                                 SourceLocation Loc) override;
+
+  // Currently unsupported on the device.
+  virtual llvm::Value *emitSeverityClause(OpenMPSeverityClauseKind Severity,
+                                          SourceLocation Loc) override;
+
   /// Emits call to void __kmpc_push_num_threads(ident_t *loc, kmp_int32
   /// global_tid, kmp_int32 num_threads) to generate code for 'num_threads'
   /// clause.
-  /// \param NumThreads An integer value of threads.
-  void emitNumThreadsClause(CodeGenFunction &CGF, llvm::Value *NumThreads,
-                            SourceLocation Loc) override;
+  void emitNumThreadsClause(
+      CodeGenFunction &CGF, llvm::Value *NumThreads, SourceLocation Loc,
+      OpenMPNumThreadsClauseModifier Modifier = OMPC_NUMTHREADS_unknown,
+      OpenMPSeverityClauseKind Severity = OMPC_SEVERITY_fatal,
+      SourceLocation SeverityLoc = SourceLocation(),
+      const Expr *Message = nullptr,
+      SourceLocation MessageLoc = SourceLocation()) override;
 
   /// This function ought to emit, in the general case, a call to
   // the openmp runtime kmpc_push_num_teams. In NVPTX backend it is not needed
@@ -272,12 +300,21 @@ public:
   /// \param IfCond Condition in the associated 'if' clause, if it was
   /// specified, nullptr otherwise.
   /// \param NumThreads The value corresponding to the num_threads clause, if
-  /// any,
-  ///                   or nullptr.
+  /// any, or nullptr.
+  /// \param NumThreadsModifier The modifier of the num_threads clause, if
+  /// any, ignored otherwise. Currently unused on the device.
+  /// \param Severity The severity corresponding to the num_threads clause, if
+  /// any, ignored otherwise. Currently unused on the device.
+  /// \param Message The message string corresponding to the num_threads clause,
+  /// if any, or nullptr. Currently unused on the device.
   void emitParallelCall(CodeGenFunction &CGF, SourceLocation Loc,
                         llvm::Function *OutlinedFn,
                         ArrayRef<llvm::Value *> CapturedVars,
-                        const Expr *IfCond, llvm::Value *NumThreads) override;
+                        const Expr *IfCond, llvm::Value *NumThreads,
+                        OpenMPNumThreadsClauseModifier NumThreadsModifier =
+                            OMPC_NUMTHREADS_unknown,
+                        OpenMPSeverityClauseKind Severity = OMPC_SEVERITY_fatal,
+                        const Expr *Message = nullptr) override;
 
   /// Emit an implicit/explicit barrier for OpenMP threads.
   /// \param Kind Directive for which this implicit barrier call must be
@@ -337,9 +374,10 @@ public:
 
   /// Emits call of the outlined function with the provided arguments,
   /// translating these arguments to correct target-specific arguments.
-  void emitOutlinedFunctionCall(
-      CodeGenFunction &CGF, SourceLocation Loc, llvm::FunctionCallee OutlinedFn,
-      ArrayRef<llvm::Value *> Args = std::nullopt) const override;
+  void
+  emitOutlinedFunctionCall(CodeGenFunction &CGF, SourceLocation Loc,
+                           llvm::FunctionCallee OutlinedFn,
+                           ArrayRef<llvm::Value *> Args = {}) const override;
 
   /// Emits OpenMP-specific function prolog.
   /// Required for device constructs.

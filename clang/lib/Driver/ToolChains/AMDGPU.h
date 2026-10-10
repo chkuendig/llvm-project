@@ -10,7 +10,6 @@
 #define LLVM_CLANG_LIB_DRIVER_TOOLCHAINS_AMDGPU_H
 
 #include "Gnu.h"
-#include "ROCm.h"
 #include "clang/Basic/TargetID.h"
 #include "clang/Driver/Options.h"
 #include "clang/Driver/Tool.h"
@@ -43,10 +42,12 @@ void getAMDGPUTargetFeatures(const Driver &D, const llvm::Triple &Triple,
                              StringRef TcTargetID = StringRef());
 
 namespace dlr {
-llvm::SmallVector<std::string, 12>
-getCommonDeviceLibNames(const llvm::opt::ArgList &DriverArgs, const Driver &D,
+llvm::SmallVector<ToolChain::BitCodeLibraryInfo, 12>
+getCommonDeviceLibNames(const llvm::opt::ArgList &DriverArgs,
+                        const SanitizerArgs &SanArgs, const Driver &D,
                         const std::string &GPUArch, bool isOpenMP,
-                        const RocmInstallationDetector &RocmInstallation);
+                        const RocmInstallationDetector &RocmInstallation,
+                        const clang::driver::Action::OffloadKind DeviceOffloadingKind = Action::OFK_OpenMP);
 
 const char *
 getCbslCommandArgs(Compilation &C, const llvm::opt::ArgList &Args,
@@ -82,6 +83,8 @@ const char *getLldCommandArgs(
     const std::optional<std::string> OutputFilePrefix = std::nullopt);
 } // end namespace dlr
 
+void addFullLTOPartitionOption(const Driver &D, const llvm::opt::ArgList &Args,
+                               llvm::opt::ArgStringList &CmdArgs);
 } // end namespace amdgpu
 } // end namespace tools
 
@@ -119,6 +122,9 @@ public:
   void addClangTargetOptions(const llvm::opt::ArgList &DriverArgs,
                              llvm::opt::ArgStringList &CC1Args,
                              Action::OffloadKind DeviceOffloadKind) const override;
+  void
+  AddClangSystemIncludeArgs(const llvm::opt::ArgList &DriverArgs,
+                            llvm::opt::ArgStringList &CC1Args) const override;
 
   /// Return whether denormals should be flushed, and treated as 0 by default
   /// for the subtarget.
@@ -138,7 +144,7 @@ public:
   /// Needed for translating LTO options.
   const char *getDefaultLinker() const override { return "ld.lld"; }
 
-  /// Should skip Sanitize options
+  /// Should skip sanitize options.
   bool shouldSkipSanitizeOption(const ToolChain &TC,
                                 const llvm::opt::ArgList &DriverArgs,
                                 StringRef TargetID,
@@ -188,12 +194,27 @@ public:
                         Action::OffloadKind DeviceOffloadKind) const override;
 
   // Returns a list of device library names shared by different languages
-  llvm::SmallVector<std::string, 12>
+  llvm::SmallVector<BitCodeLibraryInfo, 12>
   getCommonDeviceLibNames(const llvm::opt::ArgList &DriverArgs,
                           const std::string &GPUArch,
-                          bool isOpenMP = false) const;
+                          Action::OffloadKind DeviceOffloadingKind) const;
+
   SanitizerMask getSupportedSanitizers() const override {
     return SanitizerKind::Address;
+  }
+
+  void diagnoseUnsupportedSanitizers(const llvm::opt::ArgList &Args) const {
+    if (!Args.hasFlag(options::OPT_fgpu_sanitize, options::OPT_fno_gpu_sanitize,
+                      true))
+      return;
+    auto &Diags = getDriver().getDiags();
+    for (auto *A : Args.filtered(options::OPT_fsanitize_EQ)) {
+      SanitizerMask K =
+          parseSanitizerValue(A->getValue(), /*Allow Groups*/ false);
+      if (K != SanitizerKind::Address)
+        Diags.Report(clang::diag::warn_drv_unsupported_option_for_target)
+            << A->getAsString(Args) << getTriple().str();
+    }
   }
 };
 

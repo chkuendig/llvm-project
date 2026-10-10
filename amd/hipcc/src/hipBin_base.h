@@ -203,6 +203,7 @@ enum HipBinCommand {
 class HipBinBase {
  public:
   HipBinBase();
+  virtual ~HipBinBase() = default;
   // Interface functions
   virtual void constructCompilerPath() = 0;
   virtual void printFull() = 0;
@@ -324,7 +325,7 @@ void HipBinBase::constructHipPath() {
   if (!hip_path_name.empty()) {
     variables_.hipPathEnv_ = hip_path_name;
   } else if (envVariables_.hipPathEnv_.empty()) {
-    fs::path full_path(hipBinUtilPtr_->getSelfPath());
+    fs::path full_path(hipcc::utils::getSelfPath());
     variables_.hipPathEnv_ = (full_path.parent_path()).string();
   } else {
     variables_.hipPathEnv_ = envVariables_.hipPathEnv_;
@@ -390,8 +391,9 @@ void HipBinBase::getSystemInfo() const {
     cout << endl << "== Windows Display Drivers" << endl;
     cout << "Hostname      :";
     system("hostname");
-    system("wmic path win32_VideoController get AdapterCompatibility,"
-    "InstalledDisplayDrivers,Name | findstr /B /C:\"Advanced Micro Devices\"");
+    system("powershell -c \"Get-CIMInstance -query 'SELECT * FROM win32_VideoController' | "
+           "ft AdapterCompatibility,InstalledDisplayDrivers,Name | "
+           "Out-String -Width 1000 | findstr /B /C:'Advanced Micro Devices'\"");
   } else {
     assert(os == lnx);
     cout << endl << "== Linux Kernel" << endl;
@@ -466,26 +468,13 @@ void HipBinBase::printUsage() const {
 
 // compiler canRun or not
 bool HipBinBase::canRunCompiler(string exeName, string& cmdOut) {
-  string compilerName = exeName;
-  string temp_dir = hipBinUtilPtr_->getTempDir();
-  fs::path templateFs = temp_dir;
-  templateFs /= "canRunXXXXXX";
-  string tmpFileName = hipBinUtilPtr_->mktempFile(templateFs.string());
-  compilerName += " --version > " + tmpFileName + " 2>&1";
   bool executable = false;
-  if (system(const_cast<char*>(compilerName.c_str()))) {
+  SystemCmdOut sysOut = hipBinUtilPtr_->exec((exeName + " --version").c_str());
+  if (sysOut.exitCode != 0) {
     executable = false;
   } else {
-    string myline;
-    ifstream fp;
-    fp.open(tmpFileName);
-    if (fp.is_open()) {
-      while (std::getline(fp, myline)) {
-        cmdOut += myline;
-      }
-    }
-    fp.close();
     executable = true;
+    cmdOut += sysOut.out;
   }
   return executable;
 }

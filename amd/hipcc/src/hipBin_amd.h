@@ -42,7 +42,6 @@ THE SOFTWARE.
 
 class HipBinAmd : public HipBinBase {
  private:
-  HipBinUtil* hipBinUtilPtr_;
   string hipClangPath_ = "";
   string roccmPathEnv_, hipRocclrPathEnv_, hsaPathEnv_;
   PlatformInfo platformInfoAMD_;
@@ -52,7 +51,7 @@ class HipBinAmd : public HipBinBase {
 
  public:
   HipBinAmd();
-  virtual ~HipBinAmd() = default;
+  ~HipBinAmd() override = default;
   virtual bool detectPlatform();
   virtual void constructCompilerPath();
   virtual const string& getCompilerPath() const;
@@ -621,8 +620,9 @@ void HipBinAmd::executeHipCCCmd(vector<string> argv) {
     }
     if (hipBinUtilPtr_->substringPresent(
         arg, "--amdhsa-code-object-version=")) {
-      std::cerr << "Warning: The --amdhsa-code-object-version option has been deprecated and will be removed in the future."
-                << "  Use -mllvm -mcode-object-version instead.\n";
+      std::cerr << "Warning: The --amdhsa-code-object-version option has been "
+                   "deprecated and will be removed in the future."
+                << "  Use -mcode-object-version instead.\n";
       arg = hipBinUtilPtr_->replaceStr(
             arg, "--amdhsa-code-object-version=", "");
       hsacoVersion = arg;
@@ -792,13 +792,13 @@ void HipBinAmd::executeHipCCCmd(vector<string> argv) {
   }
   // Parse the targets collected in targetStr
   // and set corresponding compiler options.
-  vector<string> targets = hipBinUtilPtr_->splitStr(targetsStr, ',');
+  vector<string> targets = hipcc::utils::splitStr(targetsStr, ',');
   string GPU_ARCH_OPT = " --offload-arch=";
 
   for (auto &val : targets) {
     // Ignore 'gfx000' target reported by rocm_agent_enumerator.
     if (val != "gfx000") {
-      vector<string> procAndFeatures = hipBinUtilPtr_->splitStr(val, ':');
+      vector<string> procAndFeatures = hipcc::utils::splitStr(val, ':');
       size_t len = procAndFeatures.size();
       // proc and features
       assertm(procAndFeatures.size() >= 1, "Pass the correct device/feature");
@@ -819,8 +819,7 @@ void HipBinAmd::executeHipCCCmd(vector<string> argv) {
         HIPCXXFLAGS += GPU_ARCH_ARG;
       }
     }  // end of val != "gfx000"
-  }  // end of targets for loop
-  string HCC_EXTRA_LIBRARIES;
+  }    // end of targets for loop
   if (hsacoVersion.size() > 0) {
     if (compileOnly == 0) {
       HIPLDFLAGS += " -mcode-object-version=" + hsacoVersion;
@@ -835,7 +834,6 @@ void HipBinAmd::executeHipCCCmd(vector<string> argv) {
     std::cerr <<  "No valid AMD GPU target was either specified or found."
               << "Please specify a valid target using --offload-arch=<target>.\n";
   }
-  HCC_EXTRA_LIBRARIES ="\n";  // TODO(agunashe) write to env
 
   if (buildDeps) {
     HIPCXXFLAGS += " --cuda-host-only";
@@ -864,16 +862,6 @@ void HipBinAmd::executeHipCCCmd(vector<string> argv) {
     }
   }
 
-  if (hasHIP) {
-    fs::path bitcodeFs = roccmPath;
-    bitcodeFs /= "amdgcn/bitcode";
-    if (deviceLibPath != bitcodeFs.string()) {
-      string hip_device_lib_str = " --hip-device-lib-path=\""
-                                  + deviceLibPath + "\"";
-      HIPCXXFLAGS += hip_device_lib_str;
-    }
-  }
-
   // to avoid using dk linker or MSVC linker
   if (isWindows()) {
     HIPLDFLAGS += " -fuse-ld=lld --ld-path=\"" + hipClangPath + "/lld-link.exe\"";
@@ -893,13 +881,6 @@ void HipBinAmd::executeHipCCCmd(vector<string> argv) {
     }
   }
 
-  if (!var.hipccCompileFlagsAppendEnv_.empty()) {
-    HIPCXXFLAGS += " " + var.hipccCompileFlagsAppendEnv_ + " ";
-    HIPCFLAGS += " " + var.hipccCompileFlagsAppendEnv_ + " ";
-  }
-  if (!var.hipccLinkFlagsAppendEnv_.empty()) {
-    HIPLDFLAGS += " " + var.hipccLinkFlagsAppendEnv_ + " ";
-  }
   // TODO(hipcc): convert CMD to an array rather than a string
   string compiler;
   compiler = getHipCC();
@@ -917,6 +898,15 @@ void HipBinAmd::executeHipCCCmd(vector<string> argv) {
   }
 
   CMD += " " + toolArgs;
+  if ((needCFLAGS || needCXXFLAGS) &&
+      !var.hipccCompileFlagsAppendEnv_.empty()) {
+    CMD.append(" ");
+    CMD.append(var.hipccCompileFlagsAppendEnv_);
+  }
+  if (needLDFLAGS && !compileOnly && !var.hipccLinkFlagsAppendEnv_.empty()) {
+    CMD.append(" ");
+    CMD.append(var.hipccLinkFlagsAppendEnv_);
+  }
   if (verbose & 0x1) {
     cout << "hipcc-cmd: " <<  CMD << "\n";
   }

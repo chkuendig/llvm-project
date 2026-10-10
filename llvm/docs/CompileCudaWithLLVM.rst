@@ -418,6 +418,17 @@ the compiler chooses to inline ``host_only``.
 Member functions, including constructors, may be overloaded using H and D
 attributes.  However, destructors cannot be overloaded.
 
+Clang Warnings for Host and Device Function Declarations
+--------------------------------------------------------
+
+Clang can emit warnings when it detects that host (H) and device (D) functions are declared or defined with the same signature. These warnings are not enabled by default.
+
+To enable these warnings, use the following compiler flag:
+
+.. code-block:: console
+
+    -Wnvcc-compat
+
 Using a Different Class on Host/Device
 --------------------------------------
 
@@ -512,7 +523,7 @@ LLVM to make it generate good GPU code.  Among these changes are:
   most effective on code along dominator paths.
 
 * `Memory space inference
-  <https://llvm.org/doxygen/NVPTXInferAddressSpaces_8cpp_source.html>`_ --
+  <https://llvm.org/doxygen/InferAddressSpaces_8cpp_source.html>`_ --
   In PTX, we can operate on pointers that are in a particular "address space"
   (global, shared, constant, or local), or we can operate on pointers in the
   "generic" address space, which can point to anything.  Operations in a

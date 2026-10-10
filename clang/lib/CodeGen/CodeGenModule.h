@@ -17,6 +17,7 @@
 #include "CodeGenTypeCache.h"
 #include "CodeGenTypes.h"
 #include "SanitizerMetadata.h"
+#include "TrapReasonBuilder.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclObjC.h"
 #include "clang/AST/DeclOpenMP.h"
@@ -26,6 +27,7 @@
 #include "clang/Basic/LangOptions.h"
 #include "clang/Basic/NoSanitizeList.h"
 #include "clang/Basic/ProfileList.h"
+#include "clang/Basic/StackExhaustionHandler.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Basic/XRayLists.h"
 #include "clang/Lex/PreprocessorOptions.h"
@@ -99,6 +101,50 @@ class TargetCodeGenInfo;
 enum ForDefinition_t : bool {
   NotForDefinition = false,
   ForDefinition = true
+};
+
+/// The Counter with an optional additional Counter for
+/// branches. `Skipped` counter can be calculated with `Executed` and
+/// a common Counter (like `Parent`) as `(Parent-Executed)`.
+///
+/// In SingleByte mode, Counters are binary. Subtraction is not
+/// applicable (but addition is capable). In this case, both
+/// `Executed` and `Skipped` counters are required.  `Skipped` is
+/// `None` by default. It is allocated in the coverage mapping.
+///
+/// There might be cases that `Parent` could be induced with
+/// `(Executed+Skipped)`. This is not always applicable.
+class CounterPair {
+public:
+  /// Optional value.
+  class ValueOpt {
+  private:
+    static constexpr uint32_t None = (1u << 31); /// None is allocated.
+    static constexpr uint32_t Mask = None - 1;
+
+    uint32_t Val;
+
+  public:
+    ValueOpt() : Val(None) {}
+
+    ValueOpt(unsigned InitVal) {
+      assert(!(InitVal & ~Mask));
+      Val = InitVal;
+    }
+
+    bool hasValue() const { return !(Val & None); }
+
+    operator uint32_t() const { return Val; }
+  };
+
+  ValueOpt Executed;
+  ValueOpt Skipped; /// May be None.
+
+  /// Initialized with Skipped=None.
+  CounterPair(unsigned Val) : Executed(Val) {}
+
+  // FIXME: Should work with {None, None}
+  CounterPair() : Executed(0) {}
 };
 
 struct OrderGlobalInitsOrStermFinalizers {
@@ -329,7 +375,26 @@ public:
     NxNoRedVar,
     NxMultRedVar,
     NxUnsupportedRedExpr,
-    NxUnsupportedXteamRedThreadLimit
+    NxUnsupportedXteamRedThreadLimit,
+    NxUnsupportedPseudoObject,
+    NxNotRedVarInBinOpRHS,
+    NxNotAddOpInBinOpRHs,
+    NxRhsOfAssignNotBinOpOrCall,
+    NxBinOpNotAddAssignOrAssign,
+    NxNotBinOpOrCallButAccessesRedVar,
+    NxNotArgScalarEval,
+    NxReductionOpNotBinAssign,
+    NxReductionOpRhsNotBinOrCond,
+    NxReductionOpRhsNotMinMaxSum,
+    NxNotBuiltinByNameInHostCompile,
+    NxNotBuiltinByNameInDeviceCompile,
+    NxPOExprCountNotOne,
+    NxPOSemanticExprNotCall,
+    NxChildOfCallIsNull,
+    NxMultiDeviceMinMaxNotSupported,
+    NxFastReductionMinMaxNotSupported,
+    NxScanMinMaxNotSupported,
+    NxAmbiguousRedKind
   };
 
   using Stmt2StmtMap = llvm::DenseMap<const Stmt *, const Stmt *>;
@@ -348,13 +413,22 @@ public:
   /// Map construct statement to corresponding metadata for a NoLoop kernel.
   using NoLoopKernelMap = llvm::DenseMap<const Stmt *, NoLoopKernelInfo>;
 
+  /// Xteam reduction operators supported today.
+  enum XteamRedOpKind {
+    XR_OP_unknown = 0,
+    // Valid values must be power of 2.
+    XR_OP_add = 1,
+    XR_OP_min = 2,
+    XR_OP_max = 4
+  };
+
   /// Map a reduction variable to the corresponding metadata. The metadata
   /// contains
   // the reduction expression, the coorresponding Xteam local aggregator var,
   // and the start arg position in the offloading function signature.
   struct XteamRedVarInfo {
     XteamRedVarInfo(const Expr *E, Address A, size_t Pos)
-        : RedVarExpr{E}, RedVarAddr{A}, ArgPos{Pos} {}
+        : RedVarExpr(E), RedVarAddr(A), ArgPos(Pos), Opcode(XR_OP_unknown) {}
     XteamRedVarInfo() = delete;
 
     /// Reduction variable expression, populated during initial analysis
@@ -365,6 +439,8 @@ public:
     /// signature, populated during signature generation. Used for device
     /// codegen only.
     size_t ArgPos;
+    /// Reduction operator type: currently one of add, min, and max.
+    XteamRedOpKind Opcode;
   };
 
   using XteamRedVarMap = llvm::DenseMap<const VarDecl *, XteamRedVarInfo>;
@@ -384,6 +460,9 @@ public:
     llvm::Value *NumTeams;
     /// Number of threads in a block, populated during device codegen.
     int BlockSize;
+    /// A mask of the reduction operators found in this kernel, populated
+    /// according to XteamRedOpKind.
+    uint8_t OpKindsFound;
     /// Nested directives, generated during analysis in both host/device
     /// codegen.
     OptKernelNestDirectives XteamNestDirs;
@@ -395,6 +474,41 @@ public:
     bool IsFast;
   };
   using XteamRedKernelMap = llvm::DenseMap<const Stmt *, XteamRedKernelInfo>;
+
+  struct XteamRedCollectionInfo {
+    XteamRedCollectionInfo(XteamRedVarMap VarMap, XteamRedVarVecTy VarVec,
+                           uint8_t Ops)
+        : RedVarMap(VarMap), RedVarVector(VarVec), OpKindsFound(Ops) {}
+    XteamRedVarMap RedVarMap;
+    XteamRedVarVecTy RedVarVector;
+    uint8_t OpKindsFound;
+  };
+
+  /// Metadata for multi-device kernel codegen
+  struct MultiDeviceBoundsInfo {
+    MultiDeviceBoundsInfo(VarDecl *LBArg, VarDecl *UBArg)
+        : LBArg{LBArg}, UBArg{UBArg} {}
+    VarDecl *LBArg;
+    VarDecl *UBArg;
+  };
+  using MultiDeviceFunctionBoundsMap =
+      llvm::DenseMap<const llvm::Function *, MultiDeviceBoundsInfo>;
+
+  struct MultiDeviceKernelInfo {
+    MultiDeviceKernelInfo(OptKernelNestDirectives Dirs,
+                          MultiDeviceFunctionBoundsMap FBM,
+                          bool CanBeMultiDevice)
+        : MultiDeviceNestDirs{Dirs}, FunctionBoundsMap{FBM},
+          CanBeMultiDevice{CanBeMultiDevice} {}
+
+    OptKernelNestDirectives MultiDeviceNestDirs;
+    MultiDeviceFunctionBoundsMap FunctionBoundsMap;
+    bool CanBeMultiDevice;
+    bool NewBoundsHaveBeenUsed = false;
+  };
+  /// Map construct statement to corresponding metadata for a NoLoop kernel.
+  using MultiDeviceKernelMap =
+      llvm::DenseMap<const Stmt *, MultiDeviceKernelInfo>;
 
 private:
   ASTContext &Context;
@@ -416,12 +530,15 @@ private:
   /// Used by emitParallelCall
   bool isSPMDExecutionMode = false;
 
+  /// Used by Xteam Scan Codegen
+  bool isXteamScanCandidate = false;
+
   mutable std::unique_ptr<TargetCodeGenInfo> TheTargetCodeGenInfo;
 
   // This should not be moved earlier, since its initialization depends on some
   // of the previous reference members being already initialized and also checks
   // if TheTargetCodeGenInfo is NULL
-  CodeGenTypes Types;
+  std::unique_ptr<CodeGenTypes> Types;
 
   /// Holds information about C++ vtables.
   CodeGenVTables VTables;
@@ -437,10 +554,10 @@ private:
   std::unique_ptr<llvm::IndexedInstrProfReader> PGOReader;
   InstrProfStats PGOStats;
   std::unique_ptr<llvm::SanitizerStatReport> SanStats;
+  StackExhaustionHandler StackHandler;
 
   /// Statement for which Xteam reduction code is being generated currently
   const Stmt *CurrentXteamRedStmt = nullptr;
-
   // Map associated statement from top-level to innermost level for optimized
   // kernels.
   Stmt2StmtMap OptKernelNestMap;
@@ -448,6 +565,7 @@ private:
   NoLoopKernelMap NoLoopKernels;
   NoLoopKernelMap BigJumpLoopKernels;
   XteamRedKernelMap XteamRedKernels;
+  MultiDeviceKernelMap MultiDeviceKernels;
 
   // A set of references that have only been seen via a weakref so far. This is
   // used to remove the weak of the reference if we ever see a direct reference
@@ -713,6 +831,9 @@ private:
   /// void @llvm.lifetime.end(i64 %size, i8* nocapture <ptr>)
   llvm::Function *LifetimeEndFn = nullptr;
 
+  /// void @llvm.fake.use(...)
+  llvm::Function *FakeUseFn = nullptr;
+
   std::unique_ptr<SanitizerMetadata> SanitizerMD;
 
   llvm::MapVector<const Decl *, bool> DeferredEmptyCoverageMappingDecls;
@@ -739,6 +860,13 @@ private:
   std::optional<PointerAuthQualifier>
   computeVTPointerAuthentication(const CXXRecordDecl *ThisClass);
 
+  AtomicOptions AtomicOpts;
+
+  // A set of functions which should be hot-patched; see
+  // -fms-hotpatch-functions-file (and -list). This will nearly always be empty.
+  // The list is sorted for binary-searching.
+  std::vector<std::string> MSHotPatchFunctions;
+
 public:
   CodeGenModule(ASTContext &C, IntrusiveRefCntPtr<llvm::vfs::FileSystem> FS,
                 const HeaderSearchOptions &headersearchopts,
@@ -750,9 +878,18 @@ public:
   ~CodeGenModule();
 
   void clear();
+  bool isXteamScanPhaseOne = true;
+  llvm::SmallVector<llvm::Value *, 8> ReductionVars;
+  const OMPExecutableDirective *OMPPresentScanDirective = nullptr;
 
   /// Finalize LLVM code generation.
   void Release();
+
+  /// Get the current Atomic options.
+  AtomicOptions getAtomicOpts() { return AtomicOpts; }
+
+  /// Set the current Atomic options.
+  void setAtomicOpts(AtomicOptions AO) { AtomicOpts = AO; }
 
   /// Return true if we should emit location information for expressions.
   bool getExpressionLocationsEnabled() const;
@@ -866,8 +1003,7 @@ public:
 
   llvm::MDNode *getNoObjCARCExceptionsMetadata() {
     if (!NoObjCARCExceptionsMetadata)
-      NoObjCARCExceptionsMetadata =
-          llvm::MDNode::get(getLLVMContext(), std::nullopt);
+      NoObjCARCExceptionsMetadata = llvm::MDNode::get(getLLVMContext(), {});
     return NoObjCARCExceptionsMetadata;
   }
 
@@ -891,6 +1027,7 @@ public:
   bool supportsCOMDAT() const;
   void maybeSetTrivialComdat(const Decl &D, llvm::GlobalObject &GO);
 
+  const ABIInfo &getABIInfo();
   CGCXXABI &getCXXABI() const { return *ABI; }
   llvm::LLVMContext &getLLVMContext() { return VMContext; }
 
@@ -898,7 +1035,7 @@ public:
 
   const TargetCodeGenInfo &getTargetCodeGenInfo();
 
-  CodeGenTypes &getTypes() { return Types; }
+  CodeGenTypes &getTypes() { return *Types; }
 
   CodeGenVTables &getVTables() { return VTables; }
 
@@ -1088,7 +1225,15 @@ public:
   llvm::Constant *getFunctionPointer(llvm::Constant *Pointer,
                                      QualType FunctionType);
 
+  llvm::Constant *getMemberFunctionPointer(const FunctionDecl *FD,
+                                           llvm::Type *Ty = nullptr);
+
+  llvm::Constant *getMemberFunctionPointer(llvm::Constant *Pointer,
+                                           QualType FT);
+
   CGPointerAuthInfo getFunctionPointerAuthInfo(QualType T);
+
+  CGPointerAuthInfo getMemberFunctionPointerAuthInfo(QualType FT);
 
   CGPointerAuthInfo getPointerAuthInfoForPointeeType(QualType type);
 
@@ -1123,9 +1268,8 @@ public:
 
   // Return whether RTTI information should be emitted for this target.
   bool shouldEmitRTTI(bool ForEH = false) {
-    return (ForEH || getLangOpts().RTTI) && !getLangOpts().CUDAIsDevice &&
-           !(getLangOpts().OpenMP && getLangOpts().OpenMPIsTargetDevice &&
-             (getTriple().isNVPTX() || getTriple().isAMDGPU()));
+    return (ForEH || getLangOpts().RTTI) &&
+           (!getLangOpts().isTargetDevice() || !getTriple().isGPU());
   }
 
   /// Get the address of the RTTI descriptor for the given type.
@@ -1231,9 +1375,8 @@ public:
   ///
   /// \param GlobalName If provided, the name to use for the global (if one is
   /// created).
-  ConstantAddress
-  GetAddrOfConstantCString(const std::string &Str,
-                           const char *GlobalName = nullptr);
+  ConstantAddress GetAddrOfConstantCString(const std::string &Str,
+                                           StringRef GlobalName = ".str");
 
   /// Returns a pointer to a constant global variable for the given file-scope
   /// compound literal expression.
@@ -1285,8 +1428,9 @@ public:
   llvm::Constant *getBuiltinLibFunction(const FunctionDecl *FD,
                                         unsigned BuiltinID);
 
-  llvm::Function *getIntrinsic(unsigned IID,
-                               ArrayRef<llvm::Type *> Tys = std::nullopt);
+  llvm::Function *getIntrinsic(unsigned IID, ArrayRef<llvm::Type *> Tys = {});
+
+  void AddCXXGlobalInit(llvm::Function *F) { CXXGlobalInits.push_back(F); }
 
   /// Emit code for a single top level declaration.
   void EmitTopLevelDecl(Decl *D);
@@ -1353,8 +1497,20 @@ public:
   /// Create or return a runtime function declaration with the specified type
   /// and name. If \p AssumeConvergent is true, the call will have the
   /// convergent attribute added.
+  ///
+  /// For new code, please use the overload that takes a QualType; it sets
+  /// function attributes more accurately.
   llvm::FunctionCallee
   CreateRuntimeFunction(llvm::FunctionType *Ty, StringRef Name,
+                        llvm::AttributeList ExtraAttrs = llvm::AttributeList(),
+                        bool Local = false, bool AssumeConvergent = false);
+
+  /// Create or return a runtime function declaration with the specified type
+  /// and name. If \p AssumeConvergent is true, the call will have the
+  /// convergent attribute added.
+  llvm::FunctionCallee
+  CreateRuntimeFunction(QualType ReturnTy, ArrayRef<QualType> ArgTys,
+                        StringRef Name,
                         llvm::AttributeList ExtraAttrs = llvm::AttributeList(),
                         bool Local = false, bool AssumeConvergent = false);
 
@@ -1374,6 +1530,7 @@ public:
 
   llvm::Function *getLLVMLifetimeStartFn();
   llvm::Function *getLLVMLifetimeEndFn();
+  llvm::Function *getLLVMFakeUseFn();
 
   // Make sure that this type is translated.
   void UpdateCompletedType(const TagDecl *TD);
@@ -1402,6 +1559,13 @@ public:
 
   /// Print out an error that codegen doesn't support the specified decl yet.
   void ErrorUnsupported(const Decl *D, const char *Type);
+
+  /// Run some code with "sufficient" stack space. (Currently, at least 256K is
+  /// guaranteed). Produces a warning if we're low on stack space and allocates
+  /// more in that case. Use this in code that may recurse deeply to avoid stack
+  /// overflow.
+  void runWithSufficientStackSpace(SourceLocation Loc,
+                                   llvm::function_ref<void()> Fn);
 
   /// Set the attributes on the LLVM function for the given decl and function
   /// info. This applies attributes necessary for handling the ABI as well as
@@ -1597,6 +1761,13 @@ public:
   void EmitOMPDeclareMapper(const OMPDeclareMapperDecl *D,
                             CodeGenFunction *CGF = nullptr);
 
+  // Emit code for the OpenACC Declare declaration.
+  void EmitOpenACCDeclare(const OpenACCDeclareDecl *D,
+                          CodeGenFunction *CGF = nullptr);
+  // Emit code for the OpenACC Routine declaration.
+  void EmitOpenACCRoutine(const OpenACCRoutineDecl *D,
+                          CodeGenFunction *CGF = nullptr);
+
   /// Emit a code for requires directive.
   /// \param D Requires declaration
   void EmitOMPRequiresDecl(const OMPRequiresDecl *D);
@@ -1639,7 +1810,10 @@ public:
   llvm::ConstantInt *CreateCrossDsoCfiTypeId(llvm::Metadata *MD);
 
   /// Generate a KCFI type identifier for T.
-  llvm::ConstantInt *CreateKCFITypeId(QualType T);
+  llvm::ConstantInt *CreateKCFITypeId(QualType T, StringRef Salt);
+
+  /// Create a metadata identifier for the given function type.
+  llvm::Metadata *CreateMetadataIdentifierForFnType(QualType T);
 
   /// Create a metadata identifier for the given type. This may either be an
   /// MDString (for external identifiers) or a distinct unnamed MDNode (for
@@ -1656,7 +1830,7 @@ public:
   llvm::Metadata *CreateMetadataIdentifierGeneralized(QualType T);
 
   /// Create and attach type metadata to the given function.
-  void CreateFunctionTypeMetadataForIcall(const FunctionDecl *FD,
+  void createFunctionTypeMetadataForIcall(const FunctionDecl *FD,
                                           llvm::Function *F);
 
   /// Set type metadata to the given function.
@@ -1794,6 +1968,16 @@ public:
     return getLangOpts().OpenMPTargetFastReduction;
   }
 
+  bool isXteamScanKernel() {
+    return (getLangOpts().OpenMPTargetXteamScan ||
+            getLangOpts().OpenMPTargetXteamNoLoopScan) &&
+           isXteamScanCandidate;
+  }
+
+  bool isXteamSegmentedScanKernel() {
+    return isXteamScanKernel() && !getLangOpts().OpenMPTargetXteamNoLoopScan;
+  }
+
   /// If we are able to generate a NoLoop kernel for this directive, return
   /// true, otherwise return false. If successful, a map is created from the
   /// top-level statement to the intermediate statements. For a combined
@@ -1873,6 +2057,12 @@ public:
   /// reduction variables are created for subsequent codegen phases to work on.
   NoLoopXteamErr checkAndSetXteamRedKernel(const OMPExecutableDirective &D);
 
+  /// If we are able to generate a multi-device kernel for this directive,
+  /// return true, otherwise return false. If successful, metadata for the
+  /// argument variables is created for subsequent codegen phases to work on.
+  bool checkAndSetMultiDeviceKernel(const OMPExecutableDirective &D,
+                                    bool CanBeMultiDevice);
+
   /// Compute the block size to be used for a kernel.
   int getWorkGroupSizeSPMDHelper(const OMPExecutableDirective &D);
   /// Used in optimized kernel codegen, compute the block size from the nested
@@ -1936,7 +2126,7 @@ public:
                             Address AggVarAddr) {
     assert(isXteamRedKernel(S));
     XteamRedVarMap &RVM = getXteamRedVarMap(S);
-    assert(RVM.find(VD) != RVM.end());
+    assert(RVM.find(VD) != RVM.end() && "Expected reduction variable in map");
     RVM.find(VD)->second.RedVarExpr = RVE;
     RVM.find(VD)->second.RedVarAddr = AggVarAddr;
     // Another API is used to set ArgPos
@@ -1945,6 +2135,24 @@ public:
   void updateXteamRedVarArgPos(XteamRedVarInfo *RVInfo, size_t ArgP) {
     assert(RVInfo);
     RVInfo->ArgPos = ArgP;
+  }
+
+  void updateXteamRedVarOpcode(const CallExpr *Call, const VarDecl *VD,
+                               XteamRedVarMap *RedMap) {
+    XteamRedOpKind Opcode;
+    if (isOptKernelAMDGCNMax(Call))
+      Opcode = XR_OP_max;
+    else if (isOptKernelAMDGCNMin(Call))
+      Opcode = XR_OP_min;
+    else
+      llvm_unreachable("Expected either min or max");
+    updateXteamRedVarOpcode(VD, RedMap, Opcode);
+  }
+
+  void updateXteamRedVarOpcode(const VarDecl *VD, XteamRedVarMap *RedMap,
+                               XteamRedOpKind Opcode) {
+    assert(RedMap->contains(VD) && "Expected reduction variable in map");
+    RedMap->find(VD)->second.Opcode = Opcode;
   }
 
   void updateXteamRedKernel(const Stmt *S, llvm::Value *ThdIndex,
@@ -1995,6 +2203,129 @@ public:
   /// Return true if the provided expression accesses the provided variable,
   /// otherwise return false.
   bool isXteamRedVarExpr(const Expr *E, const VarDecl *VD) const;
+
+  /// Return status indicating whether the call is an Xteam-supported host
+  /// builtin.
+  CodeGenModule::NoLoopXteamErr
+  getStatusOptKernelHostBuiltin(const CallExpr *C) const;
+
+  /// Is the callee in std namespace?
+  bool isStdNameSpace(const CallExpr *Call) const;
+
+  /// Is the function name recognized as a min builtin by the host compile?
+  bool isOptKernelHostMin(const CallExpr *Call) const {
+    std::string CallName = Call->getDirectCallee()->getNameInfo().getAsString();
+    if (isStdNameSpace(Call) && !CallName.compare("min"))
+      return true;
+    return (!CallName.compare("fmin") || !CallName.compare("fminf") ||
+            !CallName.compare("fminl") || !CallName.compare("__builtin_fmin") ||
+            !CallName.compare("__builtin_fminf") ||
+            !CallName.compare("__builtin_fminl"));
+  }
+
+  /// Is the function name recognized as a max builtin by the host compile?
+  bool isOptKernelHostMax(const CallExpr *Call) const {
+    std::string CallName = Call->getDirectCallee()->getNameInfo().getAsString();
+    if (isStdNameSpace(Call) && !CallName.compare("max"))
+      return true;
+    return (!CallName.compare("fmax") || !CallName.compare("fmaxf") ||
+            !CallName.compare("fmaxl") || !CallName.compare("__builtin_fmax") ||
+            !CallName.compare("__builtin_fmaxf") ||
+            !CallName.compare("__builtin_fmaxl"));
+  }
+
+  /// Return status indicating whether the amdgcn device function is supported
+  /// by Xteam.
+  CodeGenModule::NoLoopXteamErr
+  getStatusOptKernelAMDGCNBuiltin(const CallExpr *C) const;
+
+  /// Is the function name recognized as a min builtin by the device compile?
+  bool isOptKernelAMDGCNMin(const CallExpr *Call) const {
+    std::string CallName = Call->getDirectCallee()->getNameInfo().getAsString();
+    if (isStdNameSpace(Call) && !CallName.compare("min"))
+      return true;
+    return (!CallName.compare("fmin[device={arch(amdgcn)}]") ||
+            !CallName.compare("fminf[device={arch(amdgcn)}]") ||
+            !CallName.compare("fminl[device={arch(amdgcn)}]") ||
+            !CallName.compare("fmin") || !CallName.compare("fminf") ||
+            !CallName.compare("fminl") || !CallName.compare("__builtin_fmin") ||
+            !CallName.compare("__builtin_fminf") ||
+            !CallName.compare("__builtin_fminl"));
+  }
+
+  // Is the function name recognized as a max builtin by the device compile?
+  bool isOptKernelAMDGCNMax(const CallExpr *Call) const {
+    std::string CallName = Call->getDirectCallee()->getNameInfo().getAsString();
+    if (isStdNameSpace(Call) && !CallName.compare("max"))
+      return true;
+    return (!CallName.compare("fmax[device={arch(amdgcn)}]") ||
+            !CallName.compare("fmaxf[device={arch(amdgcn)}]") ||
+            !CallName.compare("fmaxl[device={arch(amdgcn)}]") ||
+            !CallName.compare("fmax") || !CallName.compare("fmaxf") ||
+            !CallName.compare("fmaxl") || !CallName.compare("__builtin_fmax") ||
+            !CallName.compare("__builtin_fmaxf") ||
+            !CallName.compare("__builtin_fmaxl"));
+  }
+
+  /// Return status indicating whether the call expression is supported by Xteam
+  /// as a builtin
+  CodeGenModule::NoLoopXteamErr getStatusOptKernelBuiltin(const CallExpr *C);
+
+  /// Return status indicating if the pseudo-object expression is supported by
+  /// Xteam
+  std::pair<CodeGenModule::NoLoopXteamErr, const Expr *>
+  getStatusXteamSupportedPseudoObject(const PseudoObjectExpr *PO);
+
+  /// Are we generating multi-device kernel for the statement
+  bool multiDeviceFStmtEntryExists(const Stmt *S) {
+    return MultiDeviceKernels.find(S) != MultiDeviceKernels.end();
+  }
+  bool isMultiDeviceKernel(const Stmt *S) {
+    if (MultiDeviceKernels.find(S) == MultiDeviceKernels.end())
+      return false;
+    MultiDeviceKernelInfo MDInfo = MultiDeviceKernels.find(S)->second;
+    return MDInfo.CanBeMultiDevice;
+  }
+  bool isMultiDeviceKernel(const OMPExecutableDirective &D);
+
+  /// Given a ForStmt for which Multi Device codegen will be done, save the
+  /// metadata for the LB and UB args.
+  void saveMultiDeviceArgs(const OMPExecutableDirective &D,
+                           const llvm::Function *F, VarDecl *LBDecl,
+                           VarDecl *UBDecl) {
+    assert(isMultiDeviceKernel(getSingleForStmt(getOptKernelKey(D))) &&
+           "Must be a multi-device kernel");
+    const ForStmt *FStmt = getSingleForStmt(getOptKernelKey(D));
+    assert((MultiDeviceKernels.find(FStmt) != MultiDeviceKernels.end()) &&
+           "FStmt not found");
+    MultiDeviceKernelInfo &MDInfo = MultiDeviceKernels.find(FStmt)->second;
+    MDInfo.FunctionBoundsMap.insert(
+        std::make_pair(F, MultiDeviceBoundsInfo(LBDecl, UBDecl)));
+  }
+
+  /// Retrieve the metadata for the LB arg.
+  MultiDeviceBoundsInfo getMultiDeviceBounds(const OMPExecutableDirective &D,
+                                             const llvm::Function *F) {
+    const ForStmt *FStmt = getSingleForStmt(getOptKernelKey(D));
+    assert((MultiDeviceKernels.find(FStmt) != MultiDeviceKernels.end()) &&
+           "FStmt not found");
+    MultiDeviceKernelInfo MDInfo = MultiDeviceKernels.find(FStmt)->second;
+    assert(MDInfo.FunctionBoundsMap.find(F) != MDInfo.FunctionBoundsMap.end() &&
+           "Function must exist");
+    return MDInfo.FunctionBoundsMap.find(F)->second;
+  }
+
+  /// Retrieve the metadata for the LB arg.
+  VarDecl *getMultiDeviceLBArg(const OMPExecutableDirective &D,
+                               const llvm::Function *F) {
+    return getMultiDeviceBounds(D, F).LBArg;
+  }
+
+  /// Retrieve the metadata for the LB arg.
+  VarDecl *getMultiDeviceUBArg(const OMPExecutableDirective &D,
+                               const llvm::Function *F) {
+    return getMultiDeviceBounds(D, F).UBArg;
+  }
 
   /// Move some lazily-emitted states to the NewBuilder. This is especially
   /// essential for the incremental parsing environment like Clang Interpreter,
@@ -2049,6 +2380,71 @@ public:
     MustTailCallUndefinedGlobals.insert(Global);
   }
 
+  bool shouldZeroInitPadding() const {
+    // In C23 (N3096) $6.7.10:
+    // """
+    // If any object is initialized with an empty iniitializer, then it is
+    // subject to default initialization:
+    //  - if it is an aggregate, every member is initialized (recursively)
+    //  according to these rules, and any padding is initialized to zero bits;
+    //  - if it is a union, the first named member is initialized (recursively)
+    //  according to these rules, and any padding is initialized to zero bits.
+    //
+    // If the aggregate or union contains elements or members that are
+    // aggregates or unions, these rules apply recursively to the subaggregates
+    // or contained unions.
+    //
+    // If there are fewer initializers in a brace-enclosed list than there are
+    // elements or members of an aggregate, or fewer characters in a string
+    // literal used to initialize an array of known size than there are elements
+    // in the array, the remainder of the aggregate is subject to default
+    // initialization.
+    // """
+    //
+    // From my understanding, the standard is ambiguous in the following two
+    // areas:
+    // 1. For a union type with empty initializer, if the first named member is
+    // not the largest member, then the bytes comes after the first named member
+    // but before padding are left unspecified. An example is:
+    //    union U { int a; long long b;};
+    //    union U u = {};  // The first 4 bytes are 0, but 4-8 bytes are left
+    //    unspecified.
+    //
+    // 2. It only mentions padding for empty initializer, but doesn't mention
+    // padding for a non empty initialization list. And if the aggregation or
+    // union contains elements or members that are aggregates or unions, and
+    // some are non empty initializers, while others are empty initiailizers,
+    // the padding initialization is unclear. An example is:
+    //    struct S1 { int a; long long b; };
+    //    struct S2 { char c; struct S1 s1; };
+    //    // The values for paddings between s2.c and s2.s1.a, between s2.s1.a
+    //    and s2.s1.b are unclear.
+    //    struct S2 s2 = { 'c' };
+    //
+    // Here we choose to zero initiailize left bytes of a union type. Because
+    // projects like the Linux kernel are relying on this behavior. If we don't
+    // explicitly zero initialize them, the undef values can be optimized to
+    // return gabage data. We also choose to zero initialize paddings for
+    // aggregates and unions, no matter they are initialized by empty
+    // initializers or non empty initializers. This can provide a consistent
+    // behavior. So projects like the Linux kernel can rely on it.
+    return !getLangOpts().CPlusPlus;
+  }
+
+  // Helper to get the alignment for a variable.
+  unsigned getVtableGlobalVarAlignment(const VarDecl *D = nullptr) {
+    LangAS AS = GetGlobalVarAddressSpace(D);
+    unsigned PAlign = getItaniumVTableContext().isRelativeLayout()
+                          ? 32
+                          : getTarget().getPointerAlign(AS);
+    return PAlign;
+  }
+
+  /// Helper function to construct a TrapReasonBuilder
+  TrapReasonBuilder BuildTrapReason(unsigned DiagID, TrapReason &TR) {
+    return TrapReasonBuilder(&getDiags(), DiagID, TR);
+  }
+
 private:
   bool shouldDropDLLAttribute(const Decl *D, const llvm::GlobalValue *GV) const;
 
@@ -2067,6 +2463,15 @@ private:
   // will be for an ifunc (llvm::GlobalIFunc) if the current target supports
   // that feature and for a regular function (llvm::GlobalValue) otherwise.
   llvm::Constant *GetOrCreateMultiVersionResolver(GlobalDecl GD);
+
+  // Set attributes to a resolver function generated by Clang.
+  // GD is either the cpu_dispatch declaration or an arbitrarily chosen
+  // function declaration that triggered the implicit generation of this
+  // resolver function.
+  //
+  /// NOTE: This should only be called for definitions.
+  void setMultiVersionResolverAttributes(llvm::Function *Resolver,
+                                         GlobalDecl GD);
 
   // In scenarios where a function is not known to be a multiversion function
   // until a later declaration, it is sometimes necessary to change the
@@ -2091,8 +2496,6 @@ private:
   void EmitMultiVersionFunctionDefinition(GlobalDecl GD, llvm::GlobalValue *GV);
 
   void EmitGlobalVarDefinition(const VarDecl *D, bool IsTentative = false);
-  void EmitExternalVarDeclaration(const VarDecl *D);
-  void EmitExternalFunctionDeclaration(const FunctionDecl *D);
   void EmitAliasDefinition(GlobalDecl GD);
   void emitIFuncDefinition(GlobalDecl GD);
   void emitCPUDispatchDefinition(GlobalDecl GD);
@@ -2211,6 +2614,11 @@ private:
   /// .gcda files in a way that persists in .bc files.
   void EmitCoverageFile();
 
+  /// Given a sycl_kernel_entry_point attributed function, emit the
+  /// corresponding SYCL kernel caller offload entry point function.
+  void EmitSYCLKernelCaller(const FunctionDecl *KernelEntryPointFn,
+                            ASTContext &Ctx);
+
   /// Determine whether the definition must be emitted; if this returns \c
   /// false, the definition can be emitted lazily if it's used.
   bool MustBeEmitted(const ValueDecl *D);
@@ -2262,7 +2670,7 @@ private:
   /// Top level checker for xteam reduction of the loop
   std::pair<NoLoopXteamErr, bool>
   getXteamRedForStmtStatus(const OMPExecutableDirective &, const Stmt *,
-                           const XteamRedVarMap &);
+                           XteamRedVarMap *);
 
   /// Are clauses on a combined OpenMP construct compatible with no-loop
   /// codegen?
@@ -2275,9 +2683,17 @@ private:
   getXteamRedStatusForClauses(const OptKernelNestDirectives &NestDirs);
 
   /// Collect the reduction variables that may satisfy Xteam criteria
-  std::pair<NoLoopXteamErr, std::pair<CodeGenModule::XteamRedVarMap,
-                                      CodeGenModule::XteamRedVarVecTy>>
+  std::pair<NoLoopXteamErr, XteamRedCollectionInfo>
   collectXteamRedVars(const OptKernelNestDirectives &NestDirs);
+
+  /// Top level checker for multi device of the loop
+  NoLoopXteamErr getMultiDeviceForStmtStatus(const OMPExecutableDirective &,
+                                             const Stmt *);
+
+  /// Are clauses on a combined OpenMP construct compatible with multi-device
+  /// codegen?
+  NoLoopXteamErr
+  getMultiDeviceStatusForClauses(const OptKernelNestDirectives &NestDirs);
 };
 
 }  // end namespace CodeGen

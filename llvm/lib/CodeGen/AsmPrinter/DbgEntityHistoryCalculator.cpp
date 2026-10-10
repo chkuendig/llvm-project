@@ -362,8 +362,9 @@ static void clobberRegEntries(InlinedEntity Var, unsigned RegNo,
       FellowRegisters.push_back(Reg);
 
   // Drop all entries that have ended.
+  auto &Entries = LiveEntries[Var];
   for (auto Index : IndicesToErase)
-    LiveEntries[Var].erase(Index);
+    Entries.erase(Index);
 }
 
 /// Add a new debug value for \p Var. Closes all overlapping debug values.
@@ -373,6 +374,18 @@ static void handleNewDebugValue(InlinedEntity Var, const MachineInstr &DV,
                                 DbgValueHistoryMap &HistMap) {
   EntryIndex NewIndex;
   if (HistMap.startDbgValue(Var, DV, NewIndex)) {
+    // As we already need to iterate all LiveEntries when handling a DbgValue,
+    // we use this map to avoid a more expensive check against RegVars. There
+    // is an assert that we handle this correctly in addRegDescribedVar.
+    //
+    // In other terms, the presence in this map indicates the presence of a
+    // corresponding entry in RegVars.
+    //
+    // The bool value then tracks whether an entry is to be retained (true) or
+    // removed (false); as we end previous entries we speculatively assume they
+    // can be dropped from RegVars, but we then also visit the new entry whose
+    // set of debug register operands may overlap and "save" a reg from being
+    // dropped.
     SmallDenseMap<unsigned, bool, 4> TrackedRegs;
 
     // If we have created a new debug value entry, close all preceding
@@ -400,10 +413,9 @@ static void handleNewDebugValue(InlinedEntity Var, const MachineInstr &DV,
       for (const MachineOperand &Op : DV.debug_operands()) {
         if (Op.isReg() && Op.getReg()) {
           Register NewReg = Op.getReg();
-          if (!TrackedRegs.count(NewReg))
+          if (TrackedRegs.insert_or_assign(NewReg, true).second)
             addRegDescribedVar(RegVars, NewReg, Var);
           LiveEntries[Var].insert(NewIndex);
-          TrackedRegs[NewReg] = true;
         }
       }
     }
@@ -414,9 +426,10 @@ static void handleNewDebugValue(InlinedEntity Var, const MachineInstr &DV,
         dropRegDescribedVar(RegVars, I.first, Var);
 
     // Drop all entries that have ended, and mark the new entry as live.
+    auto &Entries = LiveEntries[Var];
     for (auto Index : IndicesToErase)
-      LiveEntries[Var].erase(Index);
-    LiveEntries[Var].insert(NewIndex);
+      Entries.erase(Index);
+    Entries.insert(NewIndex);
   }
 }
 
@@ -466,9 +479,6 @@ void llvm::calculateDbgEntityHistory(const MachineFunction *MF,
     for (const auto &MI : MBB) {
       if (MI.isDebugValue()) {
         assert(MI.getNumOperands() > 1 && "Invalid DBG_VALUE instruction!");
-        // Use the base variable (without any DW_OP_piece expressions)
-        // as index into History. The full variables including the
-        // piece expressions are attached to the MI.
         const DILocalVariable *RawVar = MI.getDebugVariable();
         assert(RawVar->isValidLocationForIntrinsic(MI.getDebugLoc()) &&
                "Expected inlined-at fields to agree");
@@ -492,8 +502,7 @@ void llvm::calculateDbgEntityHistory(const MachineFunction *MF,
       if (MI.isMetaInstruction())
         continue;
 
-      // Not a DBG_VALUE instruction. It may clobber registers which describe
-      // some variables.
+      // Other instructions may clobber registers which describe some variables.
       for (const MachineOperand &MO : MI.operands()) {
         if (MO.isReg() && MO.isDef() && MO.getReg()) {
           // Ignore call instructions that claim to clobber SP. The AArch64
@@ -557,75 +566,6 @@ void llvm::calculateDbgEntityHistory(const MachineFunction *MF,
 
       LiveEntries.clear();
       RegVars.clear();
-    }
-  }
-}
-
-DbgDefKillHistoryMap::Entry::Entry(const MachineInstr &Begin)
-    : Begin(&Begin), End(nullptr), LastLiveBlock(Begin.getParent()) {}
-
-const MachineInstr *DbgDefKillHistoryMap::Entry::getBegin() const {
-  return Begin;
-}
-const MachineInstr *DbgDefKillHistoryMap::Entry::getEnd() const {
-  if (End)
-    return End;
-  return &LastLiveBlock->back();
-}
-bool DbgDefKillHistoryMap::Entry::isLiveThroughFunction() const {
-  if (End)
-    return false;
-  // FIXME: This doesn't consider other instructions preceding this DBG_DEF in
-  // the prologue.
-  if (!Begin->getParent()->pred_empty())
-    return false;
-  return LastLiveBlock->succ_empty();
-}
-
-void DbgDefKillHistoryMap::handleDbgDef(const MachineInstr &MI,
-                                        bool IsCoalescable) {
-  LLVM_DEBUG(dbgs() << "Handling DbgDef: " << MI << '\n');
-  auto &Entries = Lifetime2Entries[MI.getDebugLifetime()];
-  if (IsCoalescable && !Entries.empty() && !Entries.back().End) {
-    Entries.back().LastLiveBlock = MI.getParent();
-    return;
-  }
-  Entries.emplace_back(MI);
-}
-
-void DbgDefKillHistoryMap::handleDbgKill(const MachineInstr &MI) {
-  LLVM_DEBUG(dbgs() << "Handling DbgKill: " << MI << '\n');
-  auto &Entries = Lifetime2Entries[MI.getDebugLifetime()];
-  assert(!Entries.empty());
-  assert(!Entries.back().End);
-  Entries.back().End = &MI;
-}
-
-void llvm::calculateHeterogeneousDbgEntityHistory(
-    const MachineFunction *MF, const TargetRegisterInfo *TRI,
-    DbgDefKillHistoryMap &DbgDefKillHistory, DbgLabelInstrMap &DbgLabels) {
-  for (const auto &MBB : *MF) {
-    bool IsCoalescable = true;
-    for (const auto &MI : MBB) {
-      if (!MI.isMetaInstruction()) {
-        IsCoalescable = false;
-        continue;
-      }
-      if (MI.isDebugDef()) {
-        DbgDefKillHistory.handleDbgDef(MI, IsCoalescable);
-      } else if (MI.isDebugKill()) {
-        DbgDefKillHistory.handleDbgKill(MI);
-      } else if (MI.isDebugLabel()) {
-        assert(MI.getNumOperands() == 1 && "Invalid DBG_LABEL instruction!");
-        const DILabel *RawLabel = MI.getDebugLabel();
-        assert(RawLabel->isValidLocationForIntrinsic(MI.getDebugLoc()) &&
-               "Expected inlined-at fields to agree");
-        // When collecting debug information for labels, there is no MCSymbol
-        // generated for it. So, we keep MachineInstr in DbgLabels in order
-        // to query MCSymbol afterward.
-        InlinedEntity L(RawLabel, MI.getDebugLoc()->getInlinedAt());
-        DbgLabels.addInstr(L, MI);
-      }
     }
   }
 }

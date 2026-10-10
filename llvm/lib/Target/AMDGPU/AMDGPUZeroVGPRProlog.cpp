@@ -69,7 +69,10 @@ public:
 
 } // namespace
 
-INITIALIZE_PASS(AMDGPUZeroVGPRProlog, DEBUG_TYPE,
+// opt registers legacy pass names as command-line choices. Keep this name
+// distinct from the boolean option above so target initialization cannot
+// register "amdgpu-zero-vgpr-prolog" twice.
+INITIALIZE_PASS(AMDGPUZeroVGPRProlog, "amdgpu-insert-zero-vgpr-prolog",
                 "AMDGPU Zero VGPR Prolog", false, false)
 
 char AMDGPUZeroVGPRProlog::ID = 0;

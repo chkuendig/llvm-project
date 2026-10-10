@@ -30,9 +30,11 @@
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Parallel.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Regex.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/Threading.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/WithColor.h"
 #include "llvm/Support/raw_ostream.h"
@@ -272,7 +274,7 @@ static cl::opt<bool>
                               "expressed in bytes."),
                      cat(DwarfDumpCategory));
 static cl::opt<bool> ManuallyGenerateUnitIndex(
-    "manaully-generate-unit-index",
+    "manually-generate-unit-index",
     cl::desc("if the input is dwp file, parse .debug_info "
              "section and use it to populate "
              "DW_SECT_INFO contributions in cu-index. "
@@ -284,6 +286,14 @@ static cl::opt<bool>
                 cat(DwarfDumpCategory));
 static opt<bool> Verify("verify", desc("Verify the DWARF debug info."),
                         cat(DwarfDumpCategory));
+static opt<unsigned> VerifyNumThreads(
+    "verify-num-threads", init(1),
+    desc("Number of threads to use for --verify. Single threaded verification "
+         "is the default unless this option is specified. If 0 is specified, "
+         "maximum hardware threads will be used. This can cause the "
+         "output to be non determinisitic, but can speed up verification and "
+         "is useful when running with the summary only or JSON summary modes."),
+    cat(DwarfDumpCategory));
 static opt<ErrorDetailLevel> ErrorDetails(
     "error-display", init(Unspecified),
     desc("Set the level of detail and summary to display when verifying "
@@ -391,6 +401,7 @@ static bool filterArch(ObjectFile &Obj) {
 }
 
 struct TargetCallbacks {
+  std::unique_ptr<const MCRegisterInfo> MCRegInfo;
   std::function<llvm::StringRef(uint64_t DwarfRegNum, bool IsEH)>
       GetNameForDWARFReg;
   std::function<llvm::StringRef(uint64_t AS)> GetNameForDWARFAddressSpace;
@@ -432,13 +443,9 @@ static bool filterByName(const StringSet<> &Names, DWARFDie Die,
 }
 
 /// Print only DIEs that have a certain name.
-static void filterByName(
-    const StringSet<> &Names, DWARFContext::unit_iterator_range CUs,
-    raw_ostream &OS,
-#if FIXME // removed by Juan in Mar 2023
-    std::function<StringRef(uint64_t RegNum, bool IsEH)> GetNameForDWARFReg,
-#endif
-    TargetCallbacks &Callbacks) {
+static void filterByName(const StringSet<> &Names,
+                         DWARFContext::unit_iterator_range CUs, raw_ostream &OS,
+                         TargetCallbacks &Callbacks) {
   auto filterDieNames = [&](DWARFUnit *Unit) {
     for (const auto &Entry : Unit->dies()) {
       DWARFDie Die = {Unit, &Entry};
@@ -522,9 +529,8 @@ static void filterByAccelName(ArrayRef<std::string> Names, DWARFContext &DICtx,
 }
 
 /// Print all DIEs in apple accelerator tables
-static void findAllApple(
-    DWARFContext &DICtx, raw_ostream &OS,
-    std::function<StringRef(uint64_t RegNum, bool IsEH)> GetNameForDWARFReg) {
+static void findAllApple(DWARFContext &DICtx, raw_ostream &OS,
+                         const TargetCallbacks &Callbacks) {
   MapVector<StringRef, llvm::SmallSet<DWARFDie, 2>> NameToDies;
 
   auto PushDIEs = [&](const AppleAcceleratorTable &Accel) {
@@ -543,7 +549,7 @@ static void findAllApple(
   PushDIEs(DICtx.getAppleTypes());
 
   DIDumpOptions DumpOpts = getDumpOpts(DICtx);
-  DumpOpts.GetNameForDWARFReg = GetNameForDWARFReg;
+  DumpOpts.GetNameForDWARFReg = Callbacks.GetNameForDWARFReg;
   for (const auto &[Name, Dies] : NameToDies) {
     OS << llvm::formatv("\nApple accelerator entries with name = \"{0}\":\n",
                         Name);
@@ -576,9 +582,13 @@ static bool lookup(ObjectFile &Obj, DWARFContext &DICtx, uint64_t Address,
 
   // TODO: it is neccessary to set proper SectionIndex here.
   // object::SectionedAddress::UndefSection works for only absolute addresses.
-  if (DILineInfo LineInfo = DICtx.getLineInfoForAddress(
-          {Lookup, object::SectionedAddress::UndefSection}))
+  if (DILineInfo LineInfo =
+          DICtx
+              .getLineInfoForAddress(
+                  {Lookup, object::SectionedAddress::UndefSection})
+              .value_or(DILineInfo())) {
     LineInfo.dump(OS);
+  }
 
   return true;
 }
@@ -664,14 +674,26 @@ static bool collectObjectSources(ObjectFile &Obj, DWARFContext &DICtx,
   return Result;
 }
 
-static std::pair<TargetCallbacks, std::unique_ptr<MCRegisterInfo>>
-getCallbacks(ObjectFile &Obj, const Twine &Filename) {
+static std::unique_ptr<MCRegisterInfo>
+createRegInfo(const object::ObjectFile &Obj) {
+  std::unique_ptr<MCRegisterInfo> MCRegInfo;
+  Triple TT;
+  TT.setArch(Triple::ArchType(Obj.getArch()));
+  TT.setVendor(Triple::UnknownVendor);
+  TT.setOS(Triple::UnknownOS);
+  std::string TargetLookupError;
+  const Target *TheTarget = TargetRegistry::lookupTarget(TT, TargetLookupError);
+  if (!TargetLookupError.empty())
+    return nullptr;
+  MCRegInfo.reset(TheTarget->createMCRegInfo(TT));
+  return MCRegInfo;
+}
+
+static TargetCallbacks getCallbacks(ObjectFile &Obj, const Twine &Filename) {
   Triple TT = Obj.makeTriple();
-  const std::string &TripleStr = TT.str();
 
   std::string TargetLookupError;
-  const Target *TheTarget =
-      TargetRegistry::lookupTarget(TripleStr, TargetLookupError);
+  const Target *TheTarget = TargetRegistry::lookupTarget(TT, TargetLookupError);
   if (!TargetLookupError.empty()) {
     logAllUnhandledErrors(
         createStringError(inconvertibleErrorCode(), "Error in creating Target"),
@@ -680,36 +702,33 @@ getCallbacks(ObjectFile &Obj, const Twine &Filename) {
     return {};
   }
 
-  TargetCallbacks Callbacks;
-  std::unique_ptr<MCRegisterInfo> MCRegInfo{
-      TheTarget->createMCRegInfo(TripleStr)};
-  if (MCRegInfo) {
-    Callbacks.GetNameForDWARFReg =
-        [MCRegInfo = MCRegInfo.get()](uint64_t DwarfRegNum,
-                                      bool IsEH) -> StringRef {
-      if (std::optional<unsigned> LLVMRegNum =
-              MCRegInfo->getLLVMRegNum(DwarfRegNum, IsEH))
-        if (const char *RegName = MCRegInfo->getName(*LLVMRegNum))
-          return StringRef(RegName);
-      return {};
-    };
-  } else {
+  const MCRegisterInfo *MCRI = TheTarget->createMCRegInfo(TT);
+  if (!MCRI) {
     logAllUnhandledErrors(createStringError(inconvertibleErrorCode(),
                                             "Error in creating MCRegisterInfo"),
                           errs(), Filename.str() + ": ");
+    return {};
   }
-
+  TargetCallbacks Callbacks;
+  Callbacks.MCRegInfo.reset(MCRI);
+  Callbacks.GetNameForDWARFReg = [MCRI](uint64_t DwarfRegNum,
+                                        bool IsEH) -> StringRef {
+    if (std::optional<MCRegister> LLVMRegNum =
+            MCRI->getLLVMRegNum(DwarfRegNum, IsEH))
+      if (const char *RegName = MCRI->getName(*LLVMRegNum))
+        return StringRef(RegName);
+    return {};
+  };
   Callbacks.GetNameForDWARFAddressSpace = [TT](uint64_t AS) {
     return dwarf::AddressSpaceString(AS, TT);
   };
 
-  return {Callbacks, std::move(MCRegInfo)};
+  return Callbacks;
 }
 
 static bool dumpObjectFile(ObjectFile &Obj, DWARFContext &DICtx,
                            const Twine &Filename, raw_ostream &OS) {
-  auto CallbacksAndRegInfo(getCallbacks(Obj, Filename));
-  auto &Callbacks = CallbacksAndRegInfo.first;
+  TargetCallbacks Callbacks = getCallbacks(Obj, Filename);
 
   // The UUID dump already contains all the same information.
   if (!(DumpType & DIDT_UUID) || DumpType == DIDT_All)
@@ -736,13 +755,12 @@ static bool dumpObjectFile(ObjectFile &Obj, DWARFContext &DICtx,
     return true;
   }
 
-#ifdef FIXME_GetRegName
   // Handle the --find-all-apple option and lower it to --debug-info=<offset>.
   if (FindAllApple) {
-    findAllApple(DICtx, OS, GetRegName);
+    findAllApple(DICtx, OS, Callbacks);
     return true;
   }
-#endif
+
   // Dump the complete DWARF structure.
   auto DumpOpts = getDumpOpts(DICtx);
   DumpOpts.GetNameForDWARFReg = Callbacks.GetNameForDWARFReg;
@@ -800,7 +818,8 @@ static bool handleBuffer(StringRef Filename, MemoryBufferRef Buffer,
     if (filterArch(*Obj)) {
       std::unique_ptr<DWARFContext> DICtx = DWARFContext::create(
           *Obj, DWARFContext::ProcessDebugRelocations::Process, nullptr, "",
-          RecoverableErrorHandler);
+          RecoverableErrorHandler, WithColor::defaultWarningHandler,
+          /*ThreadSafe=*/true);
       DICtx->setParseCUTUIndexManually(ManuallyGenerateUnitIndex);
       if (!HandleObj(*Obj, *DICtx, Filename, OS))
         Result = false;
@@ -928,6 +947,11 @@ int main(int argc, char **argv) {
 
   bool Success = true;
   if (Verify) {
+    if (!VerifyNumThreads)
+      parallel::strategy =
+          hardware_concurrency(hardware_concurrency().compute_thread_count());
+    else
+      parallel::strategy = hardware_concurrency(VerifyNumThreads);
     for (StringRef Object : Objects)
       Success &= handleFile(Object, verifyObjectFile, OutputFile.os());
   } else if (Statistics) {

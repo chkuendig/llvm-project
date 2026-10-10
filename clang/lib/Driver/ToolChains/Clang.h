@@ -159,19 +159,6 @@ public:
                                    const char *LinkingOutput) const override;
 };
 
-/// Offload wrapper tool.
-class LLVM_LIBRARY_VISIBILITY OffloadWrapper final : public Tool {
-public:
-  OffloadWrapper(const ToolChain &TC)
-      : Tool("offload wrapper", "clang-offload-wrapper", TC) {}
-
-  bool hasIntegratedCPP() const override { return false; }
-  void ConstructJob(Compilation &C, const JobAction &JA,
-                    const InputInfo &Output, const InputInfoList &Inputs,
-                    const llvm::opt::ArgList &TCArgs,
-                    const char *LinkingOutput) const override;
-};
-
 /// Offload binary tool.
 class LLVM_LIBRARY_VISIBILITY OffloadPackager final : public Tool {
 public:
@@ -204,12 +191,6 @@ public:
                           const llvm::Triple &TheTriple,
                           const char *LinkingOutput) const;
 };
-
-enum class DwarfFissionKind { None, Split, Single };
-
-DwarfFissionKind getDebugFissionKind(const Driver &D,
-                                     const llvm::opt::ArgList &Args,
-                                     llvm::opt::Arg *&Arg);
 
 // Calculate the output path of the module file when compiling a module unit
 // with the `-fmodule-output` option or `-fmodule-output=` option specified.

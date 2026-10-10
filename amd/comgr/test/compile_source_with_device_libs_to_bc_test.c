@@ -1,37 +1,10 @@
-/*******************************************************************************
- *
- * University of Illinois/NCSA
- * Open Source License
- *
- * Copyright (c) 2018 Advanced Micro Devices, Inc. All Rights Reserved.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * with the Software without restriction, including without limitation the
- * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
- * sell copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- *     * Redistributions of source code must retain the above copyright notice,
- *       this list of conditions and the following disclaimers.
- *
- *     * Redistributions in binary form must reproduce the above copyright
- *       notice, this list of conditions and the following disclaimers in the
- *       documentation and/or other materials provided with the distribution.
- *
- *     * Neither the names of Advanced Micro Devices, Inc. nor the names of its
- *       contributors may be used to endorse or promote products derived from
- *       this Software without specific prior written permission.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * CONTRIBUTORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS WITH
- * THE SOFTWARE.
- *
- ******************************************************************************/
+//===- compile_source_with_device_libs_to_bc_test.c -----------------------===//
+//
+// Part of Comgr, under the Apache License v2.0 with LLVM Exceptions. See
+// amd/comgr/LICENSE.TXT in this repository for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
 
 #include "amd_comgr.h"
 #include "common.h"
@@ -43,8 +16,8 @@ int main(int argc, char *argv[]) {
   char *BufSource;
   size_t SizeSource;
   amd_comgr_data_t DataSource;
-  amd_comgr_data_set_t DataSetIn, DataSetPch, DataSetBc, DataSetLinked,
-      DataSetReloc, DataSetExec;
+  amd_comgr_data_set_t DataSetIn, DataSetBc, DataSetLinked, DataSetReloc,
+      DataSetExec;
   amd_comgr_action_info_t DataAction;
   amd_comgr_status_t Status;
   const char *CodeGenOptions[] = {"-mcode-object-version=5", "-mllvm",
@@ -75,25 +48,6 @@ int main(int argc, char *argv[]) {
                                               "amdgcn-amd-amdhsa--gfx900");
   checkError(Status, "amd_comgr_action_info_set_isa_name");
 
-  Status = amd_comgr_create_data_set(&DataSetPch);
-  checkError(Status, "amd_comgr_create_data_set");
-
-  Status = amd_comgr_do_action(AMD_COMGR_ACTION_ADD_PRECOMPILED_HEADERS,
-                               DataAction, DataSetIn, DataSetPch);
-  checkError(Status, "amd_comgr_do_action");
-
-  size_t Count;
-  Status = amd_comgr_action_data_count(
-      DataSetPch, AMD_COMGR_DATA_KIND_PRECOMPILED_HEADER, &Count);
-  checkError(Status, "amd_comgr_action_data_count");
-
-  if (Count != 1) {
-    printf("AMD_COMGR_ACTION_ADD_PRECOMPILED_HEADERS Failed: "
-           "produced %zu precompiled header objects (expected 1)\n",
-           Count);
-    exit(1);
-  }
-
   Status = amd_comgr_create_data_set(&DataSetBc);
   checkError(Status, "amd_comgr_create_data_set");
 
@@ -103,15 +57,16 @@ int main(int argc, char *argv[]) {
 
   Status = amd_comgr_do_action(
       AMD_COMGR_ACTION_COMPILE_SOURCE_WITH_DEVICE_LIBS_TO_BC, DataAction,
-      DataSetPch, DataSetBc);
+      DataSetIn, DataSetBc);
   checkError(Status, "amd_comgr_do_action");
 
+  size_t Count;
   Status =
       amd_comgr_action_data_count(DataSetBc, AMD_COMGR_DATA_KIND_BC, &Count);
   checkError(Status, "amd_comgr_action_data_count");
 
   if (Count != 1) {
-    printf("AMD_COMGR_ACTION_COMPILE_SOURCE_TO_BC Failed: "
+    printf("AMD_COMGR_ACTION_COMPILE_SOURCE_WITH_DEVICE_LIBS_TO_BC Failed: "
            "produced %zu BC objects (expected 1)\n",
            Count);
     exit(1);
@@ -177,8 +132,6 @@ int main(int argc, char *argv[]) {
   Status = amd_comgr_release_data(DataSource);
   checkError(Status, "amd_comgr_release_data");
   Status = amd_comgr_destroy_data_set(DataSetIn);
-  checkError(Status, "amd_comgr_destroy_data_set");
-  Status = amd_comgr_destroy_data_set(DataSetPch);
   checkError(Status, "amd_comgr_destroy_data_set");
   Status = amd_comgr_destroy_data_set(DataSetBc);
   checkError(Status, "amd_comgr_destroy_data_set");

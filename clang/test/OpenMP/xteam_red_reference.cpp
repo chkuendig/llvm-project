@@ -50,6 +50,7 @@ void compute_reduced_sum(int n, int &x) {
 // CHECK-NEXT:    store ptr [[TMP1]], ptr [[DOTADDR1_ASCAST]], align 8
 // CHECK-NEXT:    [[TMP2:%.*]] = load ptr, ptr [[X_ADDR_ASCAST]], align 8
 // CHECK-NEXT:    store ptr [[TMP2]], ptr [[TMP_ASCAST]], align 8
+// CHECK-NEXT:    call void @__kmpc_specialized_kernel_init()
 // CHECK-NEXT:    [[TMP3:%.*]] = alloca i32, align 4, addrspace(5)
 // CHECK-NEXT:    store i32 0, ptr addrspace(5) [[TMP3]], align 4
 // CHECK-NEXT:    store i32 0, ptr [[I_ASCAST]], align 4
@@ -100,12 +101,12 @@ void compute_reduced_sum(int n, int &x) {
 // CHECK-NEXT:    [[TMP24:%.*]] = load i32, ptr [[DOTOMP_IV_ASCAST]], align 4
 // CHECK-NEXT:    [[TMP25:%.*]] = add i32 [[TMP23]], [[TMP24]]
 // CHECK-NEXT:    store i32 [[TMP25]], ptr [[DOTOMP_IV_ASCAST]], align 4
-// CHECK-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP7:![0-9]+]]
+// CHECK-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP6:![0-9]+]]
 // CHECK:       for.end:
 // CHECK-NEXT:    [[TMP26:%.*]] = load ptr, ptr [[DOTADDR_ASCAST]], align 8
 // CHECK-NEXT:    [[TMP27:%.*]] = load ptr, ptr [[DOTADDR1_ASCAST]], align 8
 // CHECK-NEXT:    [[TMP28:%.*]] = load ptr, ptr [[TMP_ASCAST]], align 8
 // CHECK-NEXT:    [[TMP29:%.*]] = load i32, ptr addrspace(5) [[TMP3]], align 4
-// CHECK-NEXT:    call void @__kmpc_xteamr_i_16x64(i32 [[TMP29]], ptr [[TMP28]], ptr [[TMP26]], ptr [[TMP27]], ptr @__kmpc_rfun_sum_i, ptr @__kmpc_rfun_sum_lds_i, i32 0, i64 [[TMP15]], i32 [[TMP14]])
+// CHECK-NEXT:    call void @__kmpc_xteamr_i_16x64(i32 [[TMP29]], ptr [[TMP28]], ptr [[TMP26]], ptr [[TMP27]], ptr @__kmpc_rfun_sum_i, ptr @__kmpc_rfun_sum_lds_i, i32 0, i64 [[TMP15]], i32 [[TMP14]], i32 1)
 // CHECK-NEXT:    ret void
 //

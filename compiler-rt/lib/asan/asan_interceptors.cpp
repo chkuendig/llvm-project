@@ -85,7 +85,7 @@ int OnExit() {
 // ---------------------- Wrappers ---------------- {{{1
 using namespace __asan;
 
-DECLARE_REAL_AND_INTERCEPTOR(void *, malloc, uptr)
+DECLARE_REAL_AND_INTERCEPTOR(void *, malloc, usize)
 DECLARE_REAL_AND_INTERCEPTOR(void, free, void *)
 
 #define COMMON_INTERCEPT_FUNCTION_VER(name, ver) \
@@ -366,7 +366,7 @@ INTERCEPTOR(void, makecontext, struct ucontext_t *ucp, void (*func)(), int argc,
   va_list ap;
   uptr args[64];
   // We don't know a better way to forward ... into REAL function. We can
-  // increase args size if neccecary.
+  // increase args size if necessary.
   CHECK_LE(argc, ARRAY_SIZE(args));
   internal_memset(args, 0, sizeof(args));
   va_start(ap, argc);
@@ -530,13 +530,13 @@ DEFINE_REAL(char*, index, const char *string, int c)
     return REAL(strcat)(to, from);
   }
 
-INTERCEPTOR(char*, strncat, char *to, const char *from, uptr size) {
+INTERCEPTOR(char*, strncat, char *to, const char *from, usize size) {
   void *ctx;
   ASAN_INTERCEPTOR_ENTER(ctx, strncat);
   AsanInitFromRtl();
   if (flags()->replace_str) {
     uptr from_length = MaybeRealStrnlen(from, size);
-    uptr copy_length = Min(size, from_length + 1);
+    uptr copy_length = Min<uptr>(size, from_length + 1);
     ASAN_READ_RANGE(ctx, from, copy_length);
     uptr to_length = internal_strlen(to);
     ASAN_READ_STRING_OF_LEN(ctx, to, to_length, to_length);
@@ -585,6 +585,9 @@ INTERCEPTOR(char *, strcpy, char *to, const char *from) {
 INTERCEPTOR(char*, strdup, const char *s) {
   void *ctx;
   ASAN_INTERCEPTOR_ENTER(ctx, strdup);
+  // Allowing null input is Windows-specific
+  if (SANITIZER_WINDOWS && UNLIKELY(!s))
+    return nullptr;
   if (UNLIKELY(!TryAsanInitFromRtl()))
     return internal_strdup(s);
   uptr length = internal_strlen(s);
@@ -618,12 +621,12 @@ INTERCEPTOR(char*, __strdup, const char *s) {
 }
 #endif // ASAN_INTERCEPT___STRDUP
 
-INTERCEPTOR(char*, strncpy, char *to, const char *from, uptr size) {
+INTERCEPTOR(char*, strncpy, char *to, const char *from, usize size) {
   void *ctx;
   ASAN_INTERCEPTOR_ENTER(ctx, strncpy);
   AsanInitFromRtl();
   if (flags()->replace_str) {
-    uptr from_size = Min(size, MaybeRealStrnlen(from, size) + 1);
+    uptr from_size = Min<uptr>(size, MaybeRealStrnlen(from, size) + 1);
     CHECK_RANGES_OVERLAP("strncpy", to, from_size, from, from_size);
     ASAN_READ_RANGE(ctx, from, from_size);
     ASAN_WRITE_RANGE(ctx, to, size);
@@ -651,8 +654,33 @@ static ALWAYS_INLINE auto StrtolImpl(void *ctx, Fn real, const char *nptr,
       return StrtolImpl(ctx, REAL(func), nptr, endptr, base);                \
     }
 
-INTERCEPTOR_STRTO_BASE(long, strtol)
 INTERCEPTOR_STRTO_BASE(long long, strtoll)
+
+#  if SANITIZER_WINDOWS
+INTERCEPTOR(long, strtol, const char *nptr, char **endptr, int base) {
+  // REAL(strtol) may be ntdll!strtol, which doesn't set errno. Instead,
+  // call REAL(strtoll) and do the range check ourselves.
+  COMPILER_CHECK(sizeof(long) == sizeof(u32));
+
+  void *ctx;
+  ASAN_INTERCEPTOR_ENTER(ctx, strtol);
+  AsanInitFromRtl();
+
+  long long result = StrtolImpl(ctx, REAL(strtoll), nptr, endptr, base);
+
+  if (result > INT32_MAX) {
+    errno = errno_ERANGE;
+    return INT32_MAX;
+  }
+  if (result < INT32_MIN) {
+    errno = errno_ERANGE;
+    return INT32_MIN;
+  }
+  return (long)result;
+}
+#  else
+INTERCEPTOR_STRTO_BASE(long, strtol)
+#  endif
 
 #  if SANITIZER_GLIBC
 INTERCEPTOR_STRTO_BASE(long, __isoc23_strtol)
@@ -869,6 +897,22 @@ INTERCEPTOR(hsa_status_t, hsa_amd_ipc_memory_detach, void* mapped_ptr) {
   return asan_hsa_amd_ipc_memory_detach(mapped_ptr);
 }
 
+INTERCEPTOR(hsa_status_t, hsa_amd_vmem_address_reserve_align, void** ptr,
+            size_t size, uint64_t address, uint64_t alignment, uint64_t flags) {
+  AsanInitFromRtl();
+  ENSURE_HSA_INITED();
+  GET_STACK_TRACE_MALLOC;
+  return asan_hsa_amd_vmem_address_reserve_align(ptr, size, address, alignment,
+                                                 flags, &stack);
+}
+
+INTERCEPTOR(hsa_status_t, hsa_amd_vmem_address_free, void* ptr, size_t size) {
+  AsanInitFromRtl();
+  ENSURE_HSA_INITED();
+  GET_STACK_TRACE_FREE;
+  return asan_hsa_amd_vmem_address_free(ptr, size, &stack);
+}
+
 void InitializeAmdgpuInterceptors() {
   ASAN_INTERCEPT_FUNC(hsa_memory_copy);
   ASAN_INTERCEPT_FUNC(hsa_amd_memory_pool_allocate);
@@ -881,6 +925,8 @@ void InitializeAmdgpuInterceptors() {
   ASAN_INTERCEPT_FUNC(hsa_amd_ipc_memory_create);
   ASAN_INTERCEPT_FUNC(hsa_amd_ipc_memory_attach);
   ASAN_INTERCEPT_FUNC(hsa_amd_ipc_memory_detach);
+  ASAN_INTERCEPT_FUNC(hsa_amd_vmem_address_reserve_align);
+  ASAN_INTERCEPT_FUNC(hsa_amd_vmem_address_free);
 }
 
 void ENSURE_HSA_INITED() {
@@ -922,7 +968,7 @@ void InitializeAsanInterceptors() {
   ASAN_INTERCEPT_FUNC(__isoc23_strtoll);
 #  endif
 
-  // Intecept jump-related functions.
+  // Intercept jump-related functions.
   ASAN_INTERCEPT_FUNC(longjmp);
 
 #  if ASAN_INTERCEPT_SWAPCONTEXT

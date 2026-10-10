@@ -1,37 +1,10 @@
-/*******************************************************************************
- *
- * University of Illinois/NCSA
- * Open Source License
- *
- * Copyright (c) 2018 Advanced Micro Devices, Inc. All Rights Reserved.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * with the Software without restriction, including without limitation the
- * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
- * sell copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- *     * Redistributions of source code must retain the above copyright notice,
- *       this list of conditions and the following disclaimers.
- *
- *     * Redistributions in binary form must reproduce the above copyright
- *       notice, this list of conditions and the following disclaimers in the
- *       documentation and/or other materials provided with the distribution.
- *
- *     * Neither the names of Advanced Micro Devices, Inc. nor the names of its
- *       contributors may be used to endorse or promote products derived from
- *       this Software without specific prior written permission.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * CONTRIBUTORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS WITH
- * THE SOFTWARE.
- *
- ******************************************************************************/
+//===- symbolize_test.c ---------------------------------------------------===//
+//
+// Part of Comgr, under the Apache License v2.0 with LLVM Exceptions. See
+// amd/comgr/LICENSE.TXT in this repository for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
 
 #include "amd_comgr.h"
 #include "common.h"
@@ -39,7 +12,17 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct container {
+#define CHECK(ptr, ...)                                                        \
+  do {                                                                         \
+    if ((ptr) == NULL) {                                                       \
+      fprintf(stderr, "Error: ");                                              \
+      fprintf(stderr, __VA_ARGS__);                                            \
+      fprintf(stderr, " at %s:%d\n", __FILE__, __LINE__);                      \
+      exit(EXIT_FAILURE);                                                      \
+    }                                                                          \
+  } while (0)
+
+typedef struct Container {
   char *Data;
   int Sz;
 } container_t;
@@ -56,32 +39,44 @@ void collectSymbolizedString(const char *Input, void *Data) {
 void testSymbolizedString(container_t *SymbolContainer) {
 
   char *SymbolStr = SymbolContainer->Data;
-  char* SpacePos = strchr(SymbolStr, ' ');
-  if (SpacePos == NULL) {
-    printf("Expected spaces in %s\n", SymbolStr);
-    exit(0);
-  }
+  CHECK(SymbolStr, "Failed, symbol_str is NULL.\n");
+
+  char *SpacePos = strchr(SymbolStr, ' ');
+  CHECK(SpacePos, "Expected spaces in %s\n", SymbolStr);
+
+  char *LineColPos = strchr(SymbolStr, ':');
+  CHECK(LineColPos, "Expected line:column information in %s\n", SymbolStr);
+
+  char *NewlinePos = strchr(SymbolStr, '\n');
+  CHECK(NewlinePos, "Expected '\\n' in %s", SymbolStr);
 
   size_t FuncNameSize = SpacePos - SymbolStr;
-  char *FuncName = (char*) malloc(sizeof(char) * (FuncNameSize + 1));
-
-  if (!SymbolStr) {
-    printf("Failed, symbol_str NULL\n");
-    exit(0);
-  }
+  char *FuncName = (char *)malloc(sizeof(char) * (FuncNameSize + 1));
 
   strncpy(FuncName, SymbolStr, FuncNameSize);
   FuncName[FuncNameSize] = '\0';
 
-  if (strcmp(FuncName, "bazzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")) {
+  size_t LineColSize = NewlinePos - LineColPos;
+  char *LineCol = (char *)malloc(sizeof(char) * (LineColSize));
+
+  strncpy(LineCol, LineColPos + 1, LineColSize);
+  LineCol[LineColSize - 1] = '\0';
+
+  if (strcmp(FuncName,
+             "bazzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz") &&
+      strcmp(LineCol, "46:7 (approximate)")) {
     printf("mismatch:\n");
-    printf("expected symbolized function name: bazzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n");
-    printf("actual symbolized function name: %s\n", FuncName);
+    printf("expected symbolized function name: "
+           "'bazzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz'\n");
+    printf("actual symbolized function name: '%s'\n", FuncName);
+    printf("expected symbolized line:column output: '46:7 (approximate)'\n");
+    printf("actual symbolized line:column output: '%s'\n", LineCol);
     exit(0);
   }
 
   printf("symbolized string is %s", SymbolStr);
   free(FuncName);
+  free(LineCol);
   free(SymbolStr);
 
   return;
@@ -96,7 +91,7 @@ int main(int argc, char *argv[]) {
   container_t UserData;
 
   // Read input file
-  Size = setBuf(TEST_OBJ_DIR "/shared-debug.so", &Buf);
+  Size = setBuf(TEST_OBJ_DIR "/symbolize-debug.so", &Buf);
 
   // Create data object
   {
@@ -105,7 +100,7 @@ int main(int argc, char *argv[]) {
     checkError(Status, "amd_comgr_create_data");
     Status = amd_comgr_set_data(DataIn, Size, Buf);
     checkError(Status, "amd_comgr_set_data");
-    Status = amd_comgr_set_data_name(DataIn, "shared-debug.so");
+    Status = amd_comgr_set_data_name(DataIn, "symbolize-debug.so");
     checkError(Status, "amd_comgr_set_data_name");
   }
 
@@ -116,9 +111,10 @@ int main(int argc, char *argv[]) {
                                               &Symbolizer);
     checkError(Status, "amd_comgr_create_symbolizer_info");
     // Use this command to get valid address
-    // llvm-objdump --triple=amdgcn-amd-amdhsa -l --mcpu=gfx900 --disassemble --source shared.so
-    int address = 5896;
-    Status = amd_comgr_symbolize(Symbolizer, address, 1, (void *)&UserData);
+    // llvm-objdump --triple=amdgcn-amd-amdhsa -l --mcpu=gfx900 --disassemble
+    // --source symbolize-debug.so
+    uint64_t Address = 0x128;
+    Status = amd_comgr_symbolize(Symbolizer, Address, 1, (void *)&UserData);
     checkError(Status, "amd_comgr_symbolize");
 
     testSymbolizedString(&UserData);

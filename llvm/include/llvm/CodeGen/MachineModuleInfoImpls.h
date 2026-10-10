@@ -83,16 +83,19 @@ class MachineModuleInfoELF : public MachineModuleInfoImpl {
   /// extern_weak symbols.
   DenseMap<MCSymbol *, const MCExpr *> AuthPtrStubs;
 
+  /// HasSignedPersonality is true if the corresponding IR module has the
+  /// "ptrauth-sign-personality" flag set to 1.
+  bool HasSignedPersonality = false;
+
   virtual void anchor(); // Out of line virtual method.
 
 public:
-  MachineModuleInfoELF(const MachineModuleInfo &) {}
+  MachineModuleInfoELF(const MachineModuleInfo &);
 
   StubValueTy &getGVStubEntry(MCSymbol *Sym) {
     assert(Sym && "Key cannot be null");
     return GVStubs[Sym];
   }
-
 
   const MCExpr *&getAuthPtrStubEntry(MCSymbol *Sym) {
     assert(Sym && "Key cannot be null");
@@ -106,6 +109,8 @@ public:
   ExprStubListTy getAuthGVStubList() {
     return getSortedExprStubs(AuthPtrStubs);
   }
+
+  bool hasSignedPersonality() const { return HasSignedPersonality; }
 };
 
 /// MachineModuleInfoCOFF - This is a MachineModuleInfoImpl implementation

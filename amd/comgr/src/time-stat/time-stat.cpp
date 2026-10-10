@@ -1,3 +1,17 @@
+//===- time-stat.cpp - Timing statistics ----------------------------------===//
+//
+// Part of Comgr, under the Apache License v2.0 with LLVM Exceptions. See
+// amd/comgr/LICENSE.TXT in this repository for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+///
+/// \file
+/// This file implements Comgr's built-in profiler, which can be enabled with
+/// the AMD_COMGR_TIME_STATISTICS enviornment variable.
+///
+//===----------------------------------------------------------------------===//
+
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -11,6 +25,8 @@
 #include "llvm/Support/raw_ostream.h"
 
 #if defined _WIN64 || defined _WIN32
+// Avoid introducing min as a macro from Windows headers.
+#define NOMINMAX
 #include <windows.h>
 #elif defined __linux__
 #include <time.h>

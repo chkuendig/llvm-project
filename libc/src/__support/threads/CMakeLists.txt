@@ -42,12 +42,14 @@ if(TARGET libc.src.__support.threads.${LIBC_TARGET_OS}.mutex)
       .mutex
       libc.src.__support.CPP.mutex
   )
-endif()
-
-if (LIBC_CONF_ENABLE_TID_CACHE)
-  set(libc_copt_enable_tid_cache 1)
-else()
-  set(libc_copt_enable_tid_cache 0)
+elseif(NOT (LIBC_CONF_THREAD_MODE STREQUAL LIBC_THREAD_MODE_PLATFORM))
+  add_header_library(
+    mutex
+  HDRS
+    mutex.h
+  DEPENDS
+    .mutex_common
+  )
 endif()
 
 add_header_library(
@@ -55,14 +57,12 @@ add_header_library(
   HDRS
     thread.h
   DEPENDS
+    libc.hdr.stdint_proxy
     libc.src.__support.common
     libc.src.__support.CPP.atomic
     libc.src.__support.CPP.optional
     libc.src.__support.CPP.string_view
     libc.src.__support.CPP.stringstream
-    libc.hdr.types.pid_t
-  COMPILE_OPTIONS
-    -DLIBC_COPT_ENABLE_TID_CACHE=${libc_copt_enable_tid_cache}
 )
 
 if(TARGET libc.src.__support.threads.${LIBC_TARGET_OS}.thread)
@@ -73,6 +73,7 @@ if(TARGET libc.src.__support.threads.${LIBC_TARGET_OS}.thread)
     DEPENDS
       .mutex
       .${LIBC_TARGET_OS}.thread
+      libc.hdr.stdint_proxy
       libc.src.__support.common
       libc.src.__support.fixedvector
       libc.src.__support.CPP.array
@@ -99,20 +100,18 @@ if(TARGET libc.src.__support.threads.${LIBC_TARGET_OS}.CndVar)
   )
 endif()
 
-set(tid_dep)
 if (LLVM_LIBC_FULL_BUILD)
-  list(APPEND tid_dep libc.src.__support.thread)
-else()
-  list(APPEND tid_dep libc.src.__support.OSUtil.osutil)
-  list(APPEND tid_dep libc.include.sys_syscall)
+  set(identifier_dependency_on_thread libc.src.__support.threads.thread)
 endif()
 
 add_header_library(
-  tid
+  identifier
   HDRS
-    tid.h
+    identifier.h
   DEPENDS
+    libc.src.__support.OSUtil.osutil
     libc.src.__support.common
+    libc.include.sys_syscall
     libc.hdr.types.pid_t
-    ${tid_dep}
+    ${identifier_dependency_on_thread}
 )

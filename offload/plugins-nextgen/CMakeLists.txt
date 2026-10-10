@@ -1,39 +1,44 @@
 # Common interface to handle creating a plugin library.
 set(common_dir ${CMAKE_CURRENT_SOURCE_DIR}/common)
+set(common_bin_dir ${CMAKE_CURRENT_BINARY_DIR}/common)
 add_subdirectory(common)
 function(add_target_library target_name lib_name)
   add_llvm_library(${target_name} STATIC
     LINK_COMPONENTS
     ${LLVM_TARGETS_TO_BUILD}
-    AggressiveInstCombine
-    Analysis
-    BinaryFormat
-    BitReader
-    BitWriter
-    CodeGen
-    Core
-    Extensions
-    InstCombine
-    Instrumentation
-    IPO
-    IRReader
-    Linker
-    MC
-    Object
-    Passes
-    Remarks
-    ScalarOpts
-    Support
-    Target
-    TargetParser
-    TransformUtils
-    Vectorize
+      AggressiveInstCombine
+      Analysis
+      BinaryFormat
+      BitReader
+      BitWriter
+      CodeGen
+      Core
+      Extensions
+      FrontendOffloading
+      InstCombine
+      Instrumentation
+      IPO
+      IRReader
+      Linker
+      MC
+      Object
+      Passes
+      ProfileData
+      Remarks
+      ScalarOpts
+      Support
+      Target
+      TargetParser
+      TransformUtils
+      Vectorize
+
     NO_INSTALL_RPATH
     BUILDTREE_ONLY
   )
 
   llvm_update_compile_flags(${target_name})
-  target_include_directories(${target_name} PUBLIC ${common_dir}/include)
+  target_include_directories(${target_name} PUBLIC ${common_dir}/include
+                             ${common_bin_dir}/include)
   if(OMPT_TARGET_DEFAULT AND LIBOMPTARGET_OMPT_SUPPORT)
     target_include_directories(${target_name} PUBLIC ${common_dir}/OMPT)
   endif()

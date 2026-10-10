@@ -95,11 +95,12 @@ void llvm::omp::target::ompt::setDeviceId(ompt_device_t *Device,
   auto DeviceIterator = Devices.find(Device);
   if (DeviceIterator != Devices.end()) {
     auto CurrentDeviceId = DeviceIterator->second;
-    if (DeviceId == CurrentDeviceId)
+    if (DeviceId == CurrentDeviceId) {
       REPORT("Tried to duplicate OMPT Device=%p (ID=%d)\n", Device, DeviceId);
-    else
+    } else {
       REPORT("Tried to overwrite OMPT Device=%p (ID=%d with new ID=%d)\n",
              Device, CurrentDeviceId, DeviceId);
+    }
     return;
   }
   Devices.emplace(Device, DeviceId);
@@ -123,8 +124,9 @@ OMPT_API_ROUTINE ompt_set_result_t ompt_set_trace_ompt(ompt_device_t *Device,
 
   int DeviceId = getDeviceId(Device);
   if (DeviceId < 0) {
-    REPORT("Failed to set trace events for Device=%p (Unknown device)\n",
-           Device);
+    REPORT("Failed to set trace events for Device=%p (Unknown device) "
+           "[Enable=%d, EventTy=%d]\n",
+           Device, Enable, EventTy);
     return ompt_set_never;
   }
 

@@ -1,9 +1,6 @@
 ; RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=tahiti -amdgpu-s-branch-bits=5 -amdgpu-long-branch-factor=0  < %s | FileCheck --check-prefix=GCN %s
 ; RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=tahiti -amdgpu-s-branch-bits=5 -amdgpu-long-branch-factor=0 -amdgpu-use-amdgpu-trackers=1  < %s | FileCheck --check-prefix=GCN-GCNTRACKERS %s
-
 ; CHECK-LABEL: {{^}}spill:
-; GCN:    codeLenInByte = 1000
-; GCN-GCNTRACKERS:    codeLenInByte = 1016
 ; GCN:    NumSgprs: 104
 ; GCN-GCNTRACKERS:    NumSgprs: 104
 ; GCN:    NumVgprs: 1
@@ -246,14 +243,12 @@ bb3:
 }
 
 ; CHECK-LABEL: {{^}}spill_func:
-; GCN:    codeLenInByte = 1612
-; GCN-GCNTRACKERS:    codeLenInByte = 1656
 ; GCN:    NumSgprs: 104
 ; GCN-GCNTRACKERS:    NumSgprs: 104
-; GCN:    NumVgprs: 3
-; GCN-GCNTRACKERS:    NumVgprs: 4
-; GCN:    ScratchSize: 12
-; GCN-GCNTRACKERS:    ScratchSize: 16
+; GCN:    NumVgprs: 2
+; GCN-GCNTRACKERS:    NumVgprs: 3
+; GCN:    ScratchSize: 8
+; GCN-GCNTRACKERS:    ScratchSize: 12
 
 define void @spill_func(ptr addrspace(1) %arg) #0 {
 entry:

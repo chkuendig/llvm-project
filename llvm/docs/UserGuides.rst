@@ -301,6 +301,7 @@ intermediate LLVM representation.
 
    AArch64SME
    AddingConstrainedIntrinsics
+   AdminTasks
    AdvancedBuilds
    AliasAnalysis
    AMDGPUUsage
@@ -319,6 +320,7 @@ intermediate LLVM representation.
    DebuggingJITedCode
    DirectXUsage
    Docker
+   DTLTO
    FatLTO
    ExtendingLLVM
    GitHub
@@ -333,6 +335,7 @@ intermediate LLVM representation.
    InstCombineContributorGuide
    InstrProfileFormat
    InstrRefDebugInfo
+   KeyInstructionsDebugInfo
    LinkTimeOptimization
    LoopTerminology
    MarkdownQuickstartTemplate
@@ -359,6 +362,7 @@ intermediate LLVM representation.
    SupportLibrary
    TableGen/index
    TableGenFundamentals
+   Telemetry
    Vectorizers
    WritingAnLLVMPass
    WritingAnLLVMNewPMPass
@@ -450,6 +454,11 @@ Optimizations
    This document describes the interface between LLVM intermodular optimizer
    and the linker and its design
 
+:doc:`DTLTO`
+   This document describes the DTLTO implementation, which allows for
+   distributing ThinLTO backend compilations without requiring support from
+   the build system.
+
 :doc:`GoldPlugin`
    How to build your programs with link-time optimization on Linux.
 
@@ -472,6 +481,10 @@ Optimizations
 :doc:`RemoveDIsDebugInfo`
    This is a migration guide describing how to move from debug info using
    intrinsics such as dbg.value to using the non-instruction DbgRecord object.
+
+:doc:`KeyInstructionsDebugInfo`
+   This document explains how the debug info feature Key Instructions is
+   implemented in LLVM.
 
 :doc:`InstrProfileFormat`
    This document explains two binary formats of instrumentation-based profiles.
@@ -573,10 +586,13 @@ Additional Topics
    DirectX runtime.
 
 :doc:`RISCVUsage`
-   This document describes using the RISCV-V target.
+   This document describes using the RISC-V target.
 
 :doc:`RISCV/RISCVVectorExtension`
    This document describes how the RISC-V Vector extension can be expressed in LLVM IR and how code is generated for it in the backend.
 
 :doc:`Sandbox IR <SandboxIR>`
    This document describes the design and usage of Sandbox IR, a transactional layer over LLVM IR.
+
+:doc:`Telemetry`
+   This document describes the Telemetry framework in LLVM.

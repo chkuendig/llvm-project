@@ -60,7 +60,6 @@ public:
     PrecompileJobClass,
     ExtractAPIJobClass,
     AnalyzeJobClass,
-    MigrateJobClass,
     CompileJobClass,
     FortranFrontendJobClass,
     BackendJobClass,
@@ -73,14 +72,15 @@ public:
     VerifyPCHJobClass,
     OffloadBundlingJobClass,
     OffloadUnbundlingJobClass,
-    OffloadWrapperJobClass,
     OffloadPackagerJobClass,
     LinkerWrapperJobClass,
     StaticLibJobClass,
     BinaryAnalyzeJobClass,
+    BinaryTranslatorJobClass,
+    ObjcopyJobClass,
 
     JobClassFirst = PreprocessJobClass,
-    JobClassLast = BinaryAnalyzeJobClass
+    JobClassLast = ObjcopyJobClass
   };
 
   // The offloading kind determines if this action is binded to a particular
@@ -96,6 +96,7 @@ public:
     OFK_Cuda = 0x02,
     OFK_OpenMP = 0x04,
     OFK_HIP = 0x08,
+    OFK_SYCL = 0x10,
   };
 
   static const char *getClassName(ActionClass AC);
@@ -268,7 +269,7 @@ public:
 /// programming model implementation needs and propagates the offloading kind to
 /// its dependences.
 class OffloadAction final : public Action {
-  virtual void anchor();
+  LLVM_DECLARE_VIRTUAL_ANCHOR_FUNCTION();
 
 public:
   /// Type used to communicate device actions. It associates bound architecture,
@@ -461,17 +462,6 @@ public:
   }
 };
 
-class MigrateJobAction : public JobAction {
-  void anchor() override;
-
-public:
-  MigrateJobAction(Action *Input, types::ID OutputType);
-
-  static bool classof(const Action *A) {
-    return A->getKind() == MigrateJobClass;
-  }
-};
-
 class CompileJobAction : public JobAction {
   void anchor() override;
 
@@ -655,17 +645,6 @@ public:
   }
 };
 
-class OffloadWrapperJobAction : public JobAction {
-  void anchor() override;
-
-public:
-  OffloadWrapperJobAction(ActionList &Inputs, types::ID Type);
-
-  static bool classof(const Action *A) {
-    return A->getKind() == OffloadWrapperJobClass;
-  }
-};
-
 class OffloadPackagerJobAction : public JobAction {
   void anchor() override;
 
@@ -707,6 +686,28 @@ public:
 
   static bool classof(const Action *A) {
     return A->getKind() == BinaryAnalyzeJobClass;
+  }
+};
+
+class BinaryTranslatorJobAction : public JobAction {
+  void anchor() override;
+
+public:
+  BinaryTranslatorJobAction(Action *Input, types::ID Type);
+
+  static bool classof(const Action *A) {
+    return A->getKind() == BinaryTranslatorJobClass;
+  }
+};
+
+class ObjcopyJobAction : public JobAction {
+  void anchor() override;
+
+public:
+  ObjcopyJobAction(Action *Input, types::ID Type);
+
+  static bool classof(const Action *A) {
+    return A->getKind() == ObjcopyJobClass;
   }
 };
 

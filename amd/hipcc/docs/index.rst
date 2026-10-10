@@ -8,9 +8,12 @@
 HIPCC documentation
 ******************************************
 
-``hipcc`` is a compiler driver utility that will call clang or nvcc, depending on target, and pass the appropriate include and library options for the target compiler and HIP infrastructure. 
+.. note::
+  ROCm provides and supports multiple compilers as described in `ROCm compiler reference <https://rocm.docs.amd.com/projects/llvm-project/en/latest/reference/rocmcc.html>`_.
 
-There are both Perl and C++ executable versions of the ``hipcc`` and ``hipconfig`` compiler driver utilities provided. By default the C++ version is used when ``hipcc`` is run. To enable the Perl versions of these commands set the environment variable ``HIP_USE_PERL_SCRIPTS=1``.
+``hipcc`` is a compiler driver utility that will call ``clang`` or ``nvcc``, depending on target, and pass the appropriate include and library options for the target compiler and HIP infrastructure. C++ executable versions of ``hipcc`` and ``hipconfig`` compiler driver utilities are provided.
+
+The HIPCC public repository is located at `https://github.com/ROCm/llvm-project/tree/amd-staging/amd/hipcc <https://github.com/ROCm/llvm-project/tree/amd-staging/amd/hipcc>`_
 
 The documentation is structured as follows:
 

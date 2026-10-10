@@ -186,7 +186,7 @@ static StringRef LlvmUserOperationEncodingString(unsigned Encoding) {
   default:
     llvm_unreachable("unhandled DWARF operation with LLVM user op");
 #define HANDLE_DW_OP_LLVM_USEROP(ID, NAME)                                     \
-  case DW_OP_LLVM_USER_##NAME:                                                 \
+  case DW_OP_LLVM_##NAME:                                                      \
     return "DW_OP_LLVM_" #NAME;
 #include "llvm/BinaryFormat/Dwarf.def"
   }
@@ -195,7 +195,7 @@ static StringRef LlvmUserOperationEncodingString(unsigned Encoding) {
 static unsigned
 getLlvmUserOperationEncoding(StringRef LlvmUserOperationEncodingString) {
   unsigned E = StringSwitch<unsigned>(LlvmUserOperationEncodingString)
-#define HANDLE_DW_OP_LLVM_USEROP(ID, NAME) .Case(#NAME, DW_OP_LLVM_USER_##NAME)
+#define HANDLE_DW_OP_LLVM_USEROP(ID, NAME) .Case(#NAME, DW_OP_LLVM_##NAME)
 #include "llvm/BinaryFormat/Dwarf.def"
                    .Default(0);
   assert(E && "unhandled DWARF operation string with LLVM user op");
@@ -391,6 +391,25 @@ unsigned llvm::dwarf::getVirtuality(StringRef VirtualityString) {
   .Case("DW_VIRTUALITY_" #NAME, DW_VIRTUALITY_##NAME)
 #include "llvm/BinaryFormat/Dwarf.def"
       .Default(DW_VIRTUALITY_invalid);
+}
+
+StringRef llvm::dwarf::EnumKindString(unsigned EnumKind) {
+  switch (EnumKind) {
+  default:
+    return StringRef();
+#define HANDLE_DW_APPLE_ENUM_KIND(ID, NAME)                                    \
+  case DW_APPLE_ENUM_KIND_##NAME:                                              \
+    return "DW_APPLE_ENUM_KIND_" #NAME;
+#include "llvm/BinaryFormat/Dwarf.def"
+  }
+}
+
+unsigned llvm::dwarf::getEnumKind(StringRef EnumKindString) {
+  return StringSwitch<unsigned>(EnumKindString)
+#define HANDLE_DW_APPLE_ENUM_KIND(ID, NAME)                                    \
+  .Case("DW_APPLE_ENUM_KIND_" #NAME, DW_APPLE_ENUM_KIND_##NAME)
+#include "llvm/BinaryFormat/Dwarf.def"
+      .Default(DW_APPLE_ENUM_KIND_invalid);
 }
 
 StringRef llvm::dwarf::LanguageString(unsigned Language) {
@@ -744,6 +763,8 @@ StringRef llvm::dwarf::AttributeValueString(uint16_t Attr, unsigned Val) {
     return LanguageString(Val);
   case DW_AT_defaulted:
     return DefaultedMemberString(Val);
+  case DW_AT_APPLE_enum_kind:
+    return EnumKindString(Val);
   case DW_AT_LLVM_memory_space:
     return MemorySpaceString(Val);
   }
@@ -918,7 +939,7 @@ StringRef llvm::dwarf::MemorySpaceString(unsigned MS) {
   }
 }
 
-StringRef llvm::dwarf::AddressSpaceString(unsigned AS, llvm::Triple TT) {
+StringRef llvm::dwarf::AddressSpaceString(unsigned AS, const llvm::Triple &TT) {
   switch (AS) {
 #define HANDLE_DW_ASPACE(ID, NAME)                                             \
   case DW_ASPACE_LLVM_##NAME:                                                  \
@@ -938,6 +959,18 @@ StringRef llvm::dwarf::AddressSpaceString(unsigned AS, llvm::Triple TT) {
 
   return "";
 }
+
+StringRef (*const llvm::dwarf::EnumTraits<Tag>::StringFn)(unsigned) = TagString;
+StringRef (*const llvm::dwarf::EnumTraits<Attribute>::StringFn)(unsigned) =
+    AttributeString;
+StringRef (*const llvm::dwarf::EnumTraits<Form>::StringFn)(unsigned) =
+    FormEncodingString;
+StringRef (*const llvm::dwarf::EnumTraits<LocationAtom>::StringFn)(unsigned) =
+    OperationEncodingString;
+StringRef (*const llvm::dwarf::EnumTraits<LineNumberOps>::StringFn)(unsigned) =
+    LNStandardString;
+StringRef (*const llvm::dwarf::EnumTraits<Index>::StringFn)(unsigned) =
+    IndexString;
 
 constexpr char llvm::dwarf::EnumTraits<Attribute>::Type[];
 constexpr char llvm::dwarf::EnumTraits<Form>::Type[];

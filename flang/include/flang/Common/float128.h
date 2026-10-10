@@ -20,6 +20,7 @@
 #ifndef FORTRAN_COMMON_FLOAT128_H_
 #define FORTRAN_COMMON_FLOAT128_H_
 
+#include "api-attrs.h"
 #include <float.h>
 
 #ifdef __cplusplus
@@ -35,7 +36,8 @@
 
 #undef HAS_FLOAT128
 #if (defined(__FLOAT128__) || defined(__SIZEOF_FLOAT128__)) && \
-    !defined(_LIBCPP_VERSION) && !defined(__CUDA_ARCH__)
+    !defined(_LIBCPP_VERSION) && !defined(__CUDA_ARCH__) && \
+    !defined(OMP_OFFLOAD_BUILD)
 /*
  * It may still be worth checking for compiler versions,
  * since earlier versions may define the macros above, but
@@ -49,10 +51,24 @@
 #define HAS_FLOAT128 1
 #endif
 #endif /* (defined(__FLOAT128__) || defined(__SIZEOF_FLOAT128__)) && \
-          !defined(_LIBCPP_VERSION)  && !defined(__CUDA_ARCH__) */
+          !defined(_LIBCPP_VERSION)  && !defined(__CUDA_ARCH__) && \
+          !defined(OMP_OFFLOAD_BUILD) */
+
+#if LDBL_MANT_DIG == 113
+#define HAS_LDBL128 1
+#endif
+
+#if defined(RT_DEVICE_COMPILATION) && (defined(__CUDACC__) || \
+    defined(OMP_OFFLOAD_BUILD))
+/*
+ * Most offload targets do not support 128-bit 'long double'.
+ * Disable HAS_LDBL128 for __CUDACC__ for the time being.
+ */
+#undef HAS_LDBL128
+#endif
 
 /* Define pure C CFloat128Type and CFloat128ComplexType. */
-#if LDBL_MANT_DIG == 113
+#if HAS_LDBL128
 typedef long double CFloat128Type;
 #ifndef __cplusplus
 typedef long double _Complex CFloat128ComplexType;

@@ -8,6 +8,7 @@
 
 #include "SIFrameLowering.h"
 #include "AMDGPU.h"
+#include "AMDGPULaneMaskUtils.h"
 #include "GCNSubtarget.h"
 #include "MCTargetDesc/AMDGPUMCTargetDesc.h"
 #include "SIMachineFunctionInfo.h"
@@ -48,6 +49,15 @@ static MCRegister findUnusedRegister(MachineRegisterInfo &MRI,
   return MCRegister();
 }
 
+static bool needsFrameMoves(const MachineFunction &MF) {
+  // FIXME: There are some places in the compiler which are sensitive to the CFI
+  // pseudos and so using MachineFunction::needsFrameMoves has the unintended
+  // effect of making enabling debug info affect codegen. Once we have
+  // identified and fixed those cases this should be replaced with
+  // MF.needsFrameMoves()
+  return true;
+}
+
 static void encodeDwarfRegisterLocation(int DwarfReg, raw_ostream &OS) {
   assert(DwarfReg >= 0);
   if (DwarfReg < 32) {
@@ -78,11 +88,8 @@ createScaledCFAInPrivateWave(const GCNSubtarget &ST,
           << uint8_t(dwarf::DW_OP_shl)
           << uint8_t(dwarf::DW_OP_lit0 +
                      dwarf::DW_ASPACE_LLVM_AMDGPU_private_wave);
-  if (EmitHeterogeneousDwarfAsUserOps)
     OSBlock << uint8_t(dwarf::DW_OP_LLVM_user)
-            << uint8_t(dwarf::DW_OP_LLVM_USER_form_aspace_address);
-  else
-    OSBlock << uint8_t(dwarf::DW_OP_LLVM_form_aspace_address);
+            << uint8_t(dwarf::DW_OP_LLVM_form_aspace_address);
 
   SmallString<20> CFIInst;
   raw_svector_ostream OSCFIInst(CFIInst);
@@ -100,7 +107,7 @@ void SIFrameLowering::emitDefCFA(MachineBasicBlock &MBB,
                                  MachineInstr::MIFlag Flags) const {
   MachineFunction &MF = *MBB.getParent();
   const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
-  const MCRegisterInfo *MCRI = MF.getMMI().getContext().getRegisterInfo();
+  const MCRegisterInfo *MCRI = MF.getContext().getRegisterInfo();
 
   MCRegister DwarfStackPtrReg = MCRI->getDwarfRegNum(StackPtrReg, false);
   MCCFIInstruction CFIInst =
@@ -439,7 +446,8 @@ class PrologEpilogSGPRSpillBuilder {
 
       buildEpilogRestore(ST, TRI, *FuncInfo, LiveUnits, MF, MBB, MI, DL,
                          TmpVGPR, FI, FrameReg, DwordOff);
-      MRI.constrainRegClass(SubReg, &AMDGPU::SReg_32_XM0RegClass);
+      assert(SubReg.isPhysical());
+
       BuildMI(MBB, MI, DL, TII->get(AMDGPU::V_READFIRSTLANE_B32), SubReg)
           .addReg(TmpVGPR, RegState::Kill);
       DwordOff += 4;
@@ -480,7 +488,7 @@ public:
       : MI(MI), MBB(MBB), MF(*MBB.getParent()),
         ST(MF.getSubtarget<GCNSubtarget>()), MFI(MF.getFrameInfo()),
         FuncInfo(MF.getInfo<SIMachineFunctionInfo>()), TII(TII), TRI(TRI),
-        MCRI(MF.getMMI().getContext().getRegisterInfo()),
+        MCRI(MF.getContext().getRegisterInfo()),
         TFI(ST.getFrameLowering()), SuperReg(Reg), SI(SI), LiveUnits(LiveUnits),
         DL(DL), FrameReg(FrameReg),
         IsFramePtrPrologSpill(IsFramePtrPrologSpill) {
@@ -488,8 +496,7 @@ public:
     SplitParts = TRI.getRegSplitParts(RC, EltSize);
     NumSubRegs = SplitParts.empty() ? 1 : SplitParts.size();
 
-    // FIXME: Switch to using MF.needsFrameMoves() later.
-    NeedsFrameMoves = true;
+    NeedsFrameMoves = needsFrameMoves(MF);
 
     assert(SuperReg != AMDGPU::M0 && "m0 should never spill");
   }
@@ -762,7 +769,7 @@ void SIFrameLowering::emitEntryFunctionPrologue(MachineFunction &MF,
   const SIRegisterInfo *TRI = &TII->getRegisterInfo();
   MachineRegisterInfo &MRI = MF.getRegInfo();
   const Function &F = MF.getFunction();
-  const MCRegisterInfo *MCRI = MF.getMMI().getContext().getRegisterInfo();
+  const MCRegisterInfo *MCRI = MF.getContext().getRegisterInfo();
   MachineFrameInfo &FrameInfo = MF.getFrameInfo();
 
   assert(MFI->isEntryFunction());
@@ -772,21 +779,11 @@ void SIFrameLowering::emitEntryFunctionPrologue(MachineFunction &MF,
   DebugLoc DL;
   MachineBasicBlock::iterator I = MBB.begin();
 
-  // FIXME: Switch to using MF.needsFrameMoves() later
-  const bool NeedsFrameMoves = true;
+  const bool NeedsFrameMoves = needsFrameMoves(MF);
 
   if (NeedsFrameMoves) {
     // On entry the SP/FP are not set up, so we need to define the CFA in terms
     // of a literal location expression.
-    static const char CFAEncodedInstArr[] = {
-        dwarf::DW_CFA_def_cfa_expression,
-        3, // length
-        static_cast<char>(dwarf::DW_OP_lit0),
-        static_cast<char>(dwarf::DW_OP_lit0 +
-                          dwarf::DW_ASPACE_LLVM_AMDGPU_private_wave),
-        static_cast<char>(dwarf::DW_OP_LLVM_form_aspace_address)};
-    static StringRef CFAEncodedInst =
-        StringRef(CFAEncodedInstArr, sizeof(CFAEncodedInstArr));
     static const char CFAEncodedInstUserOpsArr[] = {
         dwarf::DW_CFA_def_cfa_expression,
         4, // length
@@ -794,14 +791,11 @@ void SIFrameLowering::emitEntryFunctionPrologue(MachineFunction &MF,
         static_cast<char>(dwarf::DW_OP_lit0 +
                           dwarf::DW_ASPACE_LLVM_AMDGPU_private_wave),
         static_cast<char>(dwarf::DW_OP_LLVM_user),
-        static_cast<char>(dwarf::DW_OP_LLVM_USER_form_aspace_address)};
+        static_cast<char>(dwarf::DW_OP_LLVM_form_aspace_address)};
     static StringRef CFAEncodedInstUserOps =
         StringRef(CFAEncodedInstUserOpsArr, sizeof(CFAEncodedInstUserOpsArr));
-    buildCFI(
-        MBB, I, DL,
-        MCCFIInstruction::createEscape(nullptr, EmitHeterogeneousDwarfAsUserOps
-                                                    ? CFAEncodedInstUserOps
-                                                    : CFAEncodedInst));
+    buildCFI(MBB, I, DL,
+             MCCFIInstruction::createEscape(nullptr, CFAEncodedInstUserOps));
     // Unwinding halts when the return address (PC) is undefined.
     buildCFI(MBB, I, DL,
              MCCFIInstruction::createUndefined(
@@ -866,22 +860,74 @@ void SIFrameLowering::emitEntryFunctionPrologue(MachineFunction &MF,
         break;
       }
     }
+
+    // FIXME: We can spill incoming arguments and restore at the end of the
+    // prolog.
+    if (!ScratchWaveOffsetReg)
+      report_fatal_error(
+          "could not find temporary scratch offset register in prolog");
   } else {
     ScratchWaveOffsetReg = PreloadedScratchWaveOffsetReg;
   }
   assert(ScratchWaveOffsetReg || !PreloadedScratchWaveOffsetReg);
 
-  if (hasFP(MF)) {
+  unsigned Offset = FrameInfo.getStackSize() * getScratchScaleFactor(ST);
+  if (!mayReserveScratchForCWSR(MF)) {
+    if (hasFP(MF)) {
+      Register FPReg = MFI->getFrameOffsetReg();
+      assert(FPReg != AMDGPU::FP_REG);
+      BuildMI(MBB, I, DL, TII->get(AMDGPU::S_MOV_B32), FPReg).addImm(0);
+    }
+
+    if (requiresStackPointerReference(MF)) {
+      Register SPReg = MFI->getStackPtrOffsetReg();
+      assert(SPReg != AMDGPU::SP_REG);
+      BuildMI(MBB, I, DL, TII->get(AMDGPU::S_MOV_B32), SPReg).addImm(Offset);
+    }
+  } else {
+    // We need to check if we're on a compute queue - if we are, then the CWSR
+    // trap handler may need to store some VGPRs on the stack. The first VGPR
+    // block is saved separately, so we only need to allocate space for any
+    // additional VGPR blocks used. For now, we will make sure there's enough
+    // room for the theoretical maximum number of VGPRs that can be allocated.
+    // FIXME: Figure out if the shader uses fewer VGPRs in practice.
+    assert(hasFP(MF));
     Register FPReg = MFI->getFrameOffsetReg();
     assert(FPReg != AMDGPU::FP_REG);
-    BuildMI(MBB, I, DL, TII->get(AMDGPU::S_MOV_B32), FPReg).addImm(0);
-  }
+    unsigned VGPRSize = llvm::alignTo(
+        (ST.getAddressableNumVGPRs(MFI->getDynamicVGPRBlockSize()) -
+         AMDGPU::IsaInfo::getVGPRAllocGranule(&ST,
+                                              MFI->getDynamicVGPRBlockSize())) *
+            4,
+        FrameInfo.getMaxAlign());
+    MFI->setScratchReservedForDynamicVGPRs(VGPRSize);
 
-  if (requiresStackPointerReference(MF)) {
-    Register SPReg = MFI->getStackPtrOffsetReg();
-    assert(SPReg != AMDGPU::SP_REG);
-    BuildMI(MBB, I, DL, TII->get(AMDGPU::S_MOV_B32), SPReg)
-        .addImm(FrameInfo.getStackSize() * getScratchScaleFactor(ST));
+    BuildMI(MBB, I, DL, TII->get(AMDGPU::S_GETREG_B32), FPReg)
+        .addImm(AMDGPU::Hwreg::HwregEncoding::encode(
+            AMDGPU::Hwreg::ID_HW_ID2, AMDGPU::Hwreg::OFFSET_ME_ID, 2));
+    // The MicroEngine ID is 0 for the graphics queue, and 1 or 2 for compute
+    // (3 is unused, so we ignore it). Unfortunately, S_GETREG doesn't set
+    // SCC, so we need to check for 0 manually.
+    BuildMI(MBB, I, DL, TII->get(AMDGPU::S_CMP_LG_U32)).addImm(0).addReg(FPReg);
+    BuildMI(MBB, I, DL, TII->get(AMDGPU::S_CMOVK_I32), FPReg).addImm(VGPRSize);
+    if (requiresStackPointerReference(MF)) {
+      Register SPReg = MFI->getStackPtrOffsetReg();
+      assert(SPReg != AMDGPU::SP_REG);
+
+      // If at least one of the constants can be inlined, then we can use
+      // s_cselect. Otherwise, use a mov and cmovk.
+      if (AMDGPU::isInlinableLiteral32(Offset, ST.hasInv2PiInlineImm()) ||
+          AMDGPU::isInlinableLiteral32(Offset + VGPRSize,
+                                       ST.hasInv2PiInlineImm())) {
+        BuildMI(MBB, I, DL, TII->get(AMDGPU::S_CSELECT_B32), SPReg)
+            .addImm(Offset + VGPRSize)
+            .addImm(Offset);
+      } else {
+        BuildMI(MBB, I, DL, TII->get(AMDGPU::S_MOV_B32), SPReg).addImm(Offset);
+        BuildMI(MBB, I, DL, TII->get(AMDGPU::S_CMOVK_I32), SPReg)
+            .addImm(Offset + VGPRSize);
+      }
+    }
   }
 
   bool NeedsFlatScratchInit =
@@ -930,11 +976,11 @@ void SIFrameLowering::emitEntryFunctionScratchRsrcRegSetup(
     // at offset 0 (or offset 16 for a compute shader).
     MachinePointerInfo PtrInfo(AMDGPUAS::CONSTANT_ADDRESS);
     const MCInstrDesc &LoadDwordX4 = TII->get(AMDGPU::S_LOAD_DWORDX4_IMM);
-    auto MMO = MF.getMachineMemOperand(PtrInfo,
-                                       MachineMemOperand::MOLoad |
-                                           MachineMemOperand::MOInvariant |
-                                           MachineMemOperand::MODereferenceable,
-                                       16, Align(4));
+    auto *MMO = MF.getMachineMemOperand(
+        PtrInfo,
+        MachineMemOperand::MOLoad | MachineMemOperand::MOInvariant |
+            MachineMemOperand::MODereferenceable,
+        16, Align(4));
     unsigned Offset = Fn.getCallingConv() == CallingConv::AMDGPU_CS ? 16 : 0;
     const GCNSubtarget &Subtarget = MF.getSubtarget<GCNSubtarget>();
     unsigned EncodedOffset = AMDGPU::convertSMRDOffsetUnits(Subtarget, Offset);
@@ -981,7 +1027,7 @@ void SIFrameLowering::emitEntryFunctionScratchRsrcRegSetup(
         const MCInstrDesc &LoadDwordX2 = TII->get(AMDGPU::S_LOAD_DWORDX2_IMM);
 
         MachinePointerInfo PtrInfo(AMDGPUAS::CONSTANT_ADDRESS);
-        auto MMO = MF.getMachineMemOperand(
+        auto *MMO = MF.getMachineMemOperand(
             PtrInfo,
             MachineMemOperand::MOLoad | MachineMemOperand::MOInvariant |
                 MachineMemOperand::MODereferenceable,
@@ -1010,12 +1056,12 @@ void SIFrameLowering::emitEntryFunctionScratchRsrcRegSetup(
     }
 
     BuildMI(MBB, I, DL, SMovB32, Rsrc2)
-      .addImm(Rsrc23 & 0xffffffff)
-      .addReg(ScratchRsrcReg, RegState::ImplicitDefine);
+        .addImm(Lo_32(Rsrc23))
+        .addReg(ScratchRsrcReg, RegState::ImplicitDefine);
 
     BuildMI(MBB, I, DL, SMovB32, Rsrc3)
-      .addImm(Rsrc23 >> 32)
-      .addReg(ScratchRsrcReg, RegState::ImplicitDefine);
+        .addImm(Hi_32(Rsrc23))
+        .addReg(ScratchRsrcReg, RegState::ImplicitDefine);
   } else if (ST.isAmdHsaOrMesa(Fn)) {
     assert(PreloadedScratchRsrcReg);
 
@@ -1057,6 +1103,7 @@ bool SIFrameLowering::isSupportedStackID(TargetStackID::Value ID) const {
   case TargetStackID::SGPRSpill:
     return true;
   case TargetStackID::ScalableVector:
+  case TargetStackID::ScalablePredicateVector:
   case TargetStackID::WasmLocal:
     return false;
   }
@@ -1068,7 +1115,7 @@ void SIFrameLowering::emitPrologueEntryCFI(MachineBasicBlock &MBB,
                                            const DebugLoc &DL) const {
   const MachineFunction &MF = *MBB.getParent();
   const MachineRegisterInfo &MRI = MF.getRegInfo();
-  const MCRegisterInfo *MCRI = MF.getMMI().getContext().getRegisterInfo();
+  const MCRegisterInfo *MCRI = MF.getContext().getRegisterInfo();
   const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
   const SIRegisterInfo &TRI = ST.getInstrInfo()->getRegisterInfo();
   Register StackPtrReg =
@@ -1094,7 +1141,9 @@ void SIFrameLowering::emitPrologueEntryCFI(MachineBasicBlock &MBB,
   };
 
   // Emit CFI rules for caller saved Arch VGPRs which are clobbered
-  for_each(AMDGPU::VGPR_32RegClass.getRegisters(), ProcessReg);
+  unsigned NumArchVGPRs = ST.has1024AddressableVGPRs() ? 1024 : 256;
+  for_each(AMDGPU::VGPR_32RegClass.getRegisters().take_front(NumArchVGPRs),
+           ProcessReg);
 
   // Emit CFI rules for caller saved Accum VGPRs which are clobbered
   if (ST.hasMAIInsts()) {
@@ -1122,8 +1171,18 @@ static Register buildScratchExecCopy(LiveRegUnits &LiveUnits,
 
   initLiveUnits(LiveUnits, TRI, FuncInfo, MF, MBB, MBBI, IsProlog);
 
-  ScratchExecCopy = findScratchNonCalleeSaveRegister(
-      MRI, LiveUnits, *TRI.getWaveMaskRegClass());
+  if (FuncInfo->isWholeWaveFunction()) {
+    // Whole wave functions already have a copy of the original EXEC mask that
+    // we can use.
+    assert(IsProlog && "Epilog should look at return, not setup");
+    ScratchExecCopy =
+        TII->getWholeWaveFunctionSetup(MF)->getOperand(0).getReg();
+    assert(ScratchExecCopy && "Couldn't find copy of EXEC");
+  } else {
+    ScratchExecCopy = findScratchNonCalleeSaveRegister(
+        MRI, LiveUnits, *TRI.getWaveMaskRegClass());
+  }
+
   if (!ScratchExecCopy)
     report_fatal_error("failed to find free scratch register");
 
@@ -1153,7 +1212,9 @@ void SIFrameLowering::emitCSRSpillStores(MachineFunction &MF,
   const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
   const SIInstrInfo *TII = ST.getInstrInfo();
   const SIRegisterInfo &TRI = TII->getRegisterInfo();
-  const MCRegisterInfo *MCRI = MF.getMMI().getContext().getRegisterInfo();
+  const MCRegisterInfo *MCRI = MF.getContext().getRegisterInfo();
+  MachineRegisterInfo &MRI = MF.getRegInfo();
+  const AMDGPU::LaneMaskConstants &LMC = AMDGPU::LaneMaskConstants::get(ST);
 
   // Spill Whole-Wave Mode VGPRs. Save only the inactive lanes of the scratch
   // registers. However, save all lanes of callee-saved VGPRs. Due to this, we
@@ -1182,11 +1243,21 @@ void SIFrameLowering::emitCSRSpillStores(MachineFunction &MF,
         }
       };
 
+  for (const Register Reg : make_first_range(WWMScratchRegs)) {
+    if (!MRI.isReserved(Reg)) {
+      MRI.addLiveIn(Reg);
+      MBB.addLiveIn(Reg);
+    }
+  }
   StoreWWMRegisters(WWMScratchRegs);
+
+  auto EnableAllLanes = [&]() {
+    BuildMI(MBB, MBBI, DL, TII->get(LMC.MovOpc), LMC.ExecReg).addImm(-1);
+  };
+
   if (!WWMCalleeSavedRegs.empty()) {
     if (ScratchExecCopy) {
-      unsigned MovOpc = ST.isWave32() ? AMDGPU::S_MOV_B32 : AMDGPU::S_MOV_B64;
-      BuildMI(MBB, MBBI, DL, TII->get(MovOpc), TRI.getExec()).addImm(-1);
+      EnableAllLanes();
     } else {
       ScratchExecCopy = buildScratchExecCopy(LiveUnits, MF, MBB, MBBI, DL,
                                              /*IsProlog*/ true,
@@ -1195,10 +1266,20 @@ void SIFrameLowering::emitCSRSpillStores(MachineFunction &MF,
   }
 
   StoreWWMRegisters(WWMCalleeSavedRegs);
-  if (ScratchExecCopy) {
+  if (FuncInfo->isWholeWaveFunction()) {
+    // SI_WHOLE_WAVE_FUNC_SETUP has outlived its purpose, so we can remove
+    // it now. If we have already saved some WWM CSR registers, then the EXEC is
+    // already -1 and we don't need to do anything else. Otherwise, set EXEC to
+    // -1 here.
+    if (!ScratchExecCopy)
+      buildScratchExecCopy(LiveUnits, MF, MBB, MBBI, DL, /*IsProlog*/ true,
+                           /*EnableInactiveLanes*/ true);
+    else if (WWMCalleeSavedRegs.empty())
+      EnableAllLanes();
+    TII->getWholeWaveFunctionSetup(MF)->eraseFromParent();
+  } else if (ScratchExecCopy) {
     // FIXME: Split block and make terminator.
-    unsigned ExecMov = ST.isWave32() ? AMDGPU::S_MOV_B32 : AMDGPU::S_MOV_B64;
-    BuildMI(MBB, MBBI, DL, TII->get(ExecMov), TRI.getExec())
+    BuildMI(MBB, MBBI, DL, TII->get(LMC.MovOpc), LMC.ExecReg)
         .addReg(ScratchExecCopy, RegState::Kill);
     LiveUnits.addReg(ScratchExecCopy);
   }
@@ -1251,6 +1332,7 @@ void SIFrameLowering::emitCSRSpillRestores(
   const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
   const SIInstrInfo *TII = ST.getInstrInfo();
   const SIRegisterInfo &TRI = TII->getRegisterInfo();
+  const AMDGPU::LaneMaskConstants &LMC = AMDGPU::LaneMaskConstants::get(ST);
   Register FramePtrReg = FuncInfo->getFrameOffsetReg();
 
   for (const auto &Spill : FuncInfo->getPrologEpilogSGPRSpills()) {
@@ -1275,11 +1357,6 @@ void SIFrameLowering::emitCSRSpillRestores(
   Register ScratchExecCopy;
   SmallVector<std::pair<Register, int>, 2> WWMCalleeSavedRegs, WWMScratchRegs;
   FuncInfo->splitWWMSpillRegisters(MF, WWMCalleeSavedRegs, WWMScratchRegs);
-  if (!WWMScratchRegs.empty())
-    ScratchExecCopy =
-        buildScratchExecCopy(LiveUnits, MF, MBB, MBBI, DL,
-                             /*IsProlog*/ false, /*EnableInactiveLanes*/ true);
-
   auto RestoreWWMRegisters =
       [&](SmallVectorImpl<std::pair<Register, int>> &WWMRegs) {
         for (const auto &Reg : WWMRegs) {
@@ -1290,11 +1367,52 @@ void SIFrameLowering::emitCSRSpillRestores(
         }
       };
 
+  if (FuncInfo->isWholeWaveFunction()) {
+    // For whole wave functions, the EXEC is already -1 at this point.
+    // Therefore, we can restore the CSR WWM registers right away.
+    RestoreWWMRegisters(WWMCalleeSavedRegs);
+
+    // The original EXEC is the first operand of the return instruction.
+    MachineInstr &Return = MBB.instr_back();
+    unsigned Opcode = Return.getOpcode();
+    switch (Opcode) {
+    case AMDGPU::SI_WHOLE_WAVE_FUNC_RETURN:
+      Opcode = AMDGPU::SI_RETURN;
+      break;
+    case AMDGPU::SI_TCRETURN_GFX_WholeWave:
+      Opcode = AMDGPU::SI_TCRETURN_GFX;
+      break;
+    default:
+      llvm_unreachable("Unexpected return inst");
+    }
+    Register OrigExec = Return.getOperand(0).getReg();
+
+    if (!WWMScratchRegs.empty()) {
+      BuildMI(MBB, MBBI, DL, TII->get(LMC.XorOpc), LMC.ExecReg)
+          .addReg(OrigExec)
+          .addImm(-1);
+      RestoreWWMRegisters(WWMScratchRegs);
+    }
+
+    // Restore original EXEC.
+    BuildMI(MBB, MBBI, DL, TII->get(LMC.MovOpc), LMC.ExecReg).addReg(OrigExec);
+
+    // Drop the first operand and update the opcode.
+    Return.removeOperand(0);
+    Return.setDesc(TII->get(Opcode));
+
+    return;
+  }
+
+  if (!WWMScratchRegs.empty()) {
+    ScratchExecCopy =
+        buildScratchExecCopy(LiveUnits, MF, MBB, MBBI, DL,
+                             /*IsProlog=*/false, /*EnableInactiveLanes=*/true);
+  }
   RestoreWWMRegisters(WWMScratchRegs);
   if (!WWMCalleeSavedRegs.empty()) {
     if (ScratchExecCopy) {
-      unsigned MovOpc = ST.isWave32() ? AMDGPU::S_MOV_B32 : AMDGPU::S_MOV_B64;
-      BuildMI(MBB, MBBI, DL, TII->get(MovOpc), TRI.getExec()).addImm(-1);
+      BuildMI(MBB, MBBI, DL, TII->get(LMC.MovOpc), LMC.ExecReg).addImm(-1);
     } else {
       ScratchExecCopy = buildScratchExecCopy(LiveUnits, MF, MBB, MBBI, DL,
                                              /*IsProlog*/ false,
@@ -1305,8 +1423,7 @@ void SIFrameLowering::emitCSRSpillRestores(
   RestoreWWMRegisters(WWMCalleeSavedRegs);
   if (ScratchExecCopy) {
     // FIXME: Split block and make terminator.
-    unsigned ExecMov = ST.isWave32() ? AMDGPU::S_MOV_B32 : AMDGPU::S_MOV_B64;
-    BuildMI(MBB, MBBI, DL, TII->get(ExecMov), TRI.getExec())
+    BuildMI(MBB, MBBI, DL, TII->get(LMC.MovOpc), LMC.ExecReg)
         .addReg(ScratchExecCopy, RegState::Kill);
   }
 }
@@ -1353,8 +1470,7 @@ void SIFrameLowering::emitPrologue(MachineFunction &MF,
   uint32_t NumBytes = MFI.getStackSize();
   uint32_t RoundedSize = NumBytes;
 
-  // FIXME: Switch to using MF.needsFrameMoves() later
-  const bool NeedsFrameMoves = true;
+  const bool NeedsFrameMoves = needsFrameMoves(MF);
 
   if (NeedsFrameMoves)
     emitPrologueEntryCFI(MBB, MBBI, DL);
@@ -1507,6 +1623,16 @@ void SIFrameLowering::emitEpilogue(MachineFunction &MF,
   const Register StackPtrReg = FuncInfo->getStackPtrOffsetReg();
   Register FramePtrReg = FuncInfo->getFrameOffsetReg();
   bool FPSaved = FuncInfo->hasPrologEpilogSGPRSpillEntry(FramePtrReg);
+  if (RoundedSize != 0) {
+    if (TRI.hasBasePointer(MF))
+      BuildMI(MBB, MBBI, DL, TII->get(AMDGPU::COPY), StackPtrReg)
+          .addReg(TRI.getBaseRegister())
+          .setMIFlag(MachineInstr::FrameDestroy);
+    else if (hasFP(MF))
+      BuildMI(MBB, MBBI, DL, TII->get(AMDGPU::COPY), StackPtrReg)
+          .addReg(FramePtrReg)
+          .setMIFlag(MachineInstr::FrameDestroy);
+  }
 
   Register FramePtrRegScratchCopy;
   Register SGPRForFPSaveRestoreCopy =
@@ -1532,16 +1658,7 @@ void SIFrameLowering::emitEpilogue(MachineFunction &MF,
                          FramePtrRegScratchCopy);
   }
 
-  if (RoundedSize != 0 && hasFP(MF)) {
-    auto Add = BuildMI(MBB, MBBI, DL, TII->get(AMDGPU::S_ADD_I32), StackPtrReg)
-        .addReg(StackPtrReg)
-        .addImm(-static_cast<int64_t>(RoundedSize * getScratchScaleFactor(ST)))
-        .setMIFlag(MachineInstr::FrameDestroy);
-    Add->getOperand(3).setIsDead(); // Mark SCC as dead.
-  }
-
-  // FIXME: Switch to using MF.needsFrameMoves() later
-  const bool NeedsFrameMoves = true;
+  const bool NeedsFrameMoves = needsFrameMoves(MF);
   if (hasFP(MF)) {
     if (NeedsFrameMoves)
       emitDefCFA(MBB, MBBI, DL, StackPtrReg, /*AspaceAlreadyDefined=*/false,
@@ -1559,7 +1676,8 @@ void SIFrameLowering::emitEpilogue(MachineFunction &MF,
       MIB.setMIFlag(MachineInstr::FrameDestroy);
   } else {
     // Insert the CSR spill restores with SP as the base register.
-    emitCSRSpillRestores(MF, MBB, MBBI, DL, LiveUnits, StackPtrReg,
+    emitCSRSpillRestores(MF, MBB, MBBI, DL, LiveUnits,
+                         FuncInfo->isChainFunction() ? Register() : StackPtrReg,
                          FramePtrRegScratchCopy);
   }
 }
@@ -1661,17 +1779,15 @@ void SIFrameLowering::processFunctionBeforeFrameFinalized(
         // the debug value instructions. We should instead, update it with the
         // correct register value. But not sure the register value alone is
         for (MachineInstr &MI : MBB) {
-          if (MI.isDebugValue() && MI.getOperand(0).isFI() &&
-              !MFI.isFixedObjectIndex(MI.getOperand(0).getIndex()) &&
-              SpillFIs[MI.getOperand(0).getIndex()]) {
-            MI.getOperand(0).ChangeToRegister(Register(), false /*isDef*/);
-          }
-          // FIXME: Need to update expression to locate lane of VGPR to which
-          // the SGPR was spilled.
-          if (MI.isDebugDef() && MI.getDebugOperand(0).isFI() &&
-              !MFI.isFixedObjectIndex(MI.getDebugOperand(0).getIndex()) &&
-              SpillFIs[MI.getDebugOperand(0).getIndex()]) {
-            MI.getDebugOperand(0).ChangeToRegister(Register(), false /*isDef*/);
+          if (MI.isDebugValue()) {
+            uint32_t StackOperandIdx = MI.isDebugValueList() ? 2 : 0;
+            if (MI.getOperand(StackOperandIdx).isFI() &&
+                !MFI.isFixedObjectIndex(
+                    MI.getOperand(StackOperandIdx).getIndex()) &&
+                SpillFIs[MI.getOperand(StackOperandIdx).getIndex()]) {
+              MI.getOperand(StackOperandIdx)
+                  .ChangeToRegister(Register(), false /*isDef*/);
+            }
           }
         }
       }
@@ -1699,7 +1815,7 @@ void SIFrameLowering::processFunctionBeforeFrameFinalized(
     // second VGPR emergency frame index.
     if (HaveSGPRToVMemSpill &&
         allocateScavengingFrameIndexesNearIncomingSP(MF)) {
-      RS->addScavengingFrameIndex(MFI.CreateStackObject(4, Align(4), false));
+      RS->addScavengingFrameIndex(MFI.CreateSpillStackObject(4, Align(4)));
     }
   }
 }
@@ -1855,6 +1971,7 @@ void SIFrameLowering::determineCalleeSaves(MachineFunction &MF,
         NeedExecCopyReservedReg = true;
       else if (MI.getOpcode() == AMDGPU::SI_RETURN ||
                MI.getOpcode() == AMDGPU::SI_RETURN_TO_EPILOG ||
+               MI.getOpcode() == AMDGPU::SI_WHOLE_WAVE_FUNC_RETURN ||
                (MFI->isChainFunction() &&
                 TII->isChainCallOpcode(MI.getOpcode()))) {
         // We expect all return to be the same size.
@@ -1872,7 +1989,7 @@ void SIFrameLowering::determineCalleeSaves(MachineFunction &MF,
     // are of 32-bit size. SIPreAllocateWWMRegs pass can add tuples into WWM
     // reserved registers.
     const TargetRegisterClass *RC = TRI->getPhysRegBaseClass(Reg);
-    if (TRI->getRegSizeInBits(*RC) > 32)
+    if (TRI->getRegSizeInBits(*RC) != 32)
       continue;
     SortedWWMVGPRs.push_back(Reg);
   }
@@ -1882,6 +1999,23 @@ void SIFrameLowering::determineCalleeSaves(MachineFunction &MF,
 
   if (MFI->isEntryFunction())
     return;
+
+  if (MFI->isWholeWaveFunction()) {
+    // In practice, all the VGPRs are WWM registers, and we will need to save at
+    // least their inactive lanes. Add them to WWMReservedRegs.
+    assert(!NeedExecCopyReservedReg &&
+           "Whole wave functions can use the reg mapped for their i1 argument");
+
+    // FIXME: Be more efficient!
+    unsigned NumArchVGPRs = ST.has1024AddressableVGPRs() ? 1024 : 256;
+    for (MCRegister Reg :
+         AMDGPU::VGPR_32RegClass.getRegisters().take_front(NumArchVGPRs))
+      if (MF.getRegInfo().isPhysRegModified(Reg)) {
+        MFI->reserveWWMRegister(Reg);
+        MF.begin()->addLiveIn(Reg);
+      }
+    MF.begin()->sortUniqueLiveIns();
+  }
 
   // Remove any VGPRs used in the return value because these do not need to be saved.
   // This prevents CSR restore from clobbering return VGPRs.
@@ -1961,6 +2095,106 @@ void SIFrameLowering::determineCalleeSavesSGPR(MachineFunction &MF,
   }
 }
 
+static void assignSlotsUsingVGPRBlocks(MachineFunction &MF,
+                                       const GCNSubtarget &ST,
+                                       std::vector<CalleeSavedInfo> &CSI,
+                                       unsigned &MinCSFrameIndex,
+                                       unsigned &MaxCSFrameIndex) {
+  SIMachineFunctionInfo *FuncInfo = MF.getInfo<SIMachineFunctionInfo>();
+  MachineFrameInfo &MFI = MF.getFrameInfo();
+  const SIRegisterInfo *TRI = ST.getRegisterInfo();
+
+  assert(
+      llvm::is_sorted(CSI,
+                      [](const CalleeSavedInfo &A, const CalleeSavedInfo &B) {
+                        return A.getReg() < B.getReg();
+                      }) &&
+      "Callee saved registers not sorted");
+
+  auto CanUseBlockOps = [&](const CalleeSavedInfo &CSI) {
+    return !CSI.isSpilledToReg() &&
+           TRI->getPhysRegBaseClass(CSI.getReg()) == &AMDGPU::VGPR_32RegClass &&
+           !FuncInfo->isWWMReservedRegister(CSI.getReg());
+  };
+
+  auto CSEnd = CSI.end();
+  for (auto CSIt = CSI.begin(); CSIt != CSEnd; ++CSIt) {
+    Register Reg = CSIt->getReg();
+    if (!CanUseBlockOps(*CSIt))
+      continue;
+
+    // Find all the regs that will fit in a 32-bit mask starting at the current
+    // reg and build said mask. It should have 1 for every register that's
+    // included, with the current register as the least significant bit.
+    uint32_t Mask = 1;
+    CSEnd = std::remove_if(
+        CSIt + 1, CSEnd, [&](const CalleeSavedInfo &CSI) -> bool {
+          if (CanUseBlockOps(CSI) && CSI.getReg() < Reg + 32) {
+            Mask |= 1 << (CSI.getReg() - Reg);
+            return true;
+          } else {
+            return false;
+          }
+        });
+
+    const TargetRegisterClass *BlockRegClass = TRI->getRegClassForBlockOp(MF);
+    Register RegBlock =
+        TRI->getMatchingSuperReg(Reg, AMDGPU::sub0, BlockRegClass);
+    if (!RegBlock) {
+      // We couldn't find a super register for the block. This can happen if
+      // the register we started with is too high (e.g. v232 if the maximum is
+      // v255). We therefore try to get the last register block and figure out
+      // the mask from there.
+      Register LastBlockStart =
+          AMDGPU::VGPR0 + alignDown(Reg - AMDGPU::VGPR0, 32);
+      RegBlock =
+          TRI->getMatchingSuperReg(LastBlockStart, AMDGPU::sub0, BlockRegClass);
+      assert(RegBlock && TRI->isSubRegister(RegBlock, Reg) &&
+             "Couldn't find super register");
+      int RegDelta = Reg - LastBlockStart;
+      assert(RegDelta > 0 && llvm::countl_zero(Mask) >= RegDelta &&
+             "Bad shift amount");
+      Mask <<= RegDelta;
+    }
+
+    FuncInfo->setMaskForVGPRBlockOps(RegBlock, Mask);
+
+    // The stack objects can be a bit smaller than the register block if we know
+    // some of the high bits of Mask are 0. This may happen often with calling
+    // conventions where the caller and callee-saved VGPRs are interleaved at
+    // a small boundary (e.g. 8 or 16).
+    int UnusedBits = llvm::countl_zero(Mask);
+    unsigned BlockSize = TRI->getSpillSize(*BlockRegClass) - UnusedBits * 4;
+    int FrameIdx =
+        MFI.CreateStackObject(BlockSize, TRI->getSpillAlign(*BlockRegClass),
+                              /*isSpillSlot=*/true);
+    if ((unsigned)FrameIdx < MinCSFrameIndex)
+      MinCSFrameIndex = FrameIdx;
+    if ((unsigned)FrameIdx > MaxCSFrameIndex)
+      MaxCSFrameIndex = FrameIdx;
+
+    CSIt->setFrameIdx(FrameIdx);
+    CSIt->setReg(RegBlock);
+  }
+  CSI.erase(CSEnd, CSI.end());
+}
+
+bool SIFrameLowering::assignCalleeSavedSpillSlots(
+    MachineFunction &MF, const TargetRegisterInfo *TRI,
+    std::vector<CalleeSavedInfo> &CSI, unsigned &MinCSFrameIndex,
+    unsigned &MaxCSFrameIndex) const {
+  if (CSI.empty())
+    return true; // Early exit if no callee saved registers are modified!
+
+  const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
+  bool UseVGPRBlocks = ST.useVGPRBlockOpsForCSR();
+
+  if (UseVGPRBlocks)
+    assignSlotsUsingVGPRBlocks(MF, ST, CSI, MinCSFrameIndex, MaxCSFrameIndex);
+
+  return assignCalleeSavedSpillSlots(MF, TRI, CSI) || UseVGPRBlocks;
+}
+
 bool SIFrameLowering::assignCalleeSavedSpillSlots(
     MachineFunction &MF, const TargetRegisterInfo *TRI,
     std::vector<CalleeSavedInfo> &CSI) const {
@@ -1987,11 +2221,12 @@ bool SIFrameLowering::assignCalleeSavedSpillSlots(
     NumModifiedRegs++;
 
   for (auto &CS : CSI) {
-    if (CS.getReg() == FramePtrReg && SGPRForFPSaveRestoreCopy) {
+    if (CS.getReg() == FramePtrReg.asMCReg() && SGPRForFPSaveRestoreCopy) {
       CS.setDstReg(SGPRForFPSaveRestoreCopy);
       if (--NumModifiedRegs)
         break;
-    } else if (CS.getReg() == BasePtrReg && SGPRForBPSaveRestoreCopy) {
+    } else if (CS.getReg() == BasePtrReg.asMCReg() &&
+               SGPRForBPSaveRestoreCopy) {
       CS.setDstReg(SGPRForBPSaveRestoreCopy);
       if (--NumModifiedRegs)
         break;
@@ -2026,6 +2261,143 @@ bool SIFrameLowering::allocateScavengingFrameIndexesNearIncomingSP(
       return false;
   }
 
+  return true;
+}
+
+static bool isLiveIntoMBB(MCRegister Reg, MachineBasicBlock &MBB,
+                          const TargetRegisterInfo *TRI) {
+  for (MCRegAliasIterator R(Reg, TRI, true); R.isValid(); ++R) {
+    if (MBB.isLiveIn(*R)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool SIFrameLowering::spillCalleeSavedRegisters(
+    MachineBasicBlock &MBB, MachineBasicBlock::iterator MI,
+    ArrayRef<CalleeSavedInfo> CSI, const TargetRegisterInfo *TRI) const {
+  MachineFunction *MF = MBB.getParent();
+  const GCNSubtarget &ST = MF->getSubtarget<GCNSubtarget>();
+  const SIInstrInfo *TII = ST.getInstrInfo();
+  const SIRegisterInfo *SITRI = static_cast<const SIRegisterInfo *>(TRI);
+
+  if (!ST.useVGPRBlockOpsForCSR()) {
+    for (const CalleeSavedInfo &CS : CSI) {
+      // Insert the spill to the stack frame.
+      unsigned Reg = CS.getReg();
+
+      if (CS.isSpilledToReg()) {
+        BuildMI(MBB, MI, DebugLoc(), TII->get(TargetOpcode::COPY),
+                CS.getDstReg())
+            .addReg(Reg, getKillRegState(true));
+      } else {
+        const TargetRegisterClass *RC = TRI->getMinimalPhysRegClass(
+            Reg, Reg == SITRI->getReturnAddressReg(*MF) ? MVT::i64 : MVT::i32);
+        // If this value was already livein, we probably have a direct use of
+        // the incoming register value, so don't kill at the spill point. This
+        // happens since we pass some special inputs (workgroup IDs) in the
+        // callee saved range.
+        const bool IsLiveIn = isLiveIntoMBB(Reg, MBB, TRI);
+        TII->storeRegToStackSlotCFI(MBB, MI, Reg, !IsLiveIn, CS.getFrameIdx(),
+                                    RC, TRI);
+      }
+    }
+    return true;
+  }
+
+  MachineFrameInfo &FrameInfo = MF->getFrameInfo();
+  SIMachineFunctionInfo *FuncInfo = MF->getInfo<SIMachineFunctionInfo>();
+
+  const TargetRegisterClass *BlockRegClass =
+      static_cast<const SIRegisterInfo *>(TRI)->getRegClassForBlockOp(*MF);
+  for (const CalleeSavedInfo &CS : CSI) {
+    Register Reg = CS.getReg();
+    if (!BlockRegClass->contains(Reg) ||
+        !FuncInfo->hasMaskForVGPRBlockOps(Reg)) {
+      spillCalleeSavedRegister(MBB, MI, CS, TII, TRI);
+      continue;
+    }
+
+    // Build a scratch block store.
+    uint32_t Mask = FuncInfo->getMaskForVGPRBlockOps(Reg);
+    int FrameIndex = CS.getFrameIdx();
+    MachinePointerInfo PtrInfo =
+        MachinePointerInfo::getFixedStack(*MF, FrameIndex);
+    MachineMemOperand *MMO =
+        MF->getMachineMemOperand(PtrInfo, MachineMemOperand::MOStore,
+                                 FrameInfo.getObjectSize(FrameIndex),
+                                 FrameInfo.getObjectAlign(FrameIndex));
+
+    BuildMI(MBB, MI, MI->getDebugLoc(),
+            TII->get(AMDGPU::SI_BLOCK_SPILL_V1024_CFI_SAVE))
+        .addReg(Reg, getKillRegState(false))
+        .addFrameIndex(FrameIndex)
+        .addReg(FuncInfo->getStackPtrOffsetReg())
+        .addImm(0)
+        .addImm(Mask)
+        .addMemOperand(MMO);
+
+    FuncInfo->setHasSpilledVGPRs();
+
+    // Add the register to the liveins. This is necessary because if any of the
+    // VGPRs in the register block is reserved (e.g. if it's a WWM register),
+    // then the whole block will be marked as reserved and `updateLiveness` will
+    // skip it.
+    MBB.addLiveIn(Reg);
+  }
+  MBB.sortUniqueLiveIns();
+
+  return true;
+}
+
+bool SIFrameLowering::restoreCalleeSavedRegisters(
+    MachineBasicBlock &MBB, MachineBasicBlock::iterator MI,
+    MutableArrayRef<CalleeSavedInfo> CSI, const TargetRegisterInfo *TRI) const {
+  MachineFunction *MF = MBB.getParent();
+  const GCNSubtarget &ST = MF->getSubtarget<GCNSubtarget>();
+  if (!ST.useVGPRBlockOpsForCSR())
+    return false;
+
+  SIMachineFunctionInfo *FuncInfo = MF->getInfo<SIMachineFunctionInfo>();
+  MachineFrameInfo &MFI = MF->getFrameInfo();
+  const SIInstrInfo *TII = ST.getInstrInfo();
+  const SIRegisterInfo *SITRI = static_cast<const SIRegisterInfo *>(TRI);
+  const TargetRegisterClass *BlockRegClass = SITRI->getRegClassForBlockOp(*MF);
+  for (const CalleeSavedInfo &CS : reverse(CSI)) {
+    Register Reg = CS.getReg();
+    if (!BlockRegClass->contains(Reg) ||
+        !FuncInfo->hasMaskForVGPRBlockOps(Reg)) {
+      restoreCalleeSavedRegister(MBB, MI, CS, TII, TRI);
+      continue;
+    }
+
+    // Build a scratch block load.
+    uint32_t Mask = FuncInfo->getMaskForVGPRBlockOps(Reg);
+    int FrameIndex = CS.getFrameIdx();
+    MachinePointerInfo PtrInfo =
+        MachinePointerInfo::getFixedStack(*MF, FrameIndex);
+    MachineMemOperand *MMO = MF->getMachineMemOperand(
+        PtrInfo, MachineMemOperand::MOLoad, MFI.getObjectSize(FrameIndex),
+        MFI.getObjectAlign(FrameIndex));
+
+    auto MIB = BuildMI(MBB, MI, MI->getDebugLoc(),
+                       TII->get(AMDGPU::SI_BLOCK_SPILL_V1024_RESTORE), Reg)
+                   .addFrameIndex(FrameIndex)
+                   .addReg(FuncInfo->getStackPtrOffsetReg())
+                   .addImm(0)
+                   .addImm(Mask)
+                   .addMemOperand(MMO);
+    SITRI->addImplicitUsesForBlockCSRLoad(MIB, Reg);
+
+    // Add the register to the liveins. This is necessary because if any of the
+    // VGPRs in the register block is reserved (e.g. if it's a WWM register),
+    // then the whole block will be marked as reserved and `updateLiveness` will
+    // skip it.
+    MBB.addLiveIn(Reg);
+  }
+
+  MBB.sortUniqueLiveIns();
   return true;
 }
 
@@ -2078,7 +2450,7 @@ static bool frameTriviallyRequiresSP(const MachineFrameInfo &MFI) {
 // The FP for kernels is always known 0, so we never really need to setup an
 // explicit register for it. However, DisableFramePointerElim will force us to
 // use a register for it.
-bool SIFrameLowering::hasFP(const MachineFunction &MF) const {
+bool SIFrameLowering::hasFPImpl(const MachineFunction &MF) const {
   const MachineFrameInfo &MFI = MF.getFrameInfo();
 
   // For entry & chain functions we can use an immediate offset in most cases,
@@ -2097,7 +2469,15 @@ bool SIFrameLowering::hasFP(const MachineFunction &MF) const {
   return frameTriviallyRequiresSP(MFI) || MFI.isFrameAddressTaken() ||
          MF.getSubtarget<GCNSubtarget>().getRegisterInfo()->hasStackRealignment(
              MF) ||
+         mayReserveScratchForCWSR(MF) ||
          MF.getTarget().Options.DisableFramePointerElim(MF);
+}
+
+bool SIFrameLowering::mayReserveScratchForCWSR(
+    const MachineFunction &MF) const {
+  return MF.getInfo<SIMachineFunctionInfo>()->isDynamicVGPREnabled() &&
+         AMDGPU::isEntryFunctionCC(MF.getFunction().getCallingConv()) &&
+         AMDGPU::isCompute(MF.getFunction().getCallingConv());
 }
 
 // This is essentially a reduced version of hasFP for entry functions. Since the
@@ -2127,39 +2507,6 @@ bool SIFrameLowering::requiresStackPointerReference(
   return frameTriviallyRequiresSP(MFI);
 }
 
-bool SIFrameLowering::spillCalleeSavedRegisters(
-    MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
-    const ArrayRef<CalleeSavedInfo> CSI, const TargetRegisterInfo *TRI) const {
-  MachineFunction &MF = *MBB.getParent();
-  const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
-  const SIRegisterInfo *RI = ST.getRegisterInfo();
-  const SIInstrInfo *TII = ST.getInstrInfo();
-
-  for (const CalleeSavedInfo &CS : CSI) {
-    // Insert the spill to the stack frame.
-    unsigned Reg = CS.getReg();
-
-    if (CS.isSpilledToReg()) {
-      BuildMI(MBB, MBBI, DebugLoc(), TII->get(TargetOpcode::COPY),
-              CS.getDstReg())
-          .addReg(Reg, getKillRegState(true));
-    } else {
-      const TargetRegisterClass *RC = TRI->getMinimalPhysRegClass(
-          Reg, Reg == RI->getReturnAddressReg(MF) ? MVT::i64 : MVT::i32);
-      const MachineRegisterInfo &MRI = MF.getRegInfo();
-      // If this value was already livein, we probably have a direct use of the
-      // incoming register value, so don't kill at the spill point. This happens
-      // since we pass some special inputs (workgroup IDs) in the callee saved
-      // range.
-      const bool IsLiveIn = MRI.isLiveIn(Reg);
-      TII->storeRegToStackSlotCFI(MBB, MBBI, Reg, !IsLiveIn, CS.getFrameIdx(),
-                                  RC, TRI);
-    }
-  }
-
-  return true;
-}
-
 MachineInstr *SIFrameLowering::buildCFI(MachineBasicBlock &MBB,
                                         MachineBasicBlock::iterator MBBI,
                                         const DebugLoc &DL,
@@ -2176,7 +2523,7 @@ MachineInstr *SIFrameLowering::buildCFIForVRegToVRegSpill(
     MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
     const DebugLoc &DL, const Register Reg, const Register RegCopy) const {
   MachineFunction &MF = *MBB.getParent();
-  const MCRegisterInfo &MCRI = *MF.getMMI().getContext().getRegisterInfo();
+  const MCRegisterInfo &MCRI = *MF.getContext().getRegisterInfo();
   const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
 
   unsigned MaskReg = MCRI.getDwarfRegNum(
@@ -2193,7 +2540,7 @@ MachineInstr *SIFrameLowering::buildCFIForSGPRToVGPRSpill(
     const DebugLoc &DL, const Register SGPR, const Register VGPR,
     const int Lane) const {
   const MachineFunction &MF = *MBB.getParent();
-  const MCRegisterInfo &MCRI = *MF.getMMI().getContext().getRegisterInfo();
+  const MCRegisterInfo &MCRI = *MF.getContext().getRegisterInfo();
 
   int DwarfSGPR = MCRI.getDwarfRegNum(SGPR, false);
   int DwarfVGPR = MCRI.getDwarfRegNum(VGPR, false);
@@ -2214,7 +2561,7 @@ MachineInstr *SIFrameLowering::buildCFIForSGPRToVGPRSpill(
     const DebugLoc &DL, Register SGPR,
     ArrayRef<SIRegisterInfo::SpilledReg> VGPRSpills) const {
   const MachineFunction &MF = *MBB.getParent();
-  const MCRegisterInfo &MCRI = *MF.getMMI().getContext().getRegisterInfo();
+  const MCRegisterInfo &MCRI = *MF.getContext().getRegisterInfo();
 
   int DwarfSGPR = MCRI.getDwarfRegNum(SGPR, false);
   assert(DwarfSGPR != -1);
@@ -2240,7 +2587,7 @@ MachineInstr *SIFrameLowering::buildCFIForSGPRToVMEMSpill(
     MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
     const DebugLoc &DL, unsigned SGPR, int64_t Offset) const {
   MachineFunction &MF = *MBB.getParent();
-  const MCRegisterInfo &MCRI = *MF.getMMI().getContext().getRegisterInfo();
+  const MCRegisterInfo &MCRI = *MF.getContext().getRegisterInfo();
   return buildCFI(MBB, MBBI, DL,
                   llvm::MCCFIInstruction::createOffset(
                       nullptr, MCRI.getDwarfRegNum(SGPR, false), Offset));
@@ -2250,7 +2597,7 @@ MachineInstr *SIFrameLowering::buildCFIForVGPRToVMEMSpill(
     MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
     const DebugLoc &DL, unsigned VGPR, int64_t Offset) const {
   const MachineFunction &MF = *MBB.getParent();
-  const MCRegisterInfo &MCRI = *MF.getMMI().getContext().getRegisterInfo();
+  const MCRegisterInfo &MCRI = *MF.getContext().getRegisterInfo();
   const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
 
   int DwarfVGPR = MCRI.getDwarfRegNum(VGPR, false);
@@ -2268,7 +2615,7 @@ MachineInstr *SIFrameLowering::buildCFIForRegToSGPRPairSpill(
     MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
     const DebugLoc &DL, const Register Reg, const Register SGPRPair) const {
   const MachineFunction &MF = *MBB.getParent();
-  const MCRegisterInfo &MCRI = *MF.getMMI().getContext().getRegisterInfo();
+  const MCRegisterInfo &MCRI = *MF.getContext().getRegisterInfo();
   const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
   const SIRegisterInfo &TRI = ST.getInstrInfo()->getRegisterInfo();
 
@@ -2282,5 +2629,16 @@ MachineInstr *SIFrameLowering::buildCFIForRegToSGPRPairSpill(
 
   auto CFIInst = MCCFIInstruction::createLLVMRegisterPair(
       nullptr, DwarfReg, DwarfSGPR0, SGPRBitSize, DwarfSGPR1, SGPRBitSize);
+  return buildCFI(MBB, MBBI, DL, std::move(CFIInst));
+}
+
+MachineInstr *
+SIFrameLowering::buildCFIForSameValue(MachineBasicBlock &MBB,
+                                      MachineBasicBlock::iterator MBBI,
+                                      const DebugLoc &DL, Register Reg) const {
+  const MachineFunction &MF = *MBB.getParent();
+  const MCRegisterInfo &MCRI = *MF.getContext().getRegisterInfo();
+  int DwarfReg = MCRI.getDwarfRegNum(Reg, /*isEH=*/false);
+  auto CFIInst = MCCFIInstruction::createSameValue(nullptr, DwarfReg);
   return buildCFI(MBB, MBBI, DL, std::move(CFIInst));
 }

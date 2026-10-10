@@ -369,7 +369,7 @@ function build_with_cmake_cache() {
  pushd $BuildDir/Release
  mv $InstallDir/usr/local $Package
  if [ "$use_gzip" = "yes" ]; then
-    tar cf - $Package | gzip -9c > $BuildDir/$Package.tar.gz
+    tar cf - $Package | gzip -9c -n > $BuildDir/$Package.tar.gz
   else
     tar cf - $Package | xz -9ce -T $NumJobs > $BuildDir/$Package.tar.xz
   fi
@@ -613,7 +613,7 @@ function package_release() {
     cd $BuildDir/Phase3/Release
     mv llvmCore-$Release-$RC.install/usr/local $Package
     if [ "$use_gzip" = "yes" ]; then
-      tar cf - $Package | gzip -9c > $BuildDir/$Package.tar.gz
+      tar cf - $Package | gzip -9c -n > $BuildDir/$Package.tar.gz
     else
       tar cf - $Package | xz -9ce -T $NumJobs > $BuildDir/$Package.tar.xz
     fi
@@ -647,7 +647,7 @@ if [ $do_test_suite = "yes" ]; then
   TestSuiteSrcDir="$BuildDir/llvm-test-suite"
 
   ${venv} $SandboxDir
-  $SandboxDir/bin/python $BuildDir/llvm-project/llvm/utils/lit/setup.py install
+  $SandboxDir/bin/python -m pip install $BuildDir/llvm-project/llvm/utils/lit
   mkdir -p $TestSuiteBuildDir
 fi
 
@@ -755,8 +755,8 @@ for Flavor in $Flavors ; do
             # case there are build paths in the debug info. Do the same sub-
             # stitution on both files in case the string occurrs naturally.
             if ! cmp -s \
-                <(env LC_CTYPE=C sed -e 's,Phase1,Phase2,g' -e 's,Phase2,Phase3,g' $p2) \
-                <(env LC_CTYPE=C sed -e 's,Phase1,Phase2,g' -e 's,Phase2,Phase3,g' $p3) \
+                <(env LC_ALL=C sed -e 's,Phase1,Phase2,g' -e 's,Phase2,Phase3,g' $p2) \
+                <(env LC_ALL=C sed -e 's,Phase1,Phase2,g' -e 's,Phase2,Phase3,g' $p3) \
                 16 16; then
                 echo "file `basename $p2` differs between phase 2 and phase 3"
             fi

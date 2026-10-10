@@ -236,8 +236,10 @@ void IntrinsicLowering::LowerIntrinsicCall(CallInst *CI) {
     report_fatal_error("Code generator does not support intrinsic function '"+
                       Callee->getName()+"'!");
 
-  case Intrinsic::expect: {
-    // Just replace __builtin_expect(exp, c) with EXP.
+  case Intrinsic::expect:
+  case Intrinsic::expect_with_probability: {
+    // Just replace __builtin_expect(exp, c) and
+    // __builtin_expect_with_probability(exp, c, p) with EXP.
     Value *V = CI->getArgOperand(0);
     CI->replaceAllUsesWith(V);
     break;
@@ -326,10 +328,10 @@ void IntrinsicLowering::LowerIntrinsicCall(CallInst *CI) {
 
   case Intrinsic::dbg_declare:
   case Intrinsic::dbg_label:
+    break;    // Simply strip out debugging intrinsics
   case Intrinsic::dbg_def:
   case Intrinsic::dbg_kill:
-    break;    // Simply strip out debugging intrinsics
-
+    report_fatal_error("unsupported DIExpr-based metadata");
   case Intrinsic::eh_typeid_for:
     // Return something different to eh_selector.
     CI->replaceAllUsesWith(ConstantInt::get(CI->getType(), 1));
@@ -451,7 +453,7 @@ void IntrinsicLowering::LowerIntrinsicCall(CallInst *CI) {
   case Intrinsic::invariant_start:
   case Intrinsic::lifetime_start:
     // Discard region information.
-    CI->replaceAllUsesWith(UndefValue::get(CI->getType()));
+    CI->replaceAllUsesWith(PoisonValue::get(CI->getType()));
     break;
   case Intrinsic::invariant_end:
   case Intrinsic::lifetime_end:
@@ -476,7 +478,7 @@ bool IntrinsicLowering::LowerToByteSwap(CallInst *CI) {
 
   // Okay, we can do this xform, do so now.
   Module *M = CI->getModule();
-  Function *Int = Intrinsic::getDeclaration(M, Intrinsic::bswap, Ty);
+  Function *Int = Intrinsic::getOrInsertDeclaration(M, Intrinsic::bswap, Ty);
 
   Value *Op = CI->getArgOperand(0);
   Op = CallInst::Create(Int, Op, CI->getName(), CI->getIterator());

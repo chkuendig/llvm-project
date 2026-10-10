@@ -511,3 +511,61 @@ true:
 false:
   ret i32 33
 }
+
+; Input that is not constant or direct result of a compare.
+; Tests setting 0 to inactive lanes.
+define amdgpu_ps void @non_cst_non_compare_input(ptr addrspace(1) %out, i32 %tid, i32 %cond) {
+; CHECK-LABEL: non_cst_non_compare_input:
+; CHECK:       ; %bb.0: ; %entry
+; CHECK-NEXT:    v_cmp_ne_u32_e32 vcc, 0, v3
+; CHECK-NEXT:    ; implicit-def: $sgpr0_sgpr1
+; CHECK-NEXT:    s_and_saveexec_b64 s[2:3], vcc
+; CHECK-NEXT:    s_xor_b64 s[2:3], exec, s[2:3]
+; CHECK-NEXT:  ; %bb.1: ; %B
+; CHECK-NEXT:    v_cmp_gt_u32_e64 s[0:1], 2, v2
+; CHECK-NEXT:    ; implicit-def: $vgpr2
+; CHECK-NEXT:  ; %bb.2: ; %Flow
+; CHECK-NEXT:    s_andn2_saveexec_b64 s[2:3], s[2:3]
+; CHECK-NEXT:  ; %bb.3: ; %A
+; CHECK-NEXT:    v_cmp_ne_u32_e32 vcc, 0, v2
+; CHECK-NEXT:    s_andn2_b64 s[0:1], s[0:1], exec
+; CHECK-NEXT:    s_and_b64 s[4:5], vcc, exec
+; CHECK-NEXT:    s_or_b64 s[0:1], s[0:1], s[4:5]
+; CHECK-NEXT:  ; %bb.4: ; %exit
+; CHECK-NEXT:    s_or_b64 exec, exec, s[2:3]
+; CHECK-NEXT:    v_cndmask_b32_e64 v2, 0, 1, s[0:1]
+; CHECK-NEXT:    v_cmp_ne_u32_e64 s[0:1], 0, v2
+; CHECK-NEXT:    v_mov_b32_e32 v3, s1
+; CHECK-NEXT:    v_mov_b32_e32 v2, s0
+; CHECK-NEXT:    global_store_dwordx2 v[0:1], v[2:3], off
+; CHECK-NEXT:    s_endpgm
+entry:
+  %cmp = icmp eq i32 %cond, 0
+  br i1 %cmp, label %A, label %B
+
+A:
+  %val_A = icmp uge i32 %tid, 1
+  br label %exit
+
+B:
+  %val_B = icmp ult i32 %tid, 2
+  br label %exit
+
+exit:
+  %phi = phi i1 [ %val_A, %A ], [ %val_B, %B ]
+  %ballot = call i64 @llvm.amdgcn.ballot.i64(i1 %phi)
+  store i64 %ballot, ptr addrspace(1) %out
+  ret void
+}
+
+define amdgpu_cs i64 @compare_bfloats(bfloat %x, bfloat %y) {
+; CHECK-LABEL: compare_bfloats:
+; CHECK:       ; %bb.0:
+; CHECK-NEXT:    v_lshlrev_b32_e32 v1, 16, v1
+; CHECK-NEXT:    v_lshlrev_b32_e32 v0, 16, v0
+; CHECK-NEXT:    v_cmp_gt_f32_e64 s[0:1], v0, v1
+; CHECK-NEXT:    ; return to shader part epilog
+  %cmp = fcmp ogt bfloat %x, %y
+  %ballot = call i64 @llvm.amdgcn.ballot.i64(i1 %cmp)
+  ret i64 %ballot
+}

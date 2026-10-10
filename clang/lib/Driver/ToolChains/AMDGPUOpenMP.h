@@ -70,8 +70,7 @@ class LLVM_LIBRARY_VISIBILITY AMDGPUOpenMPToolChain final
 public:
   AMDGPUOpenMPToolChain(const Driver &D, const llvm::Triple &Triple,
                         const ToolChain &HostTC,
-                        const llvm::opt::ArgList &Args,
-                        const Action::OffloadKind OK);
+                        const llvm::opt::ArgList &Args);
 
   const llvm::Triple *getAuxTriple() const override {
     return &HostTC.getTriple();
@@ -95,12 +94,13 @@ public:
 
   void addClangWarningOptions(llvm::opt::ArgStringList &CC1Args) const override;
   CXXStdlibType GetCXXStdlibType(const llvm::opt::ArgList &Args) const override;
-  void
-  AddClangSystemIncludeArgs(const llvm::opt::ArgList &DriverArgs,
-                            llvm::opt::ArgStringList &CC1Args) const override;
+
   void AddClangCXXStdlibIncludeArgs(
       const llvm::opt::ArgList &Args,
       llvm::opt::ArgStringList &CC1Args) const override;
+  void
+  AddClangSystemIncludeArgs(const llvm::opt::ArgList &DriverArgs,
+                            llvm::opt::ArgStringList &CC1Args) const override;
   void AddIAMCUIncludeArgs(const llvm::opt::ArgList &DriverArgs,
                            llvm::opt::ArgStringList &CC1Args) const override;
   void
@@ -119,12 +119,10 @@ public:
 
   unsigned GetDefaultDwarfVersion() const override { return 5; }
   llvm::SmallVector<BitCodeLibraryInfo, 12>
-  getDeviceLibs(const llvm::opt::ArgList &Args) const override;
+  getDeviceLibs(const llvm::opt::ArgList &Args,
+                const Action::OffloadKind DeviceOffloadKind) const override;
 
   const ToolChain &HostTC;
-
-private:
-  const Action::OffloadKind OK;
 };
 
 } // end namespace toolchains

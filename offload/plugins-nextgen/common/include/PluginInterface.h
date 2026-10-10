@@ -17,8 +17,11 @@
 #include <list>
 #include <map>
 #include <shared_mutex>
+#include <variant>
 #include <vector>
 
+#include "ExclusiveAccess.h"
+#include "OpenMP/InteropAPI.h"
 #include "Shared/APITypes.h"
 #include "Shared/Debug.h"
 #include "Shared/Environment.h"
@@ -29,13 +32,11 @@
 #include "GlobalHandler.h"
 #include "JIT.h"
 #include "MemoryManager.h"
+#include "OffloadError.h"
 #include "RPC.h"
 #include "omptarget.h"
 
-#ifdef OMPT_SUPPORT
-#include "OmptDeviceTracing.h"
-#include "omp-tools.h"
-#endif
+#include "GenericProfiler.h"
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Frontend/OpenMP/OMPConstants.h"
@@ -47,6 +48,9 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
 
+extern std::unique_ptr<llvm::omp::target::plugin::GenericProfilerTy>
+getProfilerToAttach();
+
 namespace llvm {
 namespace omp {
 namespace target {
@@ -57,6 +61,41 @@ struct GenericPluginTy;
 struct GenericKernelTy;
 struct GenericDeviceTy;
 struct RecordReplayTy;
+struct KernelRunRecordTy;
+template <typename ResourceRef> class GenericDeviceResourceManagerTy;
+
+namespace Plugin {
+/// Create a success error. This is the same as calling Error::success(), but
+/// it is recommended to use this one for consistency with Plugin::error() and
+/// Plugin::check().
+static inline Error success() { return Error::success(); }
+
+/// Create an Offload error.
+template <typename... ArgsTy>
+static Error error(error::ErrorCode Code, const char *ErrFmt, ArgsTy... Args) {
+  return error::createOffloadError(Code, ErrFmt, Args...);
+}
+
+inline Error error(error::ErrorCode Code, const char *S) {
+  return make_error<error::OffloadError>(Code, S);
+}
+
+inline Error error(error::ErrorCode Code, Error &&OtherError,
+                   const char *Context) {
+  return error::createOffloadError(Code, std::move(OtherError), Context);
+}
+
+/// Check the plugin-specific error code and return an error or success
+/// accordingly. In case of an error, create a string error with the error
+/// description. The ErrFmt should follow the format:
+///     "Error in <function name>[<optional info>]: %s"
+/// The last format specifier "%s" is mandatory and will be used to place the
+/// error code's description. Notice this function should be only called from
+/// the plugin-specific code.
+/// TODO: Refactor this, must be defined individually by each plugin.
+template <typename... ArgsTy>
+static Error check(int32_t ErrorCode, const char *ErrFmt, ArgsTy... Args);
+} // namespace Plugin
 
 /// Class that wraps the __tgt_async_info to simply its usage. In case the
 /// object is constructed without a valid __tgt_async_info, the object will use
@@ -91,17 +130,32 @@ struct AsyncInfoWrapperTy {
     AsyncInfoPtr->Queue = Queue;
   }
 
+  /// Get the queue, using the provided resource manager to initialise it if it
+  /// doesn't exist.
+  template <typename Ty, typename RMTy>
+  Expected<Ty>
+  getOrInitQueue(GenericDeviceResourceManagerTy<RMTy> &ResourceManager) {
+    std::lock_guard<std::mutex> Lock(AsyncInfoPtr->Mutex);
+    if (!AsyncInfoPtr->Queue) {
+      if (auto Err = ResourceManager.getResource(
+              *reinterpret_cast<Ty *>(&AsyncInfoPtr->Queue)))
+        return Err;
+    }
+    return getQueueAs<Ty>();
+  }
+
   /// Synchronize with the __tgt_async_info's pending operations if it's the
-  /// internal async info. The error associated to the aysnchronous operations
+  /// internal async info. The error associated to the asynchronous operations
   /// issued in this queue must be provided in \p Err. This function will update
   /// the error parameter with the result of the synchronization if it was
   /// actually executed. This function must be called before destroying the
   /// object and only once.
   void finalize(Error &Err);
 
-  /// Register \p Ptr as an associated alloction that is freed after
+  /// Register \p Ptr as an associated allocation that is freed after
   /// finalization.
   void freeAllocationAfterSynchronization(void *Ptr) {
+    std::lock_guard<std::mutex> AllocationGuard(AsyncInfoPtr->Mutex);
     AsyncInfoPtr->AssociatedAllocations.push_back(Ptr);
   }
 
@@ -111,73 +165,139 @@ private:
   __tgt_async_info *AsyncInfoPtr;
 };
 
-/// The information level represents the level of a key-value property in the
-/// info tree print (i.e. indentation). The first level should be the default.
-enum InfoLevelKind { InfoLevel1 = 1, InfoLevel2, InfoLevel3 };
+enum class DeviceInfo {
+#define OFFLOAD_DEVINFO(Name, _, Value) Name = Value,
+#include "OffloadInfo.inc"
+#undef OFFLOAD_DEVINFO
+};
 
-/// Class for storing device information and later be printed. An object of this
-/// type acts as a queue of key-value properties. Each property has a key, a
-/// a value, and an optional unit for the value. For printing purposes, the
-/// information can be classified into several levels. These levels are useful
-/// for defining sections and subsections. Thus, each key-value property also
-/// has an additional field indicating to which level belongs to. Notice that
-/// we use the level to determine the indentation of the key-value property at
-/// printing time. See the enum InfoLevelKind for the list of accepted levels.
-class InfoQueueTy {
-  struct InfoQueueEntryTy {
-    std::string Key;
-    std::string Value;
-    std::string Units;
-    uint64_t Level;
-  };
+/// Tree node for device information
+///
+/// This information is either printed or used by liboffload to extract certain
+/// device queries. Each property has an optional key, an optional value
+/// and optional children. The children can be used to store additional
+/// information (such as x, y and z components of ranges).
+struct InfoTreeNode {
+  static constexpr uint64_t IndentSize = 4;
 
-  std::deque<InfoQueueEntryTy> Queue;
+  std::string Key;
+  using VariantType = std::variant<uint64_t, std::string, bool, std::monostate>;
+  VariantType Value;
+  std::string Units;
+  // Need to specify a default value number of elements here as `InfoTreeNode`'s
+  // size is unknown. This is a vector (rather than a Key->Value map) since:
+  // * The keys need to be owned and thus `std::string`s
+  // * The order of keys is important
+  // * The same key can appear multiple times
+  std::unique_ptr<llvm::SmallVector<InfoTreeNode, 8>> Children;
 
-public:
-  /// Add a new info entry to the queue. The entry requires at least a key
-  /// string in \p Key. The value in \p Value is optional and can be any type
-  /// that is representable as a string. The units in \p Units is optional and
-  /// must be a string. The info level is a template parameter that defaults to
-  /// the first level (top level).
-  template <InfoLevelKind L = InfoLevel1, typename T = std::string>
-  void add(const std::string &Key, T Value = T(),
-           const std::string &Units = std::string()) {
+  llvm::DenseMap<DeviceInfo, size_t> DeviceInfoMap;
+
+  InfoTreeNode() : InfoTreeNode("", std::monostate{}, "") {}
+  InfoTreeNode(std::string Key, VariantType Value, std::string Units)
+      : Key(std::move(Key)), Value(Value), Units(std::move(Units)) {}
+
+  /// Add a new info entry as a child of this node. The entry requires at least
+  /// a key string in \p Key. The value in \p Value is optional and can be any
+  /// type that is representable as a string. The units in \p Units is optional
+  /// and must be a string. Providing a device info key allows liboffload to
+  /// use that value for an appropriate olGetDeviceInfo query
+  template <typename T = std::monostate>
+  InfoTreeNode *add(std::string Key, T Value = T(),
+                    std::string Units = std::string(),
+                    std::optional<DeviceInfo> DeviceInfoKey = std::nullopt) {
     assert(!Key.empty() && "Invalid info key");
 
-    // Convert the value to a string depending on its type.
-    if constexpr (std::is_same_v<T, bool>)
-      Queue.push_back({Key, Value ? "Yes" : "No", Units, L});
+    if (!Children)
+      Children = std::make_unique<llvm::SmallVector<InfoTreeNode, 8>>();
+
+    VariantType ValueVariant;
+    if constexpr (std::is_same_v<T, bool> || std::is_same_v<T, std::monostate>)
+      ValueVariant = Value;
     else if constexpr (std::is_arithmetic_v<T>)
-      Queue.push_back({Key, std::to_string(Value), Units, L});
+      ValueVariant = static_cast<uint64_t>(Value);
     else
-      Queue.push_back({Key, Value, Units, L});
+      ValueVariant = std::string{Value};
+
+    auto Ptr =
+        &Children->emplace_back(std::move(Key), ValueVariant, std::move(Units));
+
+    if (DeviceInfoKey)
+      DeviceInfoMap[*DeviceInfoKey] = Children->size() - 1;
+
+    return Ptr;
   }
 
-  /// Print all info entries added to the queue.
+  std::optional<InfoTreeNode *> get(StringRef Key) {
+    if (!Children)
+      return std::nullopt;
+
+    auto It = std::find_if(Children->begin(), Children->end(),
+                           [&](auto &V) { return V.Key == Key; });
+    if (It == Children->end())
+      return std::nullopt;
+    return It;
+  }
+
+  std::optional<InfoTreeNode *> get(DeviceInfo Info) {
+    auto Result = DeviceInfoMap.find(Info);
+    if (Result != DeviceInfoMap.end())
+      return &(*Children)[Result->second];
+    return std::nullopt;
+  }
+
+  /// Print all info entries in the tree
   void print() const {
-    // We print four spances for each level.
-    constexpr uint64_t IndentSize = 4;
+    // Fake an additional indent so that values are offset from the keys
+    doPrint(0, maxKeySize(1));
+  }
 
-    // Find the maximum key length (level + key) to compute the individual
-    // indentation of each entry.
-    uint64_t MaxKeySize = 0;
-    for (const auto &Entry : Queue) {
-      uint64_t KeySize = Entry.Key.size() + Entry.Level * IndentSize;
-      if (KeySize > MaxKeySize)
-        MaxKeySize = KeySize;
-    }
-
-    // Print all info entries.
-    for (const auto &Entry : Queue) {
+private:
+  void doPrint(int Level, uint64_t MaxKeySize) const {
+    if (Key.size()) {
       // Compute the indentations for the current entry.
-      uint64_t KeyIndentSize = Entry.Level * IndentSize;
+      uint64_t KeyIndentSize = Level * IndentSize;
       uint64_t ValIndentSize =
-          MaxKeySize - (Entry.Key.size() + KeyIndentSize) + IndentSize;
+          MaxKeySize - (Key.size() + KeyIndentSize) + IndentSize;
 
-      llvm::outs() << std::string(KeyIndentSize, ' ') << Entry.Key
-                   << std::string(ValIndentSize, ' ') << Entry.Value
-                   << (Entry.Units.empty() ? "" : " ") << Entry.Units << "\n";
+      llvm::outs() << std::string(KeyIndentSize, ' ') << Key
+                   << std::string(ValIndentSize, ' ');
+      std::visit(
+          [](auto &&V) {
+            using T = std::decay_t<decltype(V)>;
+            if constexpr (std::is_same_v<T, std::string>)
+              llvm::outs() << V;
+            else if constexpr (std::is_same_v<T, bool>)
+              llvm::outs() << (V ? "Yes" : "No");
+            else if constexpr (std::is_same_v<T, uint64_t>)
+              llvm::outs() << V;
+            else if constexpr (std::is_same_v<T, std::monostate>) {
+              // Do nothing
+            } else
+              static_assert(false, "doPrint visit not exhaustive");
+          },
+          Value);
+      llvm::outs() << (Units.empty() ? "" : " ") << Units << "\n";
     }
+
+    // Print children
+    if (Children)
+      for (const auto &Entry : *Children)
+        Entry.doPrint(Level + 1, MaxKeySize);
+  }
+
+  // Recursively calculates the maximum width of each key, including indentation
+  uint64_t maxKeySize(int Level) const {
+    uint64_t MaxKeySize = 0;
+
+    if (Children)
+      for (const auto &Entry : *Children) {
+        uint64_t KeySize = Entry.Key.size() + Level * IndentSize;
+        MaxKeySize = std::max(MaxKeySize, KeySize);
+        MaxKeySize = std::max(MaxKeySize, Entry.maxKeySize(Level + 1));
+      }
+
+    return MaxKeySize;
   }
 };
 
@@ -189,26 +309,18 @@ class DeviceImageTy {
   /// not unique between different device; they may overlap.
   int32_t ImageId;
 
-  /// The pointer to the raw __tgt_device_image.
-  const __tgt_device_image *TgtImage;
-  const __tgt_device_image *TgtImageBitcode;
+  /// The managed image data.
+  std::unique_ptr<MemoryBuffer> Image;
 
   /// Reference to the device this image is loaded on.
   GenericDeviceTy &Device;
 
-  /// If this image has any global destructors that much be called.
-  /// FIXME: This is only required because we currently have no invariants
-  ///        towards the lifetime of the underlying image. We should either copy
-  ///        the image into memory locally or erase the pointers after init.
-  bool PendingGlobalDtors;
-
 public:
+  virtual ~DeviceImageTy() = default;
+
   DeviceImageTy(int32_t Id, GenericDeviceTy &Device,
-                const __tgt_device_image *Image)
-      : ImageId(Id), TgtImage(Image), TgtImageBitcode(nullptr), Device(Device),
-        PendingGlobalDtors(false) {
-    assert(TgtImage && "Invalid target image");
-  }
+                std::unique_ptr<MemoryBuffer> &&Image)
+      : ImageId(Id), Image(std::move(Image)), Device(Device) {}
 
   /// Get the image identifier within the device.
   int32_t getId() const { return ImageId; }
@@ -216,33 +328,17 @@ public:
   /// Get the device that this image is loaded onto.
   GenericDeviceTy &getDevice() const { return Device; }
 
-  /// Get the pointer to the raw __tgt_device_image.
-  const __tgt_device_image *getTgtImage() const { return TgtImage; }
-
-  void setTgtImageBitcode(const __tgt_device_image *TgtImageBitcode) {
-    this->TgtImageBitcode = TgtImageBitcode;
-  }
-
-  const __tgt_device_image *getTgtImageBitcode() const {
-    return TgtImageBitcode;
-  }
-
   /// Get the image starting address.
-  void *getStart() const { return TgtImage->ImageStart; }
+  const void *getStart() const { return Image->getBufferStart(); }
 
   /// Get the image size.
-  size_t getSize() const {
-    return getPtrDiff(TgtImage->ImageEnd, TgtImage->ImageStart);
-  }
+  size_t getSize() const { return Image->getBufferSize(); }
 
   /// Get a memory buffer reference to the whole image.
   MemoryBufferRef getMemoryBuffer() const {
     return MemoryBufferRef(StringRef((const char *)getStart(), getSize()),
                            "Image");
   }
-  /// Accessors to the boolean value
-  bool setPendingGlobalDtors() { return PendingGlobalDtors = true; }
-  bool hasPendingGlobalDtors() const { return PendingGlobalDtors; }
 };
 
 /// Class implementing common functionalities of offload kernels. Each plugin
@@ -265,13 +361,17 @@ struct GenericKernelTy {
   Error launch(GenericDeviceTy &GenericDevice, void **ArgPtrs,
                ptrdiff_t *ArgOffsets, KernelArgsTy &KernelArgs,
                AsyncInfoWrapperTy &AsyncInfoWrapper) const;
-  virtual Error launchImpl(GenericDeviceTy &GenericDevice, uint32_t NumThreads,
-                           uint64_t NumBlocks, KernelArgsTy &KernelArgs,
+  virtual Error launchImpl(GenericDeviceTy &GenericDevice,
+                           uint32_t NumThreads[3], uint32_t NumBlocks[3],
+                           KernelArgsTy &KernelArgs,
                            KernelLaunchParamsTy LaunchParams,
                            AsyncInfoWrapperTy &AsyncInfoWrapper) const = 0;
 
+  virtual Expected<uint64_t> maxGroupSize(GenericDeviceTy &GenericDevice,
+                                          uint64_t DynamicMemSize) const = 0;
+
   /// Get the kernel name.
-  const char *getName() const { return Name; }
+  const char *getName() const { return Name.c_str(); }
 
   /// Get the kernel image.
   DeviceImageTy &getImage() const {
@@ -292,13 +392,14 @@ struct GenericKernelTy {
   /// Indicate whether an execution mode is valid.
   static bool isValidExecutionMode(OMPTgtExecModeFlags ExecutionMode) {
     switch (ExecutionMode) {
+    case OMP_TGT_EXEC_MODE_BARE:
     case OMP_TGT_EXEC_MODE_SPMD:
     case OMP_TGT_EXEC_MODE_GENERIC:
     case OMP_TGT_EXEC_MODE_GENERIC_SPMD:
+    case OMP_TGT_EXEC_MODE_SPMD_NO_LOOP:
       return true;
     // AMD-only execution modes
     case OMP_TGT_EXEC_MODE_SPMD_BIG_JUMP_LOOP:
-    case OMP_TGT_EXEC_MODE_SPMD_NO_LOOP:
     case OMP_TGT_EXEC_MODE_XTEAM_RED:
       DP("AMD-only execution mode\n");
       return true;
@@ -306,10 +407,68 @@ struct GenericKernelTy {
     llvm_unreachable("Unknown execution mode!");
   }
 
+  /// Indicate whether it is a specialized kernel.
+  bool isSpecializedKernel() const {
+    if (ExecutionMode == OMP_TGT_EXEC_MODE_SPMD_NO_LOOP ||
+        ExecutionMode == OMP_TGT_EXEC_MODE_SPMD_BIG_JUMP_LOOP ||
+        ExecutionMode == OMP_TGT_EXEC_MODE_XTEAM_RED)
+      return true;
+    return false;
+  }
+
+  /// Check if kernel is a multi-device kernel.
+  bool isMultiDeviceKernel() const { return IsMultiDeviceKernel; }
+
+  /// Compute kernel occupancy
+  /// This function computes the max(upperbound) occupancy for a lanuched kernel
+  /// based on the given hardware resources e.g. the number of registers, size
+  /// of the local memory, etc.
+  virtual unsigned computeMaxOccupancy(GenericDeviceTy &Device) const {
+    // This function should be overridden in the derived class.
+    return MaxOccupancy;
+  }
+
+  /// Compute achieved occupancy
+  /// This function computes the achieved occupancy for a launched kernel based
+  /// on the number of threads, number of teams and the max occupancy of this
+  /// kernel. It returns in ratio representing the occupancy for each CU(SM).
+  virtual unsigned computeAchievedOccupancy(GenericDeviceTy &Device,
+                                            uint32_t numThreads,
+                                            uint64_t numTeams) const {
+    // This function should be overridden in the derived class.
+    return AchievedOccupancy;
+  }
+
+  /// Indicate if the kernel works in Generic SPMD, Generic or SPMD mode.
+  bool isGenericSPMDMode() const {
+    return ExecutionMode == OMP_TGT_EXEC_MODE_GENERIC_SPMD;
+  }
+  bool isGenericMode() const {
+    return ExecutionMode == OMP_TGT_EXEC_MODE_GENERIC;
+  }
+  bool isSPMDMode() const { return ExecutionMode == OMP_TGT_EXEC_MODE_SPMD; }
+  bool isBareMode() const { return ExecutionMode == OMP_TGT_EXEC_MODE_BARE; }
+
+  /// AMD-only execution modes
+  bool isBigJumpLoopMode() const {
+    return ExecutionMode == OMP_TGT_EXEC_MODE_SPMD_BIG_JUMP_LOOP;
+  }
+  bool isNoLoopMode() const {
+    return ExecutionMode == OMP_TGT_EXEC_MODE_SPMD_NO_LOOP;
+  }
+  bool isXTeamReductionsMode() const {
+    return ExecutionMode == OMP_TGT_EXEC_MODE_XTEAM_RED;
+  }
+
+  /// Indicate if the input block size is within the limit.
+  virtual bool isValidBlockSize(uint32_t BlockSize) const { return true; }
+
 protected:
   /// Get the execution mode name of the kernel.
   const char *getExecutionModeName() const {
     switch (ExecutionMode) {
+    case OMP_TGT_EXEC_MODE_BARE:
+      return "BARE";
     case OMP_TGT_EXEC_MODE_SPMD:
       return "SPMD";
     case OMP_TGT_EXEC_MODE_GENERIC:
@@ -331,15 +490,18 @@ protected:
 
   /// Prints generic kernel launch information.
   Error printLaunchInfo(GenericDeviceTy &GenericDevice,
-                        KernelArgsTy &KernelArgs, uint32_t NumThreads,
-                        uint64_t NumBlocks) const;
+                        KernelArgsTy &KernelArgs, uint32_t NumThreads[3],
+                        uint32_t NumBlocks[3], int64_t MultiDeviceLB,
+                        int64_t MultiDeviceUB) const;
 
   /// Prints plugin-specific kernel launch information after generic kernel
   /// launch information
   virtual Error printLaunchInfoDetails(GenericDeviceTy &GenericDevice,
                                        KernelArgsTy &KernelArgs,
-                                       uint32_t NumThreads,
-                                       uint64_t NumBlocks) const;
+                                       uint32_t NumThreads[3],
+                                       uint32_t NumBlocks[3],
+                                       int64_t MultiDeviceLB,
+                                       int64_t MultiDeviceUB) const;
 
 private:
   /// Prepare the arguments before launching the kernel.
@@ -366,16 +528,19 @@ private:
   /// The number of threads \p NumThreads can be adjusted by this method.
   /// \p IsNumThreadsFromUser is true is \p NumThreads is defined by user via
   /// thread_limit clause.
-  virtual uint64_t getNumBlocks(GenericDeviceTy &GenericDevice,
-                                uint32_t BlockLimitClause[3],
-                                uint64_t LoopTripCount, uint32_t &NumThreads,
-                                bool IsNumThreadsFromUser) const;
+  virtual
+  uint32_t getNumBlocks(GenericDeviceTy &GenericDevice,
+                        uint32_t BlockLimitClause[3], uint64_t LoopTripCount,
+                        uint32_t &NumThreads, bool IsNumThreadsFromUser) const;
 
   /// The kernel name.
-  const char *Name;
+  std::string Name;
 
   /// The execution flags of the kernel.
   OMPTgtExecModeFlags ExecutionMode;
+
+  /// The multi-device kernel flag.
+  bool IsMultiDeviceKernel;
 
   /// The image that contains this kernel.
   DeviceImageTy *ImagePtr = nullptr;
@@ -387,37 +552,90 @@ protected:
   /// The maximum number of threads which the kernel could leverage.
   uint32_t MaxNumThreads;
 
-  /// Indicate if the kernel works in Generic SPMD, Generic or SPMD mode.
-  bool isGenericSPMDMode() const {
-    return ExecutionMode == OMP_TGT_EXEC_MODE_GENERIC_SPMD;
-  }
-  bool isGenericMode() const {
-    return ExecutionMode == OMP_TGT_EXEC_MODE_GENERIC;
-  }
-  bool isSPMDMode() const { return ExecutionMode == OMP_TGT_EXEC_MODE_SPMD; }
-
-  /// AMD-only execution modes
-  bool isBigJumpLoopMode() const {
-    return ExecutionMode == OMP_TGT_EXEC_MODE_SPMD_BIG_JUMP_LOOP;
-  }
-  bool isNoLoopMode() const {
-    return ExecutionMode == OMP_TGT_EXEC_MODE_SPMD_NO_LOOP;
-  }
-  bool isXTeamReductionsMode() const {
-    return ExecutionMode == OMP_TGT_EXEC_MODE_XTEAM_RED;
-  }
   /// The kernel environment, including execution flags.
   KernelEnvironmentTy KernelEnvironment;
 
   /// The prototype kernel launch environment.
   KernelLaunchEnvironmentTy KernelLaunchEnvironment;
 
-  /// If the kernel is a bare kernel.
-  bool IsBareKernel = false;
+  /// Upper-bound for the launched kernel occupancy.
+  /// 0 indicates an invalid result.
+  mutable unsigned MaxOccupancy = 0;
+
+  /// Achieved occupancy for the launched kernel.
+  /// 0 indications an invalid result.
+  mutable unsigned AchievedOccupancy = 0;
+};
+
+/// Information about an allocation, when it has been allocated, and when/if it
+/// has been deallocated, for error reporting purposes.
+struct AllocationTraceInfoTy {
+
+  /// The stack trace of the allocation itself.
+  std::string AllocationTrace;
+
+  /// The stack trace of the deallocation, or empty.
+  std::string DeallocationTrace;
+
+  /// The allocated device pointer.
+  void *DevicePtr = nullptr;
+
+  /// The corresponding host pointer (can be null).
+  void *HostPtr = nullptr;
+
+  /// The size of the allocation.
+  uint64_t Size = 0;
+
+  /// The kind of the allocation.
+  TargetAllocTy Kind = TargetAllocTy::TARGET_ALLOC_DEFAULT;
+
+  /// Information about the last allocation at this address, if any.
+  AllocationTraceInfoTy *LastAllocationInfo = nullptr;
+
+  /// Lock to keep accesses race free.
+  std::mutex Lock;
+};
+
+/// Information about an allocation, when it has been allocated, and when/if it
+/// has been deallocated, for error reporting purposes.
+struct KernelTraceInfoTy {
+
+  /// The launched kernel.
+  GenericKernelTy *Kernel;
+
+  /// The stack trace of the launch itself.
+  std::string LaunchTrace;
+
+  /// The async info the kernel was launched in.
+  __tgt_async_info *AsyncInfo;
+};
+
+struct KernelTraceInfoRecordTy {
+  KernelTraceInfoRecordTy() { KTIs.fill({}); }
+
+  /// Return the (maximal) record size.
+  auto size() const { return KTIs.size(); }
+
+  /// Create a new kernel trace info and add it into the record.
+  void emplace(GenericKernelTy *Kernel, const std::string &&StackTrace,
+               __tgt_async_info *AsyncInfo) {
+    KTIs[Idx] = {Kernel, std::move(StackTrace), AsyncInfo};
+    Idx = (Idx + 1) % size();
+  }
+
+  /// Return the \p I'th last kernel trace info.
+  auto getKernelTraceInfo(int32_t I) const {
+    // Note that kernel trace infos "grow forward", so lookup is backwards.
+    return KTIs[(Idx - I - 1 + size()) % size()];
+  }
+
+private:
+  std::array<KernelTraceInfoTy, 8> KTIs;
+  unsigned Idx = 0;
 };
 
 /// Class representing a map of host pinned allocations. We track these pinned
-/// allocations, so memory tranfers invloving these buffers can be optimized.
+/// allocations, so memory transfers involving these buffers can be optimized.
 class PinnedAllocationMapTy {
 
   /// Struct representing a map entry.
@@ -443,7 +661,7 @@ class PinnedAllocationMapTy {
     /// becomes zero.
     mutable size_t References;
 
-    /// Create an entry with the host and device acessible pointers, the buffer
+    /// Create an entry with the host and device accessible pointers, the buffer
     /// size, and a boolean indicating whether the buffer was locked externally.
     EntryTy(void *HstPtr, void *DevAccessiblePtr, size_t Size,
             bool ExternallyLocked)
@@ -478,7 +696,7 @@ class PinnedAllocationMapTy {
   /// Indicate whether mapped host buffers should be locked automatically.
   bool LockMappedBuffers;
 
-  /// Indicate whether failures when locking mapped buffers should be ingored.
+  /// Indicate whether failures when locking mapped buffers should be ignored.
   bool IgnoreLockMappedFailures;
 
   /// Find an allocation that intersects with \p HstPtr pointer. Assume the
@@ -505,7 +723,7 @@ class PinnedAllocationMapTy {
     --It;
 
     // The buffer is not contained in the pinned allocation.
-    if (advanceVoidPtr(It->HstPtr, It->Size) > HstPtr)
+    if (utils::advancePtr(It->HstPtr, It->Size) > HstPtr)
       return &(*It);
 
     // None found.
@@ -532,15 +750,15 @@ class PinnedAllocationMapTy {
 
   /// Indicate whether the first range A fully contains the second range B.
   static bool contains(void *PtrA, size_t SizeA, void *PtrB, size_t SizeB) {
-    void *EndA = advanceVoidPtr(PtrA, SizeA);
-    void *EndB = advanceVoidPtr(PtrB, SizeB);
+    void *EndA = utils::advancePtr(PtrA, SizeA);
+    void *EndB = utils::advancePtr(PtrB, SizeB);
     return (PtrB >= PtrA && EndB <= EndA);
   }
 
   /// Indicate whether the first range A intersects with the second range B.
   static bool intersects(void *PtrA, size_t SizeA, void *PtrB, size_t SizeB) {
-    void *EndA = advanceVoidPtr(PtrA, SizeA);
-    void *EndB = advanceVoidPtr(PtrB, SizeB);
+    void *EndA = utils::advancePtr(PtrA, SizeA);
+    void *EndB = utils::advancePtr(PtrB, SizeB);
     return (PtrA < EndB && PtrB < EndA);
   }
 
@@ -622,8 +840,8 @@ public:
     if (!Entry)
       return nullptr;
 
-    return advanceVoidPtr(Entry->DevAccessiblePtr,
-                          getPtrDiff(HstPtr, Entry->HstPtr));
+    return utils::advancePtr(Entry->DevAccessiblePtr,
+                             utils::getPtrDiff(HstPtr, Entry->HstPtr));
   }
 
   /// Check whether a buffer belongs to a registered host pinned allocation.
@@ -665,14 +883,13 @@ struct GenericDeviceTy : public DeviceAllocatorTy {
 
   /// Load the binary image into the device and return the target table.
   Expected<DeviceImageTy *> loadBinary(GenericPluginTy &Plugin,
-                                       const __tgt_device_image *TgtImage);
+                                       StringRef TgtImage);
   virtual Expected<DeviceImageTy *>
-  loadBinaryImpl(const __tgt_device_image *TgtImage, int32_t ImageId) = 0;
+  loadBinaryImpl(std::unique_ptr<MemoryBuffer> &&TgtImage, int32_t ImageId) = 0;
 
-  /// Setup the device environment if needed. Notice this setup may not be run
-  /// on some plugins. By default, it will be executed, but plugins can change
-  /// this behavior by overriding the shouldSetupDeviceEnvironment function.
-  Error setupDeviceEnvironment(GenericPluginTy &Plugin, DeviceImageTy &Image);
+  /// Unload a previously loaded Image from the device
+  Error unloadBinary(DeviceImageTy *Image);
+  virtual Error unloadBinaryImpl(DeviceImageTy *Image) = 0;
 
   /// Setup the global device memory pool, if the plugin requires one.
   Error setupDeviceMemoryPool(GenericPluginTy &Plugin, DeviceImageTy &Image,
@@ -684,9 +901,12 @@ struct GenericDeviceTy : public DeviceAllocatorTy {
   Error setupRPCServer(GenericPluginTy &Plugin, DeviceImageTy &Image);
 
   /// Synchronize the current thread with the pending operations on the
-  /// __tgt_async_info structure.
-  Error synchronize(__tgt_async_info *AsyncInfo);
-  virtual Error synchronizeImpl(__tgt_async_info &AsyncInfo) = 0;
+  /// __tgt_async_info structure. If ReleaseQueue is false, then the
+  // underlying queue will not be released. In this case, additional
+  // work may be submitted to the queue whilst a synchronize is running.
+  Error synchronize(__tgt_async_info *AsyncInfo, bool ReleaseQueue = true);
+  virtual Error synchronizeImpl(__tgt_async_info &AsyncInfo,
+                                bool ReleaseQueue) = 0;
 
   /// Invokes any global constructors on the device if present and is required
   /// by the target.
@@ -782,6 +1002,10 @@ struct GenericDeviceTy : public DeviceAllocatorTy {
   virtual Error dataRetrieveImpl(void *HstPtr, const void *TgtPtr, int64_t Size,
                                  AsyncInfoWrapperTy &AsyncInfoWrapper) = 0;
 
+  /// Instert a data fence between previous data operations and the following
+  /// operations if necessary for the device
+  virtual Error dataFence(__tgt_async_info *AsyncInfo) = 0;
+
   /// Exchange data between devices (device to device transfer). Calling this
   /// function is only valid if GenericPlugin::isDataExchangable() passing the
   /// two devices returns true.
@@ -790,6 +1014,13 @@ struct GenericDeviceTy : public DeviceAllocatorTy {
   virtual Error dataExchangeImpl(const void *SrcPtr, GenericDeviceTy &DstDev,
                                  void *DstPtr, int64_t Size,
                                  AsyncInfoWrapperTy &AsyncInfoWrapper) = 0;
+
+  /// Fill data on the device with a pattern from the host
+  Error dataFill(void *TgtPtr, const void *PatternPtr, int64_t PatternSize,
+                 int64_t Size, __tgt_async_info *AsyncInfo);
+  virtual Error dataFillImpl(void *TgtPtr, const void *PatternPtr,
+                             int64_t PatternSize, int64_t Size,
+                             AsyncInfoWrapperTy &AsyncInfoWrapper) = 0;
 
   /// Run the kernel associated with \p EntryPtr
   Error launchKernel(void *EntryPtr, void **ArgPtrs, ptrdiff_t *ArgOffsets,
@@ -841,6 +1072,12 @@ struct GenericDeviceTy : public DeviceAllocatorTy {
   bool IsGfx90aCoarseGrainUsmMapEnabled();
   virtual bool IsGfx90aCoarseGrainUsmMapEnabledImpl() { return false; }
 
+  /// Enqueue a host call to AsyncInfo
+  Error enqueueHostCall(void (*Callback)(void *), void *UserData,
+                        __tgt_async_info *AsyncInfo);
+  virtual Error enqueueHostCallImpl(void (*Callback)(void *), void *UserData,
+                                    AsyncInfoWrapperTy &AsyncInfo) = 0;
+
   /// Create an event.
   Error createEvent(void **EventPtrStorage);
   virtual Error createEventImpl(void **EventPtrStorage) = 0;
@@ -860,13 +1097,26 @@ struct GenericDeviceTy : public DeviceAllocatorTy {
   virtual Error waitEventImpl(void *EventPtr,
                               AsyncInfoWrapperTy &AsyncInfoWrapper) = 0;
 
+  /// Check if the event enqueued to AsyncInfo is complete
+  Expected<bool> isEventComplete(void *Event, __tgt_async_info *AsyncInfo);
+  virtual Expected<bool>
+  isEventCompleteImpl(void *EventPtr, AsyncInfoWrapperTy &AsyncInfoWrapper) = 0;
+
   /// Synchronize the current thread with the event.
   Error syncEvent(void *EventPtr);
   virtual Error syncEventImpl(void *EventPtr) = 0;
 
   /// Print information about the device.
   Error printInfo();
-  virtual Error obtainInfoImpl(InfoQueueTy &Info) = 0;
+  virtual Expected<InfoTreeNode> obtainInfoImpl() = 0;
+
+  /// Return true if the device has work that is either queued or currently
+  /// running
+  ///
+  /// Devices which cannot report this information should always return true
+  Expected<bool> hasPendingWork(__tgt_async_info *AsyncInfo);
+  virtual Expected<bool>
+  hasPendingWorkImpl(AsyncInfoWrapperTy &AsyncInfoWrapper) = 0;
 
   /// Getters of the grid values.
   uint32_t getWarpSize() const { return GridValues.GV_Warp_Size; }
@@ -882,6 +1132,7 @@ struct GenericDeviceTy : public DeviceAllocatorTy {
   int32_t getOMPNumTeams() const { return OMP_NumTeams; }
   int32_t getOMPTeamsThreadLimit() const { return OMP_TeamsThreadLimit; }
 
+  uint32_t getDebugKind() const { return OMPX_DebugKind; }
   uint32_t getDynamicMemorySize() const { return OMPX_SharedMemorySize; }
   virtual uint64_t getClockFrequency() const { return CLOCKS_PER_SEC; }
 
@@ -889,6 +1140,12 @@ struct GenericDeviceTy : public DeviceAllocatorTy {
     llvm_unreachable("Unimplemented");
   }
   virtual uint32_t getOMPXBigJumpLoopTeamsPerCU() const {
+    llvm_unreachable("Unimplemented");
+  }
+  virtual uint32_t getXTeamRedTeamsPerCU() const {
+    llvm_unreachable("Unimplemented");
+  }
+  virtual uint32_t getOMPXBigJumpLoopMaxTotalTeams() const {
     llvm_unreachable("Unimplemented");
   }
   virtual uint32_t getOMPXLowTripCount() const {
@@ -907,12 +1164,18 @@ struct GenericDeviceTy : public DeviceAllocatorTy {
   virtual uint32_t getOMPXAdjustNumTeamsForXteamRedSmallBlockSize() const {
     llvm_unreachable("Unimplemented");
   }
+  virtual bool getOMPXGenericSpmdUseSmallBlockSize() const {
+    llvm_unreachable("Unimplemented");
+  }
 
   /// Get target compute unit kind (e.g., sm_80, or gfx908).
   virtual std::string getComputeUnitKind() const { return "unknown"; }
 
   /// Get the number of compute units
   virtual uint32_t getNumComputeUnits() const { return 0; }
+
+  /// Return the device time stamp
+  virtual uint64_t getDeviceTimeStamp() { return 0; }
 
   /// Post processing after jit backend. The ownership of \p MB will be taken.
   virtual Expected<std::unique_ptr<MemoryBuffer>>
@@ -976,8 +1239,114 @@ struct GenericDeviceTy : public DeviceAllocatorTy {
     return Error::success();
   }
 
+  uint32_t getNumMultiDevices() const { return OMPX_NumMultiDevices; }
+
+  bool enableRuntimeAutotuning() const { return OMPX_EnableRuntimeAutotuning; }
+
+  bool getMultiDeviceKernelValue(void *EntryPtr);
+
+  KernelRunRecordTy *getKernelRunRecords() const { return KernelRunRecords; }
+
+  /// Return true if a descriptor of size 'Size' should be allocated using
+  /// shared memory. Default implementation returns 'false',
+  virtual bool useSharedMemForDescriptor(int64_t Size);
+
+  virtual Expected<omp_interop_val_t *>
+  createInterop(int32_t InteropType, interop_spec_t &InteropSpec) {
+    return nullptr;
+  }
+
+  virtual Error releaseInterop(omp_interop_val_t *Interop) {
+    return Plugin::success();
+  }
+
+  virtual interop_spec_t selectInteropPreference(int32_t InteropType,
+                                                 int32_t NumPrefers,
+                                                 interop_spec_t *Prefers) {
+    return interop_spec_t{tgt_fr_none, {false, 0}, 0};
+  }
+
   /// Reference to the underlying plugin that created this device.
   GenericPluginTy &Plugin;
+
+  /// Map to record when allocations have been performed, and when they have
+  /// been deallocated, both for error reporting purposes.
+  ProtectedObj<DenseMap<void *, AllocationTraceInfoTy *>> AllocationTraces;
+
+  /// Return the allocation trace info for a device pointer, that is the
+  /// allocation into which this device pointer points to (or pointed into).
+  AllocationTraceInfoTy *getAllocationTraceInfoForAddr(void *DevicePtr) {
+    auto AllocationTraceMap = AllocationTraces.getExclusiveAccessor();
+    for (auto &It : *AllocationTraceMap) {
+      if (It.first <= DevicePtr &&
+          utils::advancePtr(It.first, It.second->Size) > DevicePtr)
+        return It.second;
+    }
+    return nullptr;
+  }
+
+  /// Return the allocation trace info for a device pointer, that is the
+  /// allocation into which this device pointer points to (or pointed into).
+  AllocationTraceInfoTy *
+  getClosestAllocationTraceInfoForAddr(void *DevicePtr, uintptr_t &Distance) {
+    Distance = 0;
+    if (auto *ATI = getAllocationTraceInfoForAddr(DevicePtr)) {
+      return ATI;
+    }
+
+    AllocationTraceInfoTy *ATI = nullptr;
+    uintptr_t DevicePtrI = uintptr_t(DevicePtr);
+    auto AllocationTraceMap = AllocationTraces.getExclusiveAccessor();
+    for (auto &It : *AllocationTraceMap) {
+      uintptr_t Begin = uintptr_t(It.second->DevicePtr);
+      uintptr_t End = Begin + It.second->Size - 1;
+      uintptr_t ItDistance = std::min(Begin - DevicePtrI, DevicePtrI - End);
+      if (ATI && ItDistance > Distance)
+        continue;
+      ATI = It.second;
+      Distance = ItDistance;
+    }
+    return ATI;
+  }
+
+  /// Map to record kernel have been launchedl, for error reporting purposes.
+  ProtectedObj<KernelTraceInfoRecordTy> KernelLaunchTraces;
+
+  /// Environment variable to determine if stack traces for kernel launches are
+  /// tracked.
+  UInt32Envar OMPX_TrackNumKernelLaunches =
+      UInt32Envar("OFFLOAD_TRACK_NUM_KERNEL_LAUNCH_TRACES", 0);
+
+  /// Environment variable to determine if stack traces for allocations and
+  /// deallocations are tracked.
+  BoolEnvar OMPX_TrackAllocationTraces =
+      BoolEnvar("OFFLOAD_TRACK_ALLOCATION_TRACES", false);
+
+  /// An entry to cache a shared memory buffer for Args to emissary APIs
+  struct ArgBufEntryTy {
+    size_t Size; // Size of Buffer
+    void *Addr;  // Pointer to SHARED mem
+    bool is_free;
+  };
+  /// The cache of allocated shared memory buffers for emissary APIs args
+  std::list<ArgBufEntryTy *> ArgBufEntries;
+  /// Get a free shared memory buffer and mark it not free. If none
+  /// free, allocate a new buffer and mark it not free.
+  void *getFree_ArgBuf(size_t sz);
+  /// Change a cached buffer from not free (busy) to free.
+  void moveBusyToFree_ArgBuf(void *ptr);
+  /// Destroy Argbufs and clear the cache. Used as part of device destructor
+  void clear_ArgBufs();
+
+  bool enableKernelDurationTracing() const {
+    return OMPX_KernelDurationTracing;
+  }
+
+  uint32_t getAndIncrementLaunchId() { return LaunchId.fetch_add(1); }
+
+  /// Array of images loaded into the device. Images are automatically
+  /// deallocated by the allocator.
+  llvm::SmallVector<DeviceImageTy *> LoadedImages;
 
 private:
   /// Get and set the stack size and heap size for the device. If not used, the
@@ -986,11 +1355,6 @@ private:
   virtual Error setDeviceStackSize(uint64_t V) = 0;
   virtual Error getDeviceHeapSize(uint64_t &V) = 0;
   virtual Error setDeviceHeapSize(uint64_t V) = 0;
-
-  /// Indicate whether the device should setup the device environment. Notice
-  /// that returning false in this function will change the behavior of the
-  /// setupDeviceEnvironment() function.
-  virtual bool shouldSetupDeviceEnvironment() const { return true; }
 
   /// Indicate whether the device should setup the global device memory pool. If
   /// false is return the value on the device will be uninitialized.
@@ -1004,7 +1368,7 @@ private:
   MemoryManagerTy *MemoryManager;
 
   /// Per device setting of MemoryManager's Threshold
-  virtual size_t getMemoryManagerSizeThreshold() { return 0 /* use default */; }
+  virtual size_t getMemoryManagerSizeThreshold() { return 0; }
 
   /// Environment variables defined by the OpenMP standard.
   Int32Envar OMP_TeamLimit;
@@ -1026,15 +1390,20 @@ private:
   BoolEnvar OMPX_ReuseBlocksForHighTripCount =
       BoolEnvar("LIBOMPTARGET_REUSE_BLOCKS_FOR_HIGH_TRIP_COUNT", true);
 
+  /// Variable to track kernel launch for a device.
+  std::atomic<uint32_t> LaunchId = 0;
+
 protected:
   /// Environment variables defined by the LLVM OpenMP implementation
   /// regarding the initial number of streams and events.
   UInt32Envar OMPX_InitialNumStreams;
   UInt32Envar OMPX_InitialNumEvents;
 
-  /// Array of images loaded into the device. Images are automatically
-  /// deallocated by the allocator.
-  llvm::SmallVector<DeviceImageTy *> LoadedImages;
+  /// Specify the number of devices used by multi-device kernels.
+  UInt32Envar OMPX_NumMultiDevices;
+
+  /// Envar to enable runtime tuning.
+  BoolEnvar OMPX_EnableRuntimeAutotuning;
 
   /// The identifier of the device within the plugin. Notice this is not a
   /// global device id and is not the device id visible to the OpenMP user.
@@ -1051,7 +1420,7 @@ protected:
   enum class PeerAccessState : uint8_t { AVAILABLE, UNAVAILABLE, PENDING };
 
   /// Array of peer access states with the rest of devices. This means that if
-  /// the device I has a matrix PeerAccesses with PeerAccesses[J] == AVAILABLE,
+  /// the device I has a matrix PeerAccesses with PeerAccesses == AVAILABLE,
   /// the device I can access device J's memory directly. However, notice this
   /// does not mean that device J can access device I's memory directly.
   llvm::SmallVector<PeerAccessState> PeerAccesses;
@@ -1064,22 +1433,13 @@ protected:
   /// This is used to run the RPC server during task synchronization.
   RPCServerTy *RPCServer;
 
+  /// Structs for functions and data used in runtime autotuning.
+  KernelRunRecordTy *KernelRunRecords;
+
+  /// Variable to enable kernel duration tracing.
+  BoolEnvar OMPX_KernelDurationTracing;
+
 private:
-#ifdef OMPT_SUPPORT
-  /// OMPT callback functions
-#define defineOmptCallback(Name, Type, Code) Name##_t Name##_fn = nullptr;
-  FOREACH_OMPT_DEVICE_EVENT(defineOmptCallback)
-#undef defineOmptCallback
-
-  /// OMPT device tracing functions
-#define defineOmptTracingFunction(Name) ompt_interface_fn_t Name##_fn = nullptr;
-  FOREACH_OMPT_DEVICE_TRACING_FN_COMMON(defineOmptTracingFunction);
-#undef defineOmptTracingFunction
-
-  /// Internal representation for OMPT device (initialize & finalize)
-  std::atomic<bool> OmptInitialized;
-#endif
-
   /// Return the kernel environment object for kernel \p Name.
   Expected<KernelEnvironmentTy>
   getKernelEnvironmentForKernel(StringRef Name, DeviceImageTy &Image);
@@ -1090,6 +1450,116 @@ private:
   bool IsFastReductionEnabled = false;
 };
 
+/// Struct represents the metadata for each kernel run on the device.
+struct KernelRunRecordTy {
+
+  struct KernelRunEntryTy {
+    std::string KernelName;
+    uint32_t NumTeams = 0;
+    uint32_t NumThreads = 0;
+    uint64_t RunDuration = 0;
+  };
+
+  // Metadata used in tuning process.
+  struct TuningMetadataTy {
+    uint32_t IdxThread = 0;
+    uint32_t IdxCUMultiplier = 0;
+    // Run counters.
+    uint32_t RunCounters = 0;
+    // Entry with minimum running time.
+    KernelRunEntryTy MinEntry;
+  };
+
+  // Add a new entry
+  void addEntry(std::string KernelName, uint32_t NumTeams, uint32_t NumThreads,
+                uint64_t RunDuration) {
+    TuningData[KernelName].RunCounters++;
+
+    // Update min entries.
+    uint64_t MinDuration = 0;
+    auto It = TuningData.find(KernelName);
+    if (It != TuningData.end()) {
+      MinDuration = It->second.MinEntry.RunDuration;
+    }
+    if (MinDuration > RunDuration || MinDuration == 0) {
+      TuningData[KernelName].MinEntry = {KernelName, NumTeams, NumThreads,
+                                         RunDuration};
+    }
+  }
+
+  // Get parameters for next kernel launch.
+  std::pair<uint32_t, uint32_t>
+  getLaunchParamsForKernel(const GenericKernelTy &Kernel,
+                           GenericDeviceTy &GenericDevice) {
+    std::string KernelName = Kernel.getName();
+
+    // If the kernel reaches the run limit,
+    // return the current optimal launch parameters.
+    if (reachedRunLimitForKernel(KernelName)) {
+      auto MinEntry = TuningData[KernelName].MinEntry;
+      return {MinEntry.NumTeams, MinEntry.NumThreads};
+    }
+
+    // Pick new launch parameters.
+    uint32_t IdxCUMulti = TuningData[KernelName].IdxCUMultiplier;
+    uint32_t IdxThread = TuningData[KernelName].IdxThread;
+
+    if (IdxCUMulti >= CUMultiplierCandidate.size()) {
+      // No more element to search.
+      // Max run counter to stop further runs.
+      // Return current optimal launch parameters.
+      TuningData[KernelName].RunCounters = RunLimiter + 1;
+
+      return {TuningData[KernelName].MinEntry.NumTeams,
+              TuningData[KernelName].MinEntry.NumThreads};
+    }
+
+    // New team/thread pair for launch parameters.
+    uint32_t NumCU = GenericDevice.getNumComputeUnits();
+    std::pair<uint32_t, uint32_t> NewLaunchParams = {
+        CUMultiplierCandidate[IdxCUMulti] * NumCU, ThreadCandidate[IdxThread]};
+
+    // Update indices.
+    IdxThread++;
+    TuningData[KernelName].IdxThread = IdxThread;
+
+    // Threads should be within the limit.
+    if (IdxThread >= ThreadCandidate.size() ||
+        !Kernel.isValidBlockSize(ThreadCandidate[IdxThread])) {
+      TuningData[KernelName].IdxThread = 0;
+      TuningData[KernelName].IdxCUMultiplier++;
+    }
+
+    return NewLaunchParams;
+  }
+
+  bool reachedRunLimitForKernel(std::string KernelName) {
+    if (TuningData.find(KernelName) == TuningData.end()) {
+      // If no record for this kernel.
+      return false;
+    }
+
+    return TuningData[KernelName].RunCounters > RunLimiter;
+  }
+
+  uint32_t getRunCounterForKernel(std::string KernelName) {
+    if (TuningData.find(KernelName) == TuningData.end()) {
+      return 0;
+    }
+
+    return TuningData[KernelName].RunCounters;
+  }
+
+private:
+  // Candidates for thread and team.
+  std::vector<uint32_t> ThreadCandidate = {32, 64, 128, 256, 512, 1024};
+  std::vector<uint32_t> CUMultiplierCandidate = {4, 8, 16, 32, 64, 128};
+  // The max number of tuning runs for each kernel.
+  uint32_t RunLimiter = ThreadCandidate.size() * CUMultiplierCandidate.size();
+  // Used for keeping track of the metatdata used in tuning for each kernel.
+  std::unordered_map<std::string, TuningMetadataTy> TuningData;
+};
+
 /// Class implementing common functionalities of offload plugins. Each plugin
 /// should define the specific plugin class, derive from this generic one, and
 /// implement the necessary virtual function members.
@@ -1098,7 +1568,7 @@ struct GenericPluginTy {
   /// Construct a plugin instance.
   GenericPluginTy(Triple::ArchType TA)
       : GlobalHandler(nullptr), JIT(TA), RPCServer(nullptr),
-        RecordReplay(nullptr) {}
+        RecordReplay(nullptr), Profiler(getProfilerToAttach()) {}
 
   virtual ~GenericPluginTy() {}
 
@@ -1123,7 +1593,7 @@ struct GenericPluginTy {
   /// Get the reference to the device with a certain device id.
   GenericDeviceTy &getDevice(int32_t DeviceId) {
     assert(isValidDeviceId(DeviceId) && "Invalid device id");
-    assert(Devices[DeviceId] && "Device is unitialized");
+    assert(Devices[DeviceId] && "Device is uninitialized");
 
     return *Devices[DeviceId];
   }
@@ -1153,6 +1623,8 @@ struct GenericPluginTy {
   template <typename Ty> Ty *allocate() {
     return reinterpret_cast<Ty *>(Allocator.Allocate(sizeof(Ty), alignof(Ty)));
   }
+
+  template <typename Ty> void free(Ty *Mem) { Allocator.Deallocate(Mem); }
 
   /// Get the reference to the global handler of this plugin.
   GenericGlobalHandlerTy &getGlobalHandler() {
@@ -1211,6 +1683,23 @@ struct GenericPluginTy {
   /// Indicate whether the plugin supports empty images.
   virtual bool supportsEmptyImages() const { return false; }
 
+  virtual Error flushQueueImpl(omp_interop_val_t *Interop) {
+    return Plugin::success();
+  }
+
+  virtual Error syncBarrierImpl(omp_interop_val_t *Interop) {
+    return Plugin::error(error::ErrorCode::UNSUPPORTED,
+                         "sync_barrier not supported");
+  }
+
+  virtual Error asyncBarrierImpl(omp_interop_val_t *Interop) {
+    return Plugin::error(error::ErrorCode::UNSUPPORTED,
+                         "async_barrier not supported");
+  }
+
+  /// Return a pointer to the profiler instance
+  GenericProfilerTy *getProfiler() const { return Profiler.get(); }
+
 protected:
   /// Indicate whether a device id is valid.
   bool isValidDeviceId(int32_t DeviceId) const {
@@ -1225,10 +1714,10 @@ public:
 
   /// Returns non-zero if the \p Image is compatible with the plugin. This
   /// function does not require the plugin to be initialized before use.
-  int32_t is_plugin_compatible(__tgt_device_image *Image);
+  int32_t isPluginCompatible(StringRef Image);
 
   /// Returns non-zero if the \p Image is compatible with the device.
-  int32_t is_device_compatible(int32_t DeviceId, __tgt_device_image *Image);
+  int32_t isDeviceCompatible(int32_t DeviceId, StringRef Image);
 
   /// Returns non-zero if the plugin device has been initialized.
   int32_t is_device_initialized(int32_t DeviceId) const;
@@ -1307,7 +1796,7 @@ public:
   int32_t data_retrieve(int32_t DeviceId, void *HstPtr, void *TgtPtr,
                         int64_t Size);
 
-  /// Copy data from the given device asynchornously.
+  /// Copy data from the given device asynchronously.
   int32_t data_retrieve_async(int32_t DeviceId, void *HstPtr, void *TgtPtr,
                               int64_t Size, __tgt_async_info *AsyncInfoPtr);
 
@@ -1319,6 +1808,10 @@ public:
   int32_t data_exchange_async(int32_t SrcDeviceId, void *SrcPtr,
                               int DstDeviceId, void *DstPtr, int64_t Size,
                               __tgt_async_info *AsyncInfo);
+
+  /// Places a fence between previous data movements and following data
+  /// movements if necessary on the device
+  int32_t data_fence(int32_t DeviceId, __tgt_async_info *AsyncInfo);
 
   /// Begin executing a kernel on the given device.
   int32_t launch_kernel_sync(int32_t DeviceId, void *TgtEntryPtr,
@@ -1350,7 +1843,7 @@ public:
   int32_t wait_event(int32_t DeviceId, void *EventPtr,
                      __tgt_async_info *AsyncInfoPtr);
 
-  /// Syncrhonize execution until an event is done.
+  /// Synchronize execution until an event is done.
   int32_t sync_event(int32_t DeviceId, void *EventPtr);
 
   /// Remove the event from the plugin.
@@ -1400,6 +1893,43 @@ public:
                                            bool isAutoZeroCopy,
                                            bool isEagerMaps);
 
+  /// Return number of devices used by multi-device kernels.
+  int32_t get_num_multi_devices(int32_t DeviceId);
+
+  /// Check if kernel is multi-device.
+  bool kernel_is_multi_device(int32_t DeviceId, void *TgtEntryPtr);
+
+  /// Return true if a descriptor of size 'Size' should be allocated using
+  /// shared memory.
+  bool use_shared_mem_for_descriptor(int32_t DeviceId, int64_t Size);
+
+  /// Return the interop specification that the plugin supports
+  /// It might not be one of the user specified ones.
+  interop_spec_t select_interop_preference(int32_t ID, int32_t InteropType,
+                                           int32_t NumPrefers,
+                                           interop_spec_t *Prefers) {
+    auto &Device = getDevice(ID);
+    return Device.selectInteropPreference(InteropType, NumPrefers, Prefers);
+  }
+
+  /// Create OpenMP interop with the given interop context
+  omp_interop_val_t *create_interop(int32_t ID, int32_t InteropContext,
+                                    interop_spec_t *InteropSpec);
+
+  /// Release OpenMP interop object
+  int32_t release_interop(int32_t ID, omp_interop_val_t *Interop);
+
+  /// Flush the queue associated with the interop object if necessary
+  int32_t flush_queue(omp_interop_val_t *Interop);
+
+  /// Perform a host synchronization with the queue associated with the interop
+  /// object and wait for it to complete.
+  int32_t sync_barrier(omp_interop_val_t *Interop);
+
+  /// Queue an asynchronous barrier in the queue associated with the interop
+  /// object and return immediately.
+  int32_t async_barrier(omp_interop_val_t *Interop);
+
 private:
   /// Indicates if the platform runtime has been fully initialized.
   bool Initialized = false;
@@ -1430,31 +1960,10 @@ private:
 
   /// The interface between the plugin and the GPU for host services.
   RecordReplayTy *RecordReplay;
+
+  /// The Profiler instance
+  std::unique_ptr<GenericProfilerTy> Profiler;
 };
-
-namespace Plugin {
-/// Create a success error. This is the same as calling Error::success(), but
-/// it is recommended to use this one for consistency with Plugin::error() and
-/// Plugin::check().
-static inline Error success() { return Error::success(); }
-
-/// Create a string error.
-template <typename... ArgsTy>
-static Error error(const char *ErrFmt, ArgsTy... Args) {
-  return createStringError(inconvertibleErrorCode(), ErrFmt, Args...);
-}
-
-/// Check the plugin-specific error code and return an error or success
-/// accordingly. In case of an error, create a string error with the error
-/// description. The ErrFmt should follow the format:
-///     "Error in <function name>[<optional info>]: %s"
-/// The last format specifier "%s" is mandatory and will be used to place the
-/// error code's description. Notice this function should be only called from
-/// the plugin-specific code.
-/// TODO: Refactor this, must be defined individually by each plugin.
-template <typename... ArgsTy>
-static Error check(int32_t ErrorCode, const char *ErrFmt, ArgsTy... Args);
-} // namespace Plugin
 
 /// Auxiliary interface class for GenericDeviceResourceManagerTy. This class
 /// acts as a reference to a device resource, such as a stream, and requires
@@ -1646,9 +2155,6 @@ protected:
   /// The actual resource pool.
   std::deque<ResourceRef> ResourcePool;
 };
-
-/// A static check on whether or not we support RPC in libomptarget.
-bool libomptargetSupportsRPC();
 
 } // namespace plugin
 } // namespace target

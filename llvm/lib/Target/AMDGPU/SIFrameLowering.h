@@ -50,6 +50,23 @@ public:
                               const TargetRegisterInfo *TRI,
                               std::vector<CalleeSavedInfo> &CSI) const override;
 
+  bool assignCalleeSavedSpillSlots(MachineFunction &MF,
+                                   const TargetRegisterInfo *TRI,
+                                   std::vector<CalleeSavedInfo> &CSI,
+                                   unsigned &MinCSFrameIndex,
+                                   unsigned &MaxCSFrameIndex) const override;
+
+  bool spillCalleeSavedRegisters(MachineBasicBlock &MBB,
+                                 MachineBasicBlock::iterator MI,
+                                 ArrayRef<CalleeSavedInfo> CSI,
+                                 const TargetRegisterInfo *TRI) const override;
+
+  bool
+  restoreCalleeSavedRegisters(MachineBasicBlock &MBB,
+                              MachineBasicBlock::iterator MI,
+                              MutableArrayRef<CalleeSavedInfo> CSI,
+                              const TargetRegisterInfo *TRI) const override;
+
   bool allocateScavengingFrameIndexesNearIncomingSP(
     const MachineFunction &MF) const override;
 
@@ -67,10 +84,8 @@ public:
                                 MachineBasicBlock &MBB,
                                 MachineBasicBlock::iterator MI) const override;
 
-  bool spillCalleeSavedRegisters(MachineBasicBlock &MBB,
-                                 MachineBasicBlock::iterator MBBI,
-                                 const ArrayRef<CalleeSavedInfo> CSI,
-                                 const TargetRegisterInfo *TRI) const override;
+protected:
+  bool hasFPImpl(const MachineFunction &MF) const override;
 
 private:
   void emitEntryFunctionFlatScratchInit(MachineFunction &MF,
@@ -97,8 +112,6 @@ private:
                   MachineInstr::MIFlag Flags = MachineInstr::NoFlags) const;
 
 public:
-  bool hasFP(const MachineFunction &MF) const override;
-
   bool requiresStackPointerReference(const MachineFunction &MF) const;
 
   /// If '-amdgpu-spill-cfi-saved-regs' is enabled, emit RA/EXEC spills to
@@ -149,6 +162,12 @@ public:
                                               MachineBasicBlock::iterator MBBI,
                                               const DebugLoc &DL, Register Reg,
                                               Register SGPRPair) const;
+  MachineInstr *buildCFIForSameValue(MachineBasicBlock &MBB,
+                                     MachineBasicBlock::iterator MBBI,
+                                     const DebugLoc &DL, Register Reg) const;
+  // Returns true if the function may need to reserve space on the stack for the
+  // CWSR trap handler.
+  bool mayReserveScratchForCWSR(const MachineFunction &MF) const;
 };
 
 } // end namespace llvm

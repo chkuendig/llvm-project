@@ -1445,7 +1445,7 @@ define i16 @test_v8i16(<8 x i16> %a0) {
 ; AVX512BW-LABEL: test_v8i16:
 ; AVX512BW:       # %bb.0:
 ; AVX512BW-NEXT:    # kill: def $xmm0 killed $xmm0 def $zmm0
-; AVX512BW-NEXT:    vpternlogq $15, %zmm0, %zmm0, %zmm0
+; AVX512BW-NEXT:    vpternlogq {{.*#+}} zmm0 = ~zmm0
 ; AVX512BW-NEXT:    vphminposuw %xmm0, %xmm0
 ; AVX512BW-NEXT:    vmovd %xmm0, %eax
 ; AVX512BW-NEXT:    notl %eax
@@ -1455,7 +1455,7 @@ define i16 @test_v8i16(<8 x i16> %a0) {
 ;
 ; AVX512VL-LABEL: test_v8i16:
 ; AVX512VL:       # %bb.0:
-; AVX512VL-NEXT:    vpternlogq $15, %xmm0, %xmm0, %xmm0
+; AVX512VL-NEXT:    vpternlogq {{.*#+}} xmm0 = ~xmm0
 ; AVX512VL-NEXT:    vphminposuw %xmm0, %xmm0
 ; AVX512VL-NEXT:    vmovd %xmm0, %eax
 ; AVX512VL-NEXT:    notl %eax
@@ -1525,7 +1525,7 @@ define i16 @test_v16i16(<16 x i16> %a0) {
 ; AVX512BW:       # %bb.0:
 ; AVX512BW-NEXT:    vextracti128 $1, %ymm0, %xmm1
 ; AVX512BW-NEXT:    vpmaxuw %xmm1, %xmm0, %xmm0
-; AVX512BW-NEXT:    vpternlogq $15, %zmm0, %zmm0, %zmm0
+; AVX512BW-NEXT:    vpternlogq {{.*#+}} zmm0 = ~zmm0
 ; AVX512BW-NEXT:    vphminposuw %xmm0, %xmm0
 ; AVX512BW-NEXT:    vmovd %xmm0, %eax
 ; AVX512BW-NEXT:    notl %eax
@@ -1537,7 +1537,7 @@ define i16 @test_v16i16(<16 x i16> %a0) {
 ; AVX512VL:       # %bb.0:
 ; AVX512VL-NEXT:    vextracti128 $1, %ymm0, %xmm1
 ; AVX512VL-NEXT:    vpmaxuw %xmm1, %xmm0, %xmm0
-; AVX512VL-NEXT:    vpternlogq $15, %xmm0, %xmm0, %xmm0
+; AVX512VL-NEXT:    vpternlogq {{.*#+}} xmm0 = ~xmm0
 ; AVX512VL-NEXT:    vphminposuw %xmm0, %xmm0
 ; AVX512VL-NEXT:    vmovd %xmm0, %eax
 ; AVX512VL-NEXT:    notl %eax
@@ -1620,7 +1620,7 @@ define i16 @test_v32i16(<32 x i16> %a0) {
 ; AVX512BW-NEXT:    vpmaxuw %ymm1, %ymm0, %ymm0
 ; AVX512BW-NEXT:    vextracti128 $1, %ymm0, %xmm1
 ; AVX512BW-NEXT:    vpmaxuw %xmm1, %xmm0, %xmm0
-; AVX512BW-NEXT:    vpternlogq $15, %zmm0, %zmm0, %zmm0
+; AVX512BW-NEXT:    vpternlogq {{.*#+}} zmm0 = ~zmm0
 ; AVX512BW-NEXT:    vphminposuw %xmm0, %xmm0
 ; AVX512BW-NEXT:    vmovd %xmm0, %eax
 ; AVX512BW-NEXT:    notl %eax
@@ -1634,7 +1634,7 @@ define i16 @test_v32i16(<32 x i16> %a0) {
 ; AVX512VL-NEXT:    vpmaxuw %ymm1, %ymm0, %ymm0
 ; AVX512VL-NEXT:    vextracti128 $1, %ymm0, %xmm1
 ; AVX512VL-NEXT:    vpmaxuw %xmm1, %xmm0, %xmm0
-; AVX512VL-NEXT:    vpternlogq $15, %xmm0, %xmm0, %xmm0
+; AVX512VL-NEXT:    vpternlogq {{.*#+}} xmm0 = ~xmm0
 ; AVX512VL-NEXT:    vphminposuw %xmm0, %xmm0
 ; AVX512VL-NEXT:    vmovd %xmm0, %eax
 ; AVX512VL-NEXT:    notl %eax
@@ -1738,7 +1738,7 @@ define i16 @test_v64i16(<64 x i16> %a0) {
 ; AVX512BW-NEXT:    vpmaxuw %ymm1, %ymm0, %ymm0
 ; AVX512BW-NEXT:    vextracti128 $1, %ymm0, %xmm1
 ; AVX512BW-NEXT:    vpmaxuw %xmm1, %xmm0, %xmm0
-; AVX512BW-NEXT:    vpternlogq $15, %zmm0, %zmm0, %zmm0
+; AVX512BW-NEXT:    vpternlogq {{.*#+}} zmm0 = ~zmm0
 ; AVX512BW-NEXT:    vphminposuw %xmm0, %xmm0
 ; AVX512BW-NEXT:    vmovd %xmm0, %eax
 ; AVX512BW-NEXT:    notl %eax
@@ -1753,7 +1753,7 @@ define i16 @test_v64i16(<64 x i16> %a0) {
 ; AVX512VL-NEXT:    vpmaxuw %ymm1, %ymm0, %ymm0
 ; AVX512VL-NEXT:    vextracti128 $1, %ymm0, %xmm1
 ; AVX512VL-NEXT:    vpmaxuw %xmm1, %xmm0, %xmm0
-; AVX512VL-NEXT:    vpternlogq $15, %xmm0, %xmm0, %xmm0
+; AVX512VL-NEXT:    vpternlogq {{.*#+}} xmm0 = ~xmm0
 ; AVX512VL-NEXT:    vphminposuw %xmm0, %xmm0
 ; AVX512VL-NEXT:    vmovd %xmm0, %eax
 ; AVX512VL-NEXT:    notl %eax
@@ -1920,7 +1920,7 @@ define i8 @test_v16i8(<16 x i8> %a0) {
 ; AVX512BW-LABEL: test_v16i8:
 ; AVX512BW:       # %bb.0:
 ; AVX512BW-NEXT:    # kill: def $xmm0 killed $xmm0 def $zmm0
-; AVX512BW-NEXT:    vpternlogq $15, %zmm0, %zmm0, %zmm0
+; AVX512BW-NEXT:    vpternlogq {{.*#+}} zmm0 = ~zmm0
 ; AVX512BW-NEXT:    vpsrlw $8, %xmm0, %xmm1
 ; AVX512BW-NEXT:    vpminub %xmm1, %xmm0, %xmm0
 ; AVX512BW-NEXT:    vphminposuw %xmm0, %xmm0
@@ -1932,7 +1932,7 @@ define i8 @test_v16i8(<16 x i8> %a0) {
 ;
 ; AVX512VL-LABEL: test_v16i8:
 ; AVX512VL:       # %bb.0:
-; AVX512VL-NEXT:    vpternlogq $15, %xmm0, %xmm0, %xmm0
+; AVX512VL-NEXT:    vpternlogq {{.*#+}} xmm0 = ~xmm0
 ; AVX512VL-NEXT:    vpsrlw $8, %xmm0, %xmm1
 ; AVX512VL-NEXT:    vpminub %xmm1, %xmm0, %xmm0
 ; AVX512VL-NEXT:    vphminposuw %xmm0, %xmm0
@@ -2010,7 +2010,7 @@ define i8 @test_v32i8(<32 x i8> %a0) {
 ; AVX512BW:       # %bb.0:
 ; AVX512BW-NEXT:    vextracti128 $1, %ymm0, %xmm1
 ; AVX512BW-NEXT:    vpmaxub %xmm1, %xmm0, %xmm0
-; AVX512BW-NEXT:    vpternlogq $15, %zmm0, %zmm0, %zmm0
+; AVX512BW-NEXT:    vpternlogq {{.*#+}} zmm0 = ~zmm0
 ; AVX512BW-NEXT:    vpsrlw $8, %xmm0, %xmm1
 ; AVX512BW-NEXT:    vpminub %xmm1, %xmm0, %xmm0
 ; AVX512BW-NEXT:    vphminposuw %xmm0, %xmm0
@@ -2024,7 +2024,7 @@ define i8 @test_v32i8(<32 x i8> %a0) {
 ; AVX512VL:       # %bb.0:
 ; AVX512VL-NEXT:    vextracti128 $1, %ymm0, %xmm1
 ; AVX512VL-NEXT:    vpmaxub %xmm1, %xmm0, %xmm0
-; AVX512VL-NEXT:    vpternlogq $15, %xmm0, %xmm0, %xmm0
+; AVX512VL-NEXT:    vpternlogq {{.*#+}} xmm0 = ~xmm0
 ; AVX512VL-NEXT:    vpsrlw $8, %xmm0, %xmm1
 ; AVX512VL-NEXT:    vpminub %xmm1, %xmm0, %xmm0
 ; AVX512VL-NEXT:    vphminposuw %xmm0, %xmm0
@@ -2113,7 +2113,7 @@ define i8 @test_v64i8(<64 x i8> %a0) {
 ; AVX512BW-NEXT:    vpmaxub %ymm1, %ymm0, %ymm0
 ; AVX512BW-NEXT:    vextracti128 $1, %ymm0, %xmm1
 ; AVX512BW-NEXT:    vpmaxub %xmm1, %xmm0, %xmm0
-; AVX512BW-NEXT:    vpternlogq $15, %zmm0, %zmm0, %zmm0
+; AVX512BW-NEXT:    vpternlogq {{.*#+}} zmm0 = ~zmm0
 ; AVX512BW-NEXT:    vpsrlw $8, %xmm0, %xmm1
 ; AVX512BW-NEXT:    vpminub %xmm1, %xmm0, %xmm0
 ; AVX512BW-NEXT:    vphminposuw %xmm0, %xmm0
@@ -2129,7 +2129,7 @@ define i8 @test_v64i8(<64 x i8> %a0) {
 ; AVX512VL-NEXT:    vpmaxub %ymm1, %ymm0, %ymm0
 ; AVX512VL-NEXT:    vextracti128 $1, %ymm0, %xmm1
 ; AVX512VL-NEXT:    vpmaxub %xmm1, %xmm0, %xmm0
-; AVX512VL-NEXT:    vpternlogq $15, %xmm0, %xmm0, %xmm0
+; AVX512VL-NEXT:    vpternlogq {{.*#+}} xmm0 = ~xmm0
 ; AVX512VL-NEXT:    vpsrlw $8, %xmm0, %xmm1
 ; AVX512VL-NEXT:    vpminub %xmm1, %xmm0, %xmm0
 ; AVX512VL-NEXT:    vphminposuw %xmm0, %xmm0
@@ -2235,7 +2235,7 @@ define i8 @test_v128i8(<128 x i8> %a0) {
 ; AVX512BW-NEXT:    vpmaxub %ymm1, %ymm0, %ymm0
 ; AVX512BW-NEXT:    vextracti128 $1, %ymm0, %xmm1
 ; AVX512BW-NEXT:    vpmaxub %xmm1, %xmm0, %xmm0
-; AVX512BW-NEXT:    vpternlogq $15, %zmm0, %zmm0, %zmm0
+; AVX512BW-NEXT:    vpternlogq {{.*#+}} zmm0 = ~zmm0
 ; AVX512BW-NEXT:    vpsrlw $8, %xmm0, %xmm1
 ; AVX512BW-NEXT:    vpminub %xmm1, %xmm0, %xmm0
 ; AVX512BW-NEXT:    vphminposuw %xmm0, %xmm0
@@ -2252,7 +2252,7 @@ define i8 @test_v128i8(<128 x i8> %a0) {
 ; AVX512VL-NEXT:    vpmaxub %ymm1, %ymm0, %ymm0
 ; AVX512VL-NEXT:    vextracti128 $1, %ymm0, %xmm1
 ; AVX512VL-NEXT:    vpmaxub %xmm1, %xmm0, %xmm0
-; AVX512VL-NEXT:    vpternlogq $15, %xmm0, %xmm0, %xmm0
+; AVX512VL-NEXT:    vpternlogq {{.*#+}} xmm0 = ~xmm0
 ; AVX512VL-NEXT:    vpsrlw $8, %xmm0, %xmm1
 ; AVX512VL-NEXT:    vpminub %xmm1, %xmm0, %xmm0
 ; AVX512VL-NEXT:    vphminposuw %xmm0, %xmm0

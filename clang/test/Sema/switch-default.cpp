@@ -1,7 +1,5 @@
 // RUN: %clang_cc1 -fsyntax-only -verify -std=c++11 -Wswitch-default %s
 
-// XFAIL: *
-
 int f1(int a) {
   switch (a) {                // expected-warning {{'switch' missing 'default' label}}
     case 1: a++; break;

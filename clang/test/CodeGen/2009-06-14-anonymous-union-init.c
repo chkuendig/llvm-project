@@ -5,3 +5,4 @@ struct sysfs_dirent {
  unsigned short s_mode;
 };
 struct sysfs_dirent sysfs_root = { {}, 16877 };
+

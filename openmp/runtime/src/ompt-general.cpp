@@ -10,10 +10,11 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "kmp_utils.h"
+
 /*****************************************************************************
  * system include files
  ****************************************************************************/
-
 #include <assert.h>
 
 #include <stdint.h>
@@ -104,9 +105,11 @@ static ompt_start_tool_result_t *ompt_start_tool_result = NULL;
 
 #if KMP_OS_WINDOWS
 static HMODULE ompt_tool_module = NULL;
+static HMODULE ompt_archer_module = NULL;
 #define OMPT_DLCLOSE(Lib) FreeLibrary(Lib)
 #else
 static void *ompt_tool_module = NULL;
+static void *ompt_archer_module = NULL;
 #define OMPT_DLCLOSE(Lib) dlclose(Lib)
 #endif
 static ompt_start_tool_result_t *libomptarget_ompt_result = NULL;
@@ -372,6 +375,7 @@ ompt_try_start_tool(unsigned int omp_version, const char *runtime_version) {
               "Tool was started and is using the OMPT interface.\n");
           OMPT_VERBOSE_INIT_PRINT(
               "----- END LOGGING OF TOOL REGISTRATION -----\n");
+          ompt_archer_module = h;
           return ret;
         }
         OMPT_VERBOSE_INIT_CONTINUED_PRINT(
@@ -379,6 +383,7 @@ ompt_try_start_tool(unsigned int omp_version, const char *runtime_version) {
       } else {
         OMPT_VERBOSE_INIT_CONTINUED_PRINT("Failed: %s\n", dlerror());
       }
+      OMPT_DLCLOSE(h);
     }
   }
 #endif
@@ -491,6 +496,7 @@ void ompt_post_init() {
     kmp_info_t *root_thread = ompt_get_thread();
 
     ompt_set_thread_state(root_thread, ompt_state_overhead);
+    __ompt_task_init(root_thread->th.th_current_task, 0);
 
     if (ompt_enabled.ompt_callback_thread_begin) {
       ompt_callbacks.ompt_callback(ompt_callback_thread_begin)(
@@ -519,6 +525,8 @@ void ompt_fini() {
     }
   }
 
+  if (ompt_archer_module)
+    OMPT_DLCLOSE(ompt_archer_module);
   if (ompt_tool_module)
     OMPT_DLCLOSE(ompt_tool_module);
   memset(&ompt_enabled, 0, sizeof(ompt_enabled));
@@ -700,7 +708,7 @@ OMPT_API_ROUTINE int ompt_get_place_proc_ids(int place_num, int ids_size,
   return 0;
 #else
   int i, count;
-  int tmp_ids[ids_size];
+  SimpleVLA<int> tmp_ids(ids_size);
   for (int j = 0; j < ids_size; j++)
     tmp_ids[j] = 0;
   if (!KMP_AFFINITY_CAPABLE())

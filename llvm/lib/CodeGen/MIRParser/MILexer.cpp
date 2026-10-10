@@ -216,6 +216,8 @@ static MIToken::TokenKind getIdentifierKind(StringRef Identifier) {
       .Case("exact", MIToken::kw_exact)
       .Case("nneg", MIToken::kw_nneg)
       .Case("disjoint", MIToken::kw_disjoint)
+      .Case("samesign", MIToken::kw_samesign)
+      .Case("inbounds", MIToken::kw_inbounds)
       .Case("nofpexcept", MIToken::kw_nofpexcept)
       .Case("unpredictable", MIToken::kw_unpredictable)
       .Case("debug-location", MIToken::kw_debug_location)
@@ -243,6 +245,8 @@ static MIToken::TokenKind getIdentifierKind(StringRef Identifier) {
       .Case("llvm_vector_offset", MIToken::kw_cfi_llvm_vector_offset)
       .Case("llvm_vector_register_mask",
             MIToken::kw_cfi_llvm_vector_register_mask)
+      .Case("negate_ra_sign_state_with_pc",
+            MIToken::kw_cfi_aarch64_negate_ra_sign_state_with_pc)
       .Case("blockaddress", MIToken::kw_blockaddress)
       .Case("intrinsic", MIToken::kw_intrinsic)
       .Case("target-index", MIToken::kw_target_index)
@@ -618,6 +622,7 @@ static MIToken::TokenKind getMetadataKeywordKind(StringRef Identifier) {
       .Case("!range", MIToken::md_range)
       .Case("!DIExpression", MIToken::md_diexpr)
       .Case("!DILocation", MIToken::md_dilocation)
+      .Case("!noalias.addrspace", MIToken::md_noalias_addrspace)
       .Default(MIToken::Error);
 }
 
@@ -728,7 +733,7 @@ StringRef llvm::lexMIToken(StringRef Source, MIToken &Token,
     return C.remaining();
   }
 
-  C = skipMachineOperandComment(C);
+  C = skipWhitespace(skipMachineOperandComment(C));
 
   if (Cursor R = maybeLexMachineBasicBlock(C, Token, ErrorCallback))
     return R.remaining();

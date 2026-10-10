@@ -37,74 +37,38 @@ template <typename T>
 using remove_cvref_t // NOLINT(readability-identifier-naming)
     = typename llvm::remove_cvref<T>::type;
 
+// TODO: Remove this in favor of std::type_identity<T> once we switch to C++20.
 template <typename T>
 struct type_identity // NOLINT(readability-identifier-naming)
 {
   using type = T;
 };
 
-//===----------------------------------------------------------------------===//
-//     Features from C++17
-//===----------------------------------------------------------------------===//
-
+// TODO: Remove this in favor of std::type_identity_t<T> once we switch to
+// C++20.
 template <typename T>
-struct negation // NOLINT(readability-identifier-naming)
-    : std::integral_constant<bool, !bool(T::value)> {};
+using type_identity_t // NOLINT(readability-identifier-naming)
+    = typename llvm::type_identity<T>::type;
 
-template <typename...>
-struct conjunction // NOLINT(readability-identifier-naming)
-    : std::true_type {};
-template <typename B1> struct conjunction<B1> : B1 {};
-template <typename B1, typename... Bn>
-struct conjunction<B1, Bn...>
-    : std::conditional<bool(B1::value), conjunction<Bn...>, B1>::type {};
-
-template <typename...>
-struct disjunction // NOLINT(readability-identifier-naming)
-    : std::false_type {};
-template <typename B1> struct disjunction<B1> : B1 {};
-template <typename B1, typename... Bn>
-struct disjunction<B1, Bn...>
-    : std::conditional<bool(B1::value), B1, disjunction<Bn...>>::type {};
-
-struct in_place_t // NOLINT(readability-identifier-naming)
-{
-  explicit in_place_t() = default;
+namespace detail {
+template <class, template <class...> class Op, class... Args> struct detector {
+  using value_t = std::false_type;
 };
-/// \warning This must not be odr-used, as it cannot be made \c inline in C++14.
-constexpr in_place_t in_place; // NOLINT(readability-identifier-naming)
-
-template <typename T>
-struct in_place_type_t // NOLINT(readability-identifier-naming)
-{
-  explicit in_place_type_t() = default;
+template <template <class...> class Op, class... Args>
+struct detector<std::void_t<Op<Args...>>, Op, Args...> {
+  using value_t = std::true_type;
 };
-/// \warning This must not be odr-used, as it cannot be made \c inline in C++14.
-template <typename T>
-constexpr in_place_type_t<T>
-    in_place_type; // NOLINT(readability-identifier-naming)
+} // end namespace detail
 
-template <std::size_t I>
-struct in_place_index_t // NOLINT(readability-identifier-naming)
-{
-  explicit in_place_index_t() = default;
-};
-/// \warning This must not be odr-used, as it cannot be made \c inline in C++14.
-template <std::size_t I>
-constexpr in_place_index_t<I>
-    in_place_index; // NOLINT(readability-identifier-naming)
-
-/// Implementation of std::experimental::make_array. Should be deleted in favor
-/// of the C++17 deduction guide for std::array.
-template <typename ExplicitT = void, typename... ArgTs>
-static constexpr auto
-make_array(ArgTs &&...Args) // NOLINT(readability-identifier-naming)
-    -> std::array<typename std::conditional_t<std::is_same<ExplicitT, void>::value,
-                                              std::common_type<ArgTs...>,
-                                              type_identity<ExplicitT>>::type,
-                  sizeof...(ArgTs)> {
-  return {std::forward<ArgTs>(Args)...};
-}
+/// Detects if a given trait holds for some set of arguments 'Args'.
+/// For example, the given trait could be used to detect if a given type
+/// has a copy assignment operator:
+///   template<class T>
+///   using has_copy_assign_t = decltype(std::declval<T&>()
+///                                                 = std::declval<const T&>());
+///   bool fooHasCopyAssign = is_detected<has_copy_assign_t, FooClass>::value;
+template <template <class...> class Op, class... Args>
+using is_detected = typename detail::detector<void, Op, Args...>::value_t;
 
 //===----------------------------------------------------------------------===//
 //     Features from C++23
@@ -112,21 +76,13 @@ make_array(ArgTs &&...Args) // NOLINT(readability-identifier-naming)
 
 // TODO: Remove this in favor of std::optional<T>::transform once we switch to
 // C++23.
-template <typename T, typename Function>
-auto transformOptional(const std::optional<T> &O, const Function &F)
-    -> std::optional<decltype(F(*O))> {
-  if (O)
-    return F(*O);
-  return std::nullopt;
-}
-
-// TODO: Remove this in favor of std::optional<T>::transform once we switch to
-// C++23.
-template <typename T, typename Function>
-auto transformOptional(std::optional<T> &&O, const Function &F)
-    -> std::optional<decltype(F(*std::move(O)))> {
-  if (O)
-    return F(*std::move(O));
+template <typename Optional, typename Function,
+          typename Value = typename llvm::remove_cvref_t<Optional>::value_type>
+std::optional<std::invoke_result_t<Function, Value>>
+transformOptional(Optional &&O, Function &&F) {
+  if (O) {
+    return F(*std::forward<Optional>(O));
+  }
   return std::nullopt;
 }
 
@@ -137,6 +93,11 @@ template <typename Enum>
   return static_cast<std::underlying_type_t<Enum>>(E);
 }
 
+// A tag for constructors accepting ranges.
+struct from_range_t {
+  explicit from_range_t() = default;
+};
+inline constexpr from_range_t from_range{};
 } // namespace llvm
 
 #endif // LLVM_ADT_STLFORWARDCOMPAT_H

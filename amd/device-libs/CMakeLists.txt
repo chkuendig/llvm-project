@@ -7,14 +7,14 @@
 
 cmake_minimum_required(VERSION 3.13.4)
 
-project(ROCm-Device-Libs VERSION "1.0.0")
+project(rocm-device-libs VERSION "1.0.0")
 cmake_policy(SET CMP0011 NEW)
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   include(CMakePackageConfigHelpers)
   include(GNUInstallDirs)
 
-  find_package(ROCM)
+  find_package(ROCmCMakeBuildTools)
   if (ROCM_FOUND)
     include(ROCMSetupVersion)
     rocm_setup_version(VERSION "${PROJECT_VERSION}")
@@ -106,11 +106,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   set ( CPACK_PACKAGE_DESCRIPTION_SUMMARY "Radeon Open Compute - device libraries" )
   set ( CPACK_PACKAGE_DESCRIPTION "This package includes LLVM bitcode libraries." )
   set ( CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE.TXT" )
-  set ( CPACK_DEBIAN_PACKAGE_HOMEPAGE "https://github.com/RadeonOpenCompute/ROCm-Device-Libs" )
+  set ( CPACK_DEBIAN_PACKAGE_HOMEPAGE "https://github.com/ROCm/llvm-project/tree/amd-staging/amd/device-libs" )
 
   # Install License file
   install ( FILES "${CPACK_RESOURCE_FILE_LICENSE}"
-          DESTINATION ${CMAKE_INSTALL_DOCDIR})
+          DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/${CPACK_PACKAGE_NAME})
 
   set ( CPACK_GENERATOR "DEB;RPM" CACHE STRING "Default packaging generators." )
 

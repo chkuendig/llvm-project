@@ -5,6 +5,8 @@ include(GNUInstallDirs)
 
 option(CLANG_TIDY_ENABLE_STATIC_ANALYZER
   "Include static analyzer checks in clang-tidy" ON)
+option(CLANG_TIDY_ENABLE_QUERY_BASED_CUSTOM_CHECKS
+  "Enable query-based custom checks in clang-tidy" OFF)
 
 if(CLANG_INCLUDE_TESTS)
   umbrella_lit_testsuite_begin(check-clang-tools)
@@ -27,13 +29,7 @@ add_subdirectory(clang-move)
 add_subdirectory(clang-query)
 add_subdirectory(include-cleaner)
 add_subdirectory(pp-trace)
-add_subdirectory(pseudo)
 add_subdirectory(tool-template)
-
-option(CLANG_ENABLE_AMDCLANG "Enable amdclang" ON)
-if (CLANG_ENABLE_AMDCLANG)
-  add_subdirectory(amdllvm)
-endif()
 
 # Add the common testsuite after all the tools.
 if(CLANG_INCLUDE_TESTS)

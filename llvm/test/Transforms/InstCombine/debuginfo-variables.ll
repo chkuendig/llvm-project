@@ -1,8 +1,5 @@
 ; RUN: opt < %s -passes=debugify,instcombine -S | FileCheck %s
-; RUN: opt < %s -passes=debugify,instcombine -S --try-experimental-debuginfo-iterators | FileCheck %s
-
-; RUN: opt < %s -passes=debugify,instcombine --debugify-diop-diexprs --experimental-debuginfo-iterators=true  -S | FileCheck %s --check-prefix DIOP-DBGINFO
-; RUN: opt < %s -passes=debugify,instcombine --debugify-diop-diexprs --experimental-debuginfo-iterators=false -S | FileCheck %s --check-prefix DIOP-DBGINFO
+; RUN: opt < %s -passes=debugify,instcombine --debugify-diop-diexprs -S | FileCheck %s --check-prefix DIOP-DBGINFO
 
 declare void @escape32(i32)
 
@@ -64,9 +61,8 @@ define void @test_or(i64 %A) {
 ; CHECK-LABEL: @test_or(
 ; CHECK-NEXT:  #dbg_value(i64 %A, {{.*}}, !DIExpression(DW_OP_constu, 256, DW_OP_or, DW_OP_stack_value),
 
-; FIXME: No way to represent bitwise or in DIOp-DIExpressions.
 ; DIOP-DBGINFO-LABEL: @test_or(
-; DIOP-DBGINFO-NEXT:  #dbg_value(i64 poison, {{.*}}, !DIExpression(DIOpArg(0, i64)),
+; DIOP-DBGINFO-NEXT:  #dbg_value(i64 %A, {{.*}}, !DIExpression(DIOpArg(0, i64), DIOpConstant(i64 256), DIOpOr()),
   %1 = or i64 %A, 256
   ret void
 }
@@ -75,9 +71,8 @@ define void @test_xor(i32 %A) {
 ; CHECK-LABEL: @test_xor(
 ; CHECK-NEXT:  #dbg_value(i32 %A, {{.*}}, !DIExpression(DW_OP_constu, 1, DW_OP_xor, DW_OP_stack_value),
 
-; FIXME: No way to represent bitwise xor in DIOp-DIExpressions.
 ; DIOP-DBGINFO-LABEL: @test_xor(
-; DIOP-DBGINFO-NEXT:  #dbg_value(i32 poison, {{.*}}, !DIExpression(DIOpArg(0, i32)),
+; DIOP-DBGINFO-NEXT:  #dbg_value(i32 %A, {{.*}}, !DIExpression(DIOpArg(0, i32), DIOpConstant(i32 1), DIOpXor()),
   %1 = xor i32 %A, 1
   ret void
 }
@@ -156,9 +151,8 @@ define void @test_srem(i64 %A) {
 ; CHECK-LABEL: @test_srem(
 ; CHECK-NEXT:  #dbg_value(i64 %A, {{.*}}, !DIExpression(DW_OP_constu, 7, DW_OP_mod, DW_OP_stack_value),
 
-; FIXME: No way to represent srem in DIOp-DIExpressions.
 ; DIOP-DBGINFO-LABEL: @test_srem(
-; DIOP-DBGINFO-NEXT:  #dbg_value(i64 poison, {{.*}}, !DIExpression(DIOpArg(0, i64)),
+; DIOP-DBGINFO-NEXT:  #dbg_value(i64 %A, {{.*}}, !DIExpression(DIOpArg(0, i64), DIOpConstant(i64 7), DIOpMod()),
   %1 = srem i64 %A, 7
   ret void
 }
@@ -177,9 +171,8 @@ define void @test_and(i64 %A) {
 ; CHECK-LABEL: @test_and(
 ; CHECK-NEXT:  #dbg_value(i64 %A, {{.*}}, !DIExpression(DW_OP_constu, 256, DW_OP_and, DW_OP_stack_value),
 
-; FIXME: No way to represent bitwise and in DIOp-DIExpressions.
 ; DIOP-DBGINFO-LABEL: @test_and(
-; DIOP-DBGINFO-NEXT:  #dbg_value(i64 poison, {{.*}}, !DIExpression(DIOpArg(0, i64)),
+; DIOP-DBGINFO-NEXT:  #dbg_value(i64 %A, {{.*}}, !DIExpression(DIOpArg(0, i64), DIOpConstant(i64 256), DIOpAnd()),
   %1 = and i64 %A, 256
   ret void
 }
@@ -197,14 +190,14 @@ define void @test_gep(ptr %A) {
   ret void
 }
 
-define void @test_gep_var_offset(ptr %A, i64 %B, i64 %C) {
+define void @test_gep_var_offset(ptr %A, i64 %B, i8 %C) {
 ; CHECK-LABEL: @test_gep_var_offset(
-; CHECK-NEXT:  #dbg_value(!DIArgList(ptr %A, i64 %B, i64 %C), {{.*}}, !DIExpression(DW_OP_LLVM_arg, 0, DW_OP_LLVM_arg, 1, DW_OP_constu, 8, DW_OP_mul, DW_OP_plus, DW_OP_LLVM_arg, 2, DW_OP_constu, 2, DW_OP_mul, DW_OP_plus, DW_OP_plus_uconst, 88, DW_OP_stack_value),
+; CHECK-NEXT:  #dbg_value(!DIArgList(ptr %A, i64 %B, i8 %C), {{.*}}, !DIExpression(DW_OP_LLVM_arg, 0, DW_OP_LLVM_arg, 1, DW_OP_constu, 8, DW_OP_mul, DW_OP_plus, DW_OP_LLVM_arg, 2, DW_OP_constu, 2, DW_OP_mul, DW_OP_plus, DW_OP_plus_uconst, 88, DW_OP_stack_value),
 
 ; DIOP-DBGINFO-LABEL: @test_gep_var_offset(
-; DIOP-DBGINFO-NEXT:  #dbg_value(!DIArgList(ptr %A, i64 %B, i64 %C), {{.*}}, !DIExpression(DIOpArg(0, ptr), DIOpReinterpret(i64), DIOpArg(1, i64), DIOpConstant(i64 8), DIOpMul(), DIOpAdd(), DIOpArg(2, i64), DIOpConstant(i64 2), DIOpMul(), DIOpAdd(), DIOpConstant(i64 88), DIOpAdd(), DIOpReinterpret(ptr)),
+; DIOP-DBGINFO-NEXT:  #dbg_value(!DIArgList(ptr %A, i64 %B, i8 %C), {{.*}}, !DIExpression(DIOpArg(0, ptr), DIOpReinterpret(i64), DIOpArg(1, i64), DIOpConstant(i64 8), DIOpMul(), DIOpAdd(), DIOpArg(2, i8), DIOpSExt(i64), DIOpConstant(i64 2), DIOpMul(), DIOpAdd(), DIOpConstant(i64 88), DIOpAdd(), DIOpReinterpret(ptr)),
 
   ; This is the following expression in infix: i64(A) + B*8 + C*2 + 88
-  %1 = getelementptr %struct.S, ptr %A, i32 1, i32 1, i64 %B, i32 0, i64 %C
+  %1 = getelementptr %struct.S, ptr %A, i32 1, i32 1, i64 %B, i32 0, i8 %C
   ret void
 }

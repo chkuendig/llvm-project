@@ -1,3 +1,11 @@
+//===- demangle_test.c ----------------------------------------------------===//
+//
+// Part of Comgr, under the Apache License v2.0 with LLVM Exceptions. See
+// amd/comgr/LICENSE.TXT in this repository for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 #include "amd_comgr.h"
 #include "common.h"
 
@@ -21,8 +29,8 @@ int test(const char *MangledName, const char *ExpectedString) {
   checkError(Status, "amd_comgr_get_data");
 
   if (DemangledSize != strlen(ExpectedString)) {
-    fail(
-        "demangled_string size (%d) does not match expected_string size(%d)\n");
+    fail("DemangledSize (%zu) does not match ExpectedString size(%zu)\n",
+         DemangledSize, ExpectedString);
   }
 
   char *DemangledName = (char *)calloc(DemangledSize, sizeof(char));
