@@ -108,6 +108,23 @@ static llvm::cl::opt<bool> DisableStrictWWMOnLoads(
                    "divergent OOB-guarded loads from reading wild addresses)"),
     llvm::cl::init(true), llvm::cl::Hidden);
 
+// ZLUDA: keep strict-WWM marking block-local. A strict.wwm use marks the
+// definitions of its operands StrictWWM, and propagateInstruction repeats
+// that for their operands, so the whole producer chain is re-executed with all
+// lanes enabled. When a producer sits in another block that the current lanes
+// reached through divergent control flow (for example a min that is merged
+// only when two neighbours share a segment label), re-running it whole-wave
+// also executes it for lanes that branched around it and overwrites their
+// correct values (Batman:AK IOFX_bboxKernel segmented reduction produced
+// garbage actor bounds). Values defined in another block keep their natural
+// exec; inactive lanes then read the register contents they already hold.
+static llvm::cl::opt<bool> StrictWWMBlockLocal(
+    "amdgpu-wwm-strict-block-local",
+    llvm::cl::desc("Do not propagate strict-WWM to definitions in other "
+                   "basic blocks (prevents re-executing divergently guarded "
+                   "producers for lanes that skipped them)"),
+    llvm::cl::init(true), llvm::cl::Hidden);
+
 namespace {
 
 enum {
@@ -208,6 +225,8 @@ private:
 
   void markInstruction(MachineInstr &MI, char Flag,
                        std::vector<WorkItem> &Worklist);
+  void markDef(const MachineInstr &UseMI, MachineInstr &DefMI, char Flag,
+               std::vector<WorkItem> &Worklist);
   void markDefs(const MachineInstr &UseMI, LiveRange &LR, Register Reg,
                 unsigned SubReg, char Flag, std::vector<WorkItem> &Worklist);
   void markOperand(const MachineInstr &MI, const MachineOperand &Op, char Flag,
@@ -336,6 +355,20 @@ void SIWholeQuadMode::markInstruction(MachineInstr &MI, char Flag,
   Worklist.emplace_back(&MI);
 }
 
+/// Mark \p DefMI, which defines a value read by \p UseMI, with \p Flag.
+void SIWholeQuadMode::markDef(const MachineInstr &UseMI, MachineInstr &DefMI,
+                              char Flag, std::vector<WorkItem> &Worklist) {
+  if (StrictWWMBlockLocal && (Flag & StateStrictWWM) &&
+      DefMI.getParent() != UseMI.getParent()) {
+    LLVM_DEBUG(dbgs() << "Not propagating StrictWWM across blocks to "
+                      << DefMI);
+    Flag &= ~StateStrictWWM;
+    if (!Flag)
+      return;
+  }
+  markInstruction(DefMI, Flag, Worklist);
+}
+
 /// Mark all relevant definitions of register \p Reg in usage \p UseMI.
 void SIWholeQuadMode::markDefs(const MachineInstr &UseMI, LiveRange &LR,
                                Register Reg, unsigned SubReg, char Flag,
@@ -434,10 +467,10 @@ void SIWholeQuadMode::markDefs(const MachineInstr &UseMI, LiveRange &LR,
 
         // Only mark the instruction if it defines some part of the use
         if (HasDef)
-          markInstruction(*MI, Flag, Worklist);
+          markDef(UseMI, *MI, Flag, Worklist);
       } else {
         // For physical registers simply mark the defining instruction
-        markInstruction(*MI, Flag, Worklist);
+        markDef(UseMI, *MI, Flag, Worklist);
       }
     }
 
