@@ -5319,6 +5319,20 @@ bool AMDGPUInstructionSelector::selectScaleOffset(MachineOperand &Root,
   return ScaleOffset;
 }
 
+// SMEM loads do not form the exact byte sum of SBASE, SOFFSET and the
+// immediate offset: the low bits of the offsets below the access granularity
+// (a dword before GFX12) are dropped. Return the required alignment of each
+// offset part, as a power of two.
+static unsigned getSmrdOffsetAlignLog2(const GCNSubtarget &STI,
+                                       const MachineInstr &MI) {
+  if (!STI.hasScalarSubwordLoads())
+    return 2;
+  if (!MI.hasOneMemOperand())
+    return 0;
+  uint64_t Size = (*MI.memoperands_begin())->getSize().getValue();
+  return Size >= 4 ? 2 : Log2_64(Size);
+}
+
 bool AMDGPUInstructionSelector::selectSmrdOffset(MachineOperand &Root,
                                                  Register &Base,
                                                  Register *SOffset,
@@ -5341,6 +5355,15 @@ bool AMDGPUInstructionSelector::selectSmrdOffset(MachineOperand &Root,
   if (ScaleOffset)
     *ScaleOffset = false;
 
+  const unsigned AlignLog2 = getSmrdOffsetAlignLog2(STI, *MI);
+  if (!isAligned(Align(1ULL << AlignLog2), GEPI.Imm))
+    return false;
+  // A scaled SOFFSET is a multiple of the access size.
+  auto IsSOffsetAligned = [&](Register Reg) {
+    return (ScaleOffset && *ScaleOffset) ||
+           VT->getKnownBits(Reg).countMinTrailingZeros() >= AlignLog2;
+  };
+
   if (SOffset && Offset) {
     EncodedImm = AMDGPU::getSMRDEncodedOffset(STI, GEPI.Imm, /*IsBuffer=*/false,
                                               /*HasSOffset=*/true);
@@ -5353,7 +5376,7 @@ bool AMDGPUInstructionSelector::selectSmrdOffset(MachineOperand &Root,
           *ScaleOffset =
               selectScaleOffset(Root, OffsetReg, false /* IsSigned */);
         OffsetReg = matchZeroExtendFromS32OrS32(OffsetReg);
-        if (OffsetReg) {
+        if (OffsetReg && IsSOffsetAligned(OffsetReg)) {
           Base = GEPI2.SgprParts[0];
           *SOffset = OffsetReg;
           *Offset = *EncodedImm;
@@ -5402,7 +5425,7 @@ bool AMDGPUInstructionSelector::selectSmrdOffset(MachineOperand &Root,
     if (ScaleOffset)
       *ScaleOffset = selectScaleOffset(Root, OffsetReg, false /* IsSigned */);
     OffsetReg = matchZeroExtendFromS32OrS32(OffsetReg);
-    if (OffsetReg) {
+    if (OffsetReg && IsSOffsetAligned(OffsetReg)) {
       Base = GEPI.SgprParts[0];
       *SOffset = OffsetReg;
       return true;
