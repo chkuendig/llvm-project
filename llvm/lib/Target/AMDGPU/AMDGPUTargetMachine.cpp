@@ -596,8 +596,6 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeSILowerControlFlowLegacyPass(*PR);
   initializeSIPreEmitPeepholeLegacyPass(*PR);
   initializeSILateBranchLoweringLegacyPass(*PR);
-  // ZLUDA addition (2026-05-11): zero-VGPR prolog pass registration.
-  initializeAMDGPUZeroVGPRPrologPass(*PR);
   initializeSIMemoryLegalizerLegacyPass(*PR);
   initializeSIOptimizeExecMaskingLegacyPass(*PR);
   initializeSIPreAllocateWWMRegsLegacyPass(*PR);
@@ -1796,12 +1794,6 @@ void GCNPassConfig::addPreSched2() {
 }
 
 void GCNPassConfig::addPreEmitPass() {
-  // ZLUDA addition (2026-05-11): zero allocated VGPRs at kernel entry
-  // to eliminate cross-kernel VGPR residue. Runs FIRST in addPreEmitPass
-  // so the v_mov_b32 instructions are visible to all subsequent passes
-  // (memory legalizer, waitcnt, scheduler) for correct dependency
-  // analysis. Pass is a no-op for non-entry-function calling conventions.
-  addPass(createAMDGPUZeroVGPRPrologPass());
   if (isPassEnabled(EnableVOPD, CodeGenOptLevel::Less))
     addPass(&GCNCreateVOPDID);
   addPass(createSIMemoryLegalizerPass());
