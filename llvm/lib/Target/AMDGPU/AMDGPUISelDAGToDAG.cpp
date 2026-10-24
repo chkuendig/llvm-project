@@ -2327,6 +2327,20 @@ bool AMDGPUDAGToDAGISel::SelectScratchSVAddr(SDNode *N, SDValue Addr,
   return true;
 }
 
+// SMEM loads do not form the exact byte sum of SBASE, SOFFSET and the
+// immediate offset: the low bits of the offsets below the access granularity
+// (a dword before GFX12) are dropped. An aligned address must therefore not be
+// split into an SGPR or immediate offset whose low bits may be set. Return the
+// required alignment of each offset part, as a power of two. Without the load
+// node (immediate-only selection), assume a dword access.
+static unsigned getSMRDOffsetAlignLog2(const GCNSubtarget &ST,
+                                       const SDNode *N) {
+  if (!ST.hasScalarSubwordLoads() || !N)
+    return 2;
+  uint64_t Size = cast<MemSDNode>(N)->getMemoryVT().getStoreSize();
+  return Size >= 4 ? 2 : Log2_64(Size);
+}
+
 // For unbuffered smem loads, it is illegal for the Immediate Offset to be
 // negative if the resulting (Offset + (M0 or SOffset or zero) is negative.
 // Handle the case where the Immediate Offset + SOffset is negative.
@@ -2402,20 +2416,24 @@ bool AMDGPUDAGToDAGISel::SelectSMRDOffset(SDNode *N, SDValue ByteOffsetNode,
     if (!SOffset)
       return false;
 
+    SDValue SOff;
     if (ByteOffsetNode.getValueType().isScalarInteger() &&
-        ByteOffsetNode.getValueType().getSizeInBits() == 32) {
-      *SOffset = ByteOffsetNode;
-      return isSOffsetLegalWithImmOffset(SOffset, Imm32Only, IsBuffer,
-                                         ImmOffset);
-    }
-    if (ByteOffsetNode.getOpcode() == ISD::ZERO_EXTEND) {
-      if (ByteOffsetNode.getOperand(0).getValueType().getSizeInBits() == 32) {
-        *SOffset = ByteOffsetNode.getOperand(0);
-        return isSOffsetLegalWithImmOffset(SOffset, Imm32Only, IsBuffer,
-                                           ImmOffset);
-      }
-    }
-    return false;
+        ByteOffsetNode.getValueType().getSizeInBits() == 32)
+      SOff = ByteOffsetNode;
+    else if (ByteOffsetNode.getOpcode() == ISD::ZERO_EXTEND &&
+             ByteOffsetNode.getOperand(0).getValueType().getSizeInBits() == 32)
+      SOff = ByteOffsetNode.getOperand(0);
+    else
+      return false;
+
+    // A scaled SOFFSET is a multiple of the access size.
+    if (!IsBuffer && !(ScaleOffset && *ScaleOffset) &&
+        CurDAG->computeKnownBits(SOff).countMinTrailingZeros() <
+            getSMRDOffsetAlignLog2(*Subtarget, N))
+      return false;
+
+    *SOffset = SOff;
+    return isSOffsetLegalWithImmOffset(SOffset, Imm32Only, IsBuffer, ImmOffset);
   }
 
   SDLoc SL(ByteOffsetNode);
@@ -2423,6 +2441,10 @@ bool AMDGPUDAGToDAGISel::SelectSMRDOffset(SDNode *N, SDValue ByteOffsetNode,
   // GFX9 and GFX10 have signed byte immediate offsets. The immediate
   // offset for S_BUFFER instructions is unsigned.
   int64_t ByteOffset = IsBuffer ? C->getZExtValue() : C->getSExtValue();
+  if (!IsBuffer &&
+      !isAligned(Align(1ULL << getSMRDOffsetAlignLog2(*Subtarget, N)),
+                 ByteOffset))
+    return false;
   std::optional<int64_t> EncodedOffset = AMDGPU::getSMRDEncodedOffset(
       *Subtarget, ByteOffset, IsBuffer, HasSOffset);
   if (EncodedOffset && Offset && !Imm32Only) {
