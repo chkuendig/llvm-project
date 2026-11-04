@@ -439,6 +439,13 @@ ExprResult Sema::ActOnBuiltinBitCastExpr(SourceLocation KWLoc, Declarator &D,
 ExprResult Sema::BuildBuiltinBitCastExpr(SourceLocation KWLoc,
                                          TypeSourceInfo *TSI, Expr *Operand,
                                          SourceLocation RParenLoc) {
+  if (Operand->hasPlaceholderType()) {
+    ExprResult PR = CheckPlaceholderExpr(Operand);
+    if (PR.isInvalid())
+      return ExprError();
+    Operand = PR.get();
+  }
+
   CastOperation Op(*this, TSI->getType(), Operand);
   Op.OpRange = CastOperation::OpRangeType(KWLoc, KWLoc, RParenLoc);
   TypeLoc TL = TSI->getTypeLoc();
@@ -963,7 +970,7 @@ void CastOperation::CheckDynamicCast() {
   }
 
   // C++ 5.2.7p6: Otherwise, v shall be [polymorphic].
-  const RecordDecl *SrcDecl = SrcRecord->getOriginalDecl()->getDefinition();
+  const RecordDecl *SrcDecl = SrcRecord->getDecl()->getDefinition();
   assert(SrcDecl && "Definition missing");
   if (!cast<CXXRecordDecl>(SrcDecl)->isPolymorphic()) {
     Self.Diag(OpRange.getBegin(), diag::err_bad_dynamic_cast_not_polymorphic)
@@ -1454,7 +1461,7 @@ static TryCastResult TryStaticCast(Sema &Self, ExprResult &SrcExpr,
   // converted to an integral type. [...] A value of a scoped enumeration type
   // can also be explicitly converted to a floating-point type [...].
   if (const EnumType *Enum = dyn_cast<EnumType>(SrcType)) {
-    if (Enum->getOriginalDecl()->isScoped()) {
+    if (Enum->getDecl()->isScoped()) {
       if (DestType->isBooleanType()) {
         Kind = CK_IntegralToBoolean;
         return TC_Success;
@@ -1595,16 +1602,7 @@ static TryCastResult TryStaticCast(Sema &Self, ExprResult &SrcExpr,
 
   if (SrcType == Self.Context.AMDGPUFeaturePredicateTy &&
       DestType == Self.Context.getLogicalOperationType()) {
-    SrcExpr = Self.AMDGPU().ExpandAMDGPUPredicateBI(
-        dyn_cast<CallExpr>(SrcExpr.get()));
-    Kind = CK_NoOp;
-    return TC_Success;
-  }
-
-  if (SrcType == Self.Context.AMDGPUFeaturePredicateTy &&
-      DestType == Self.Context.getLogicalOperationType()) {
-    SrcExpr = Self.AMDGPU().ExpandAMDGPUPredicateBI(
-        dyn_cast<CallExpr>(SrcExpr.get()));
+    SrcExpr = Self.AMDGPU().ExpandAMDGPUPredicateBuiltIn(SrcExpr.get());
     Kind = CK_NoOp;
     return TC_Success;
   }
@@ -2944,6 +2942,8 @@ bool CastOperation::CheckHLSLCStyleCast(CheckedConversionKind CCK) {
       SrcExpr = Self.ImpCastExprToType(
           SrcExpr.get(), Self.Context.getArrayParameterType(SrcTy),
           CK_HLSLArrayRValue, VK_PRValue, nullptr, CCK);
+    else
+      SrcExpr = Self.DefaultLvalueConversion(SrcExpr.get());
     Kind = CK_HLSLElementwiseCast;
     return true;
   }
@@ -2952,11 +2952,18 @@ bool CastOperation::CheckHLSLCStyleCast(CheckedConversionKind CCK) {
   // If the relative order of this and the HLSLElementWise cast checks
   // are changed, it might change which cast handles what in a few cases
   if (Self.HLSL().CanPerformAggregateSplatCast(SrcExpr.get(), DestType)) {
+    SrcExpr = Self.DefaultLvalueConversion(SrcExpr.get());
     const VectorType *VT = SrcTy->getAs<VectorType>();
+    const ConstantMatrixType *MT = SrcTy->getAs<ConstantMatrixType>();
     // change splat from vec1 case to splat from scalar
     if (VT && VT->getNumElements() == 1)
       SrcExpr = Self.ImpCastExprToType(
           SrcExpr.get(), VT->getElementType(), CK_HLSLVectorTruncation,
+          SrcExpr.get()->getValueKind(), nullptr, CCK);
+    // change splat from 1x1 matrix case to splat from scalar
+    else if (MT && MT->getNumElementsFlattened() == 1)
+      SrcExpr = Self.ImpCastExprToType(
+          SrcExpr.get(), MT->getElementType(), CK_HLSLMatrixTruncation,
           SrcExpr.get()->getValueKind(), nullptr, CCK);
     // Inserting a scalar cast here allows for a simplified codegen in
     // the case the destTy is a vector
@@ -3122,7 +3129,7 @@ void CastOperation::CheckCStyleCast() {
       }
 
       // GCC's cast to union extension.
-      if (RecordDecl *RD = DestRecordTy->getOriginalDecl(); RD->isUnion()) {
+      if (RecordDecl *RD = DestRecordTy->getDecl(); RD->isUnion()) {
         if (CastExpr::getTargetFieldForToUnionCast(RD->getDefinitionOrSelf(),
                                                    SrcType)) {
           Self.Diag(OpRange.getBegin(), diag::ext_typecheck_cast_to_union)

@@ -21,6 +21,8 @@
 #include "Shared/Debug.h"
 #include "omp-tools.h"
 
+#include "GenericProfiler.h"
+
 #include "llvm/Support/ErrorHandling.h"
 
 #include <functional>
@@ -36,7 +38,6 @@
 /// target_task_data representing the target task region.
 typedef ompt_data_t *(*ompt_get_task_data_t)();
 typedef ompt_data_t *(*ompt_get_target_task_data_t)();
-typedef int (*ompt_set_frame_enter_t)(void *Address, int Flags, int State);
 
 namespace llvm {
 namespace omp {
@@ -47,7 +48,6 @@ namespace ompt {
 /// target_task_data.
 static ompt_get_task_data_t ompt_get_task_data_fn;
 static ompt_get_target_task_data_t ompt_get_target_task_data_fn;
-static ompt_set_frame_enter_t ompt_set_frame_enter_fn;
 
 /// OMPT global tracing status. Indicates if at least one device is traced.
 extern bool TracingActive;
@@ -140,6 +140,14 @@ public:
   /// Top-level function for invoking callback after target disassociate API
   void endTargetDisassociatePointer(int64_t DeviceId, void *HstPtrBegin,
                                     void *TgtPtrBegin, size_t Size, void *Code);
+
+  /// Top-level function for invoking callback before target memset API
+  void beginTargetMemset(int64_t DeviceId, void *HostPtrBegin,
+                         void *TgtPtrBegin, size_t Size, void *Code);
+
+  /// Top-level function for invoking callback after target memset API
+  void endTargetMemset(int64_t DeviceId, void *HostPtrBegin, void *TgtPtrBegin,
+                       size_t Size, void *Code);
 
   // Target kernel callbacks
 
@@ -259,6 +267,11 @@ public:
       return std::make_pair(
           std::mem_fn(&Interface::beginTargetDisassociatePointer),
           std::mem_fn(&Interface::endTargetDisassociatePointer));
+
+    if constexpr (OpType == ompt_target_data_memset ||
+                  OpType == ompt_target_data_memset_async)
+      return std::make_pair(std::mem_fn(&Interface::beginTargetMemset),
+                            std::mem_fn(&Interface::endTargetMemset));
 
     llvm_unreachable("Unhandled target data operation type!");
   }
@@ -473,16 +486,20 @@ template <typename FunctionPairTy, typename AsyncInfoTy, typename... ArgsTy>
 class TracerInterfaceRAII {
 public:
   TracerInterfaceRAII(FunctionPairTy Callbacks, AsyncInfoTy &AsyncInfo,
-                      void *OmptSpecificData, int TracedDeviceId,
+                      plugin::GenericProfilerTy *Prof, int TracedDeviceId,
                       ompt_callbacks_t EventType, ArgsTy... Args)
       : Arguments(Args...), beginFunction(std::get<0>(Callbacks)) {
     __tgt_async_info *AI = AsyncInfo;
     if (isTracingEnabled(TracedDeviceId, EventType)) {
       auto Record = begin();
 
-      // Access the already allocated profiler data and populate it
+      // The Profiler can allocate specific data to be used to pass information
+      // from here to lower parts of the runtime system.
+      // NOTE: It is the responsibility of the programmer to ensure type
+      // compatibility and correct usage of the data. The profiler, however,
+      // OWNS the pointer and frees it at an appropriate time.
       OmptEventInfoTy *ProfilerData =
-          reinterpret_cast<OmptEventInfoTy *>(OmptSpecificData);
+          reinterpret_cast<OmptEventInfoTy *>(Prof->getProfilerSpecificData());
       ProfilerData->TraceRecord = Record;
       ProfilerData->NumTeams = 0;
 

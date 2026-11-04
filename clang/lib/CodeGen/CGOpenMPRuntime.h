@@ -606,6 +606,9 @@ protected:
                           LValue PosLVal, const OMPTaskDataTy::DependData &Data,
                           Address DependenciesArray);
 
+  /// Keep track of VTable Declarations so we don't register duplicate VTable.
+  llvm::SmallDenseMap<CXXRecordDecl *, const VarDecl *> VTableDeclMap;
+
 public:
   explicit CGOpenMPRuntime(CodeGenModule &CGM);
   virtual ~CGOpenMPRuntime() {}
@@ -956,15 +959,7 @@ public:
     bool IVSigned = false;
     /// true if loop is ordered, false otherwise.
     bool Ordered = false;
-    /// true if kernel is multi-device
-    bool IsMultiDevice = false;
     Address IL = Address::invalid();
-    /// Address of the output variable in which the lower iteration number is
-    /// returned.
-    Address MultiDeviceLB = Address::invalid();
-    /// Address of the output variable in which the upper iteration number is
-    /// returned.
-    Address MultiDeviceUB = Address::invalid();
     /// Address of the output variable in which the lower iteration number is
     /// returned.
     Address LB = Address::invalid();
@@ -982,11 +977,6 @@ public:
                   llvm::Value *Chunk = nullptr)
         : IVSize(IVSize), IVSigned(IVSigned), Ordered(Ordered), IL(IL), LB(LB),
           UB(UB), ST(ST), Chunk(Chunk) {}
-    void setMultiDeviceLBUB(Address LB, Address UB) {
-      MultiDeviceLB = LB;
-      MultiDeviceUB = UB;
-      IsMultiDevice = true;
-    }
   };
   /// Call the appropriate runtime routine to initialize it before start
   /// of loop.
@@ -1017,8 +1007,7 @@ public:
   virtual void emitDistributeStaticInit(CodeGenFunction &CGF,
                                         SourceLocation Loc,
                                         OpenMPDistScheduleClauseKind SchedKind,
-                                        const StaticRTInput &Values,
-                                        bool IsMultiDeviceKernel);
+                                        const StaticRTInput &Values);
 
   /// Call the appropriate runtime routine to notify that we finished
   /// iteration of the ordered loop with the dynamic scheduling.
@@ -1064,13 +1053,9 @@ public:
   virtual llvm::Value *emitMessageClause(CodeGenFunction &CGF,
                                          const Expr *Message,
                                          SourceLocation Loc);
-  virtual llvm::Value *emitMessageClause(CodeGenFunction &CGF,
-                                         const OMPMessageClause *MessageClause);
 
   virtual llvm::Value *emitSeverityClause(OpenMPSeverityClauseKind Severity,
                                           SourceLocation Loc);
-  virtual llvm::Value *
-  emitSeverityClause(const OMPSeverityClause *SeverityClause);
 
   /// Emits call to void __kmpc_push_num_threads(ident_t *loc, kmp_int32
   /// global_tid, kmp_int32 num_threads) to generate code for 'num_threads'
@@ -1127,6 +1112,23 @@ public:
   /// \param PerformInit true if initialization expression is not constant.
   virtual void emitDeclareTargetFunction(const FunctionDecl *FD,
                                          llvm::GlobalValue *GV);
+
+  /// Register VTable to OpenMP offload entry.
+  /// \param VTable VTable of the C++ class.
+  /// \param RD C++ class decl.
+  virtual void registerVTableOffloadEntry(llvm::GlobalVariable *VTable,
+                                          const VarDecl *VD);
+  /// Emit code for registering vtable by scanning through map clause
+  /// in OpenMP target region.
+  /// \param D OpenMP target directive.
+  virtual void registerVTable(const OMPExecutableDirective &D);
+
+  /// Emit and register VTable for the C++ class in OpenMP offload entry.
+  /// \param CXXRecord C++ class decl.
+  /// \param VD Variable decl which holds VTable.
+  virtual void emitAndRegisterVTable(CodeGenModule &CGM,
+                                     CXXRecordDecl *CXXRecord,
+                                     const VarDecl *VD);
 
   /// Creates artificial threadprivate variable with name \p Name and type \p
   /// VarType.
@@ -1699,8 +1701,9 @@ public:
   /// Updates the dependency kind in the specified depobj object.
   /// \param DepobjLVal LValue for the main depobj object.
   /// \param NewDepKind New dependency kind.
-  void emitUpdateClause(CodeGenFunction &CGF, LValue DepobjLVal,
-                        OpenMPDependClauseKind NewDepKind, SourceLocation Loc);
+  void emitUpdateDependObjectsClause(CodeGenFunction &CGF, LValue DepobjLVal,
+                                     OpenMPDependClauseKind NewDepKind,
+                                     SourceLocation Loc);
 
   /// Initializes user defined allocators specified in the uses_allocators
   /// clauses.
@@ -1944,8 +1947,7 @@ public:
   ///
   void emitDistributeStaticInit(CodeGenFunction &CGF, SourceLocation Loc,
                                 OpenMPDistScheduleClauseKind SchedKind,
-                                const StaticRTInput &Values,
-                                bool IsMultiDeviceKernel) override;
+                                const StaticRTInput &Values) override;
 
   /// Call the appropriate runtime routine to notify that we finished
   /// iteration of the ordered loop with the dynamic scheduling.

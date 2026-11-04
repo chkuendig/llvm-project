@@ -37,6 +37,15 @@ func.func @bad_array_declare(%arg0: !fir.ref<!fir.array<?x?xf32>>) {
 }
 
 // -----
+func.func @bad_declare_skip_rebox(%arg0: !fir.ref<f32>) {
+  // expected-error@+1 {{'hlfir.declare' op skip_rebox attribute must only be set when the input is a box}}
+  %0:2 = hlfir.declare %arg0 skip_rebox {uniq_name = "x"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+  return
+}
+
+// -----
+
+// -----
 func.func @bad_assign_scalar_character(%arg0: !fir.boxchar<1>, %arg1: !fir.char<1,?>) {
   // expected-error@+1 {{'hlfir.assign' op operand #0 must be any Fortran value or variable type, but got '!fir.char<1,?>'}}
   hlfir.assign %arg1 to %arg0 : !fir.char<1,?>, !fir.boxchar<1>
@@ -1101,6 +1110,29 @@ func.func @bad_element_addr_4(%x: !fir.ref<!fir.array<20xf32>>, %y: !fir.ref<!fi
        %elt = hlfir.designate %y(%i, %j) : (!fir.ref<!fir.array<20x20xf32>>, index, index) -> !fir.ref<f32>
        hlfir.yield %elt : !fir.ref<f32>
     }
+  }
+  return
+}
+
+// -----
+func.func @bad_conditional_empty_then_region(%cond: i1, %v0: f32) {
+  // expected-error@+1 {{'hlfir.conditional' op region #0 ('then_region') failed to verify constraint: region with 1 blocks}}
+  %0 = hlfir.conditional %cond : (i1) -> !hlfir.expr<f32> {
+  } else {
+    hlfir.yield %v0 : f32
+  }
+  return
+}
+
+// -----
+func.func @bad_conditional_region_size(%cond: i1, %v0: f32, %v1: f32, %v2: f32) {
+  // expected-error@+1 {{'hlfir.conditional' op region #0 ('then_region') failed to verify constraint: region with 1 blocks}}
+  %0 = hlfir.conditional %cond : (i1) -> !hlfir.expr<f32> {
+    hlfir.yield %v0 : f32
+  ^bb1:
+    hlfir.yield %v1 : f32
+  } else {
+    hlfir.yield %v2 : f32
   }
   return
 }

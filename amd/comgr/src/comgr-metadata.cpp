@@ -28,8 +28,10 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/TargetParser/AMDGPUTargetParser.h"
 #include <cstddef>
 #include <iostream>
+#include <optional>
 
 using namespace llvm;
 using namespace llvm::object;
@@ -41,12 +43,9 @@ template <typename ELFT> using Elf_Note = typename ELFT::Note;
 
 namespace {
 Expected<std::unique_ptr<ELFObjectFileBase>>
-getELFObjectFileBase(DataObject *DataP) {
-  std::unique_ptr<MemoryBuffer> Buf =
-      MemoryBuffer::getMemBuffer(StringRef(DataP->Data, DataP->Size));
-
+getELFObjectFileBase(MemoryBufferRef MB) {
   Expected<std::unique_ptr<ObjectFile>> ObjOrErr =
-      ObjectFile::createELFObjectFile(*Buf);
+      ObjectFile::createELFObjectFile(MB);
 
   if (auto Err = ObjOrErr.takeError()) {
     return std::move(Err);
@@ -55,41 +54,52 @@ getELFObjectFileBase(DataObject *DataP) {
   return unique_dyn_cast<ELFObjectFileBase>(std::move(*ObjOrErr));
 }
 
+Expected<std::unique_ptr<ELFObjectFileBase>>
+getELFObjectFileBase(DataObject *DataP) {
+  return getELFObjectFileBase(
+      MemoryBufferRef(StringRef(DataP->Data, DataP->Size), ""));
+}
+
 // PAL currently produces MsgPack metadata in a note with this ID.
 // FIXME: Unify with HSA note types?
 #define PAL_METADATA_NOTE_TYPE 13
 
 // Try to merge "amdhsa.kernels" from DocNode @p From to @p To.
 // The merge is allowed only if
-// 1. "amdhsa.printf" record is not existing in either of the nodes.
-// 2. "amdhsa.version" exists and is same.
-// 3. "amdhsa.kernels" exists in both nodes.
+// 1. "amdhsa.version" exists and is same.
+// 2. "amdhsa.kernels" exists in both nodes.
+//
+// "amdhsa.printf" is copied from @p From if @p To doesn't have it.
+// If both have it, the merge is allowed only if they are identical
+// (as expected from LTO partitions sharing the same module-level
+// llvm.printf.fmts metadata).
 //
 // If merge is possible the function merges Kernel records
 // to @p To and returns @c true.
+// @p DestDoc is the document into which merged nodes are deep copied.
 bool mergeNoteRecords(llvm::msgpack::DocNode &From, llvm::msgpack::DocNode &To,
                       const StringRef VersionStrKey,
                       const StringRef PrintfStrKey,
-                      const StringRef KernelStrKey) {
+                      const StringRef KernelStrKey,
+                      llvm::msgpack::Document &DestDoc) {
   if (!From.isMap()) {
     return false;
   }
 
   if (To.isEmpty()) {
-    To = From;
+    To = DestDoc.copyNode(From);
     return true;
   }
 
   assert(To.isMap());
 
   if (From.getMap().find(PrintfStrKey) != From.getMap().end()) {
-    /* Check if both have Printf records */
     if (To.getMap().find(PrintfStrKey) != To.getMap().end()) {
-      return false;
+      if (From.getMap()[PrintfStrKey] != To.getMap()[PrintfStrKey])
+        return false;
+    } else {
+      To.getMap()[PrintfStrKey] = DestDoc.copyNode(From.getMap()[PrintfStrKey]);
     }
-
-    /* Add Printf record for 'To' */
-    To.getMap()[PrintfStrKey] = From.getMap()[PrintfStrKey];
   }
 
   auto &FromMapNode = From.getMap();
@@ -129,7 +139,7 @@ bool mergeNoteRecords(llvm::msgpack::DocNode &From, llvm::msgpack::DocNode &To,
 
   auto &ToKernelRecords = ToKernelArray->second.getArray();
   for (auto Kernel : FromKernelArray->second.getArray()) {
-    ToKernelRecords.push_back(Kernel);
+    ToKernelRecords.push_back(DestDoc.copyNode(Kernel));
   }
 
   return true;
@@ -166,31 +176,31 @@ bool processNote(const Elf_Note<ELFT> &Note, DataMeta *MetaP,
     MetaP->MetaDoc->EmitIntegerBooleans = true;
     MetaP->MetaDoc->RawDocumentList.push_back(std::string(DescString));
 
-    /* TODO add support for merge using readFromBlob merge function */
-    auto &Document = MetaP->MetaDoc->Document;
-
-    Document.clear();
-    if (!Document.readFromBlob(MetaP->MetaDoc->RawDocumentList.back(), false)) {
+    // Use a temporary document for parsing to avoid invalidating Root.
+    // DocNode contains pointers to memory owned by its Document, so reusing
+    // the same Document for parsing would invalidate nodes accumulated in Root.
+    llvm::msgpack::Document TempDoc;
+    if (!TempDoc.readFromBlob(MetaP->MetaDoc->RawDocumentList.back(), false)) {
       return false;
     }
 
-    return mergeNoteRecords(Document.getRoot(), Root, "amdhsa.version",
-                            "amdhsa.printf", "amdhsa.kernels");
+    return mergeNoteRecords(TempDoc.getRoot(), Root, "amdhsa.version",
+                            "amdhsa.printf", "amdhsa.kernels",
+                            MetaP->MetaDoc->Document);
   }
   return false;
 }
 
 template <class ELFT>
-amd_comgr_status_t getElfMetadataRoot(const ELFObjectFile<ELFT> *Obj,
-                                      DataMeta *MetaP) {
+llvm::Error getElfMetadataRoot(const ELFObjectFile<ELFT> *Obj,
+                               DataMeta *MetaP) {
   bool Found = false;
   llvm::msgpack::DocNode Root;
   const ELFFile<ELFT> &ELFFile = Obj->getELFFile();
 
   auto ProgramHeadersOrError = ELFFile.program_headers();
-  if (errorToBool(ProgramHeadersOrError.takeError())) {
-    return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
-  }
+  if (!ProgramHeadersOrError)
+    return ProgramHeadersOrError.takeError();
 
   for (const auto &Phdr : *ProgramHeadersOrError) {
     if (Phdr.p_type != ELF::PT_NOTE) {
@@ -203,21 +213,19 @@ amd_comgr_status_t getElfMetadataRoot(const ELFObjectFile<ELFT> *Obj,
       }
     }
 
-    if (errorToBool(std::move(Err))) {
-      return AMD_COMGR_STATUS_ERROR;
-    }
+    if (Err)
+      return Err;
   }
 
   if (Found) {
     MetaP->MetaDoc->Document.getRoot() = Root;
     MetaP->DocNode = MetaP->MetaDoc->Document.getRoot();
-    return AMD_COMGR_STATUS_SUCCESS;
+    return Error::success();
   }
 
   auto SectionsOrError = ELFFile.sections();
-  if (errorToBool(SectionsOrError.takeError())) {
-    return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
-  }
+  if (!SectionsOrError)
+    return SectionsOrError.takeError();
 
   for (const auto &Shdr : *SectionsOrError) {
     if (Shdr.sh_type != ELF::SHT_NOTE) {
@@ -230,28 +238,23 @@ amd_comgr_status_t getElfMetadataRoot(const ELFObjectFile<ELFT> *Obj,
       }
     }
 
-    if (errorToBool(std::move(Err))) {
-      return AMD_COMGR_STATUS_ERROR;
-    }
+    if (Err)
+      return Err;
   }
 
   if (Found) {
     MetaP->MetaDoc->Document.getRoot() = Root;
     MetaP->DocNode = MetaP->MetaDoc->Document.getRoot();
-    return AMD_COMGR_STATUS_SUCCESS;
+    return Error::success();
   }
 
-  return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
+  return createStringError(inconvertibleErrorCode(),
+                           "no AMDGPU metadata note found in code object");
 }
 } // namespace
 
-amd_comgr_status_t getMetadataRoot(DataObject *DataP, DataMeta *MetaP) {
-  auto ObjOrErr = getELFObjectFileBase(DataP);
-  if (errorToBool(ObjOrErr.takeError())) {
-    return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
-  }
-  auto *Obj = ObjOrErr->get();
-
+namespace {
+llvm::Error getMetadataRoot(ELFObjectFileBase *Obj, DataMeta *MetaP) {
   if (auto *ELF32LE = dyn_cast<ELF32LEObjectFile>(Obj)) {
     return getElfMetadataRoot(ELF32LE, MetaP);
   }
@@ -264,12 +267,31 @@ amd_comgr_status_t getMetadataRoot(DataObject *DataP, DataMeta *MetaP) {
   auto *ELF64BE = dyn_cast<ELF64BEObjectFile>(Obj);
   return getElfMetadataRoot(ELF64BE, MetaP);
 }
+} // namespace
+
+amd_comgr_status_t getMetadataRoot(DataObject *DataP, DataMeta *MetaP) {
+  auto ObjOrErr = getELFObjectFileBase(DataP);
+  if (errorToBool(ObjOrErr.takeError())) {
+    return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
+  }
+  // The internal walker preserves the underlying LLVM error; the DataObject
+  // boundary keeps the historical status-only contract, so map any failure
+  // (malformed input or an absent note) to a single invalid-argument status.
+  if (errorToBool(getMetadataRoot(ObjOrErr->get(), MetaP)))
+    return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
+  return AMD_COMGR_STATUS_SUCCESS;
+}
+
+llvm::Error getMetadataRoot(MemoryBufferRef MB, DataMeta *MetaP) {
+  auto ObjOrErr = getELFObjectFileBase(MB);
+  if (!ObjOrErr)
+    return ObjOrErr.takeError();
+  return getMetadataRoot(ObjOrErr->get(), MetaP);
+}
 
 struct IsaInfo {
   const char *IsaName;
   const char *Processor;
-  bool SrameccSupported;
-  bool XnackSupported;
   unsigned ElfMachine;
   bool TrapHandlerEnabled;
   bool ImageSupport;
@@ -278,24 +300,18 @@ struct IsaInfo {
   unsigned EUsPerCU;
   unsigned MaxWavesPerCU;
   unsigned MaxFlatWorkGroupSize;
-  unsigned SGPRAllocGranule;
-  unsigned TotalNumSGPRs;
-  unsigned AddressableNumSGPRs;
   unsigned VGPRAllocGranule;
   unsigned TotalNumVGPRs;
   // TODO: Update this to AvailableNumVGPRs to be more accurate
   unsigned AddressableNumVGPRs;
 } IsaInfos[] = {
-#define HANDLE_ISA(TARGET_TRIPLE, PROCESSOR, SRAMECC_SUPPORTED,                \
-                   XNACK_SUPPORTED, ELF_MACHINE, TRAP_HANDLER_ENABLED,         \
-                   IMAGE_SUPPORT, LDS_SIZE, LDS_BANK_COUNT, EUS_PER_CU,        \
-                   MAX_WAVES_PER_CU, MAX_FLAT_WORK_GROUP_SIZE,                 \
-                   SGPR_ALLOC_GRANULE, TOTAL_NUM_SGPRS, ADDRESSABLE_NUM_SGPRS, \
-                   VGPR_ALLOC_GRANULE, TOTAL_NUM_VGPRS, ADDRESSABLE_NUM_VGPRS) \
+#define HANDLE_ISA(TARGET_TRIPLE, PROCESSOR, ELF_MACHINE,                      \
+                   TRAP_HANDLER_ENABLED, IMAGE_SUPPORT, LDS_SIZE,              \
+                   LDS_BANK_COUNT, EUS_PER_CU, MAX_WAVES_PER_CU,               \
+                   MAX_FLAT_WORK_GROUP_SIZE, VGPR_ALLOC_GRANULE,               \
+                   TOTAL_NUM_VGPRS, ADDRESSABLE_NUM_VGPRS)                     \
   {TARGET_TRIPLE "-" PROCESSOR,                                                \
    PROCESSOR,                                                                  \
-   SRAMECC_SUPPORTED,                                                          \
-   XNACK_SUPPORTED,                                                            \
    ELF::ELF_MACHINE,                                                           \
    TRAP_HANDLER_ENABLED,                                                       \
    IMAGE_SUPPORT,                                                              \
@@ -304,9 +320,6 @@ struct IsaInfo {
    EUS_PER_CU,                                                                 \
    MAX_WAVES_PER_CU,                                                           \
    MAX_FLAT_WORK_GROUP_SIZE,                                                   \
-   SGPR_ALLOC_GRANULE,                                                         \
-   TOTAL_NUM_SGPRS,                                                            \
-   ADDRESSABLE_NUM_SGPRS,                                                      \
    VGPR_ALLOC_GRANULE,                                                         \
    TOTAL_NUM_VGPRS,                                                            \
    ADDRESSABLE_NUM_VGPRS},
@@ -325,8 +338,7 @@ typedef struct amdgpu_hsa_note_code_object_version_s {
 
 // NOLINTNEXTLINE(readability-identifier-naming)
 namespace {
-bool getMachInfo(unsigned Mach, std::string &Processor, bool &SrameccSupported,
-                 bool &XnackSupported) {
+bool getMachInfo(unsigned Mach, std::string &Processor) {
   auto *IsaIterator = std::find_if(
       std::begin(IsaInfos), std::end(IsaInfos),
       [Mach](const IsaInfo &IsaInfo) { return Mach == IsaInfo.ElfMachine; });
@@ -335,8 +347,6 @@ bool getMachInfo(unsigned Mach, std::string &Processor, bool &SrameccSupported,
   }
 
   Processor = IsaIterator->Processor;
-  SrameccSupported = IsaIterator->SrameccSupported;
-  XnackSupported = IsaIterator->XnackSupported;
   return true;
 }
 
@@ -361,9 +371,7 @@ amd_comgr_status_t getElfIsaNameFromElfHeader(const ELFObjectFile<ELFT> *Obj,
   ElfIsaName += "--";
 
   std::string Processor;
-  bool SrameccSupported, XnackSupported;
-  if (!getMachInfo(ElfHeader.e_flags & ELF::EF_AMDGPU_MACH, Processor,
-                   SrameccSupported, XnackSupported)) {
+  if (!getMachInfo(ElfHeader.e_flags & ELF::EF_AMDGPU_MACH, Processor)) {
     return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
   }
   ElfIsaName += Processor;
@@ -401,24 +409,56 @@ amd_comgr_status_t getElfIsaNameFromElfHeader(const ELFObjectFile<ELFT> *Obj,
 }
 } // namespace
 
-amd_comgr_status_t getElfIsaName(DataObject *DataP, std::string &IsaName) {
-  auto ObjOrErr = getELFObjectFileBase(DataP);
-  if (errorToBool(ObjOrErr.takeError())) {
-    return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
-  }
-  auto *Obj = ObjOrErr->get();
+Expected<std::string> getElfIsaName(MemoryBufferRef MB) {
+  auto ObjOrErr = getELFObjectFileBase(MB);
+  if (!ObjOrErr)
+    return ObjOrErr.takeError();
 
-  if (auto *ELF64LE = dyn_cast<ELF64LEObjectFile>(Obj))
-    return getElfIsaNameFromElfHeader(ELF64LE, IsaName);
-  else
-    return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
+  auto *ELF64LE = dyn_cast<ELF64LEObjectFile>(ObjOrErr->get());
+  if (!ELF64LE)
+    return createStringError(inconvertibleErrorCode(),
+                             "code object is not a 64-bit little-endian ELF");
+
+  std::string IsaName;
+  if (getElfIsaNameFromElfHeader(ELF64LE, IsaName) != AMD_COMGR_STATUS_SUCCESS)
+    return createStringError(inconvertibleErrorCode(),
+                             "failed to derive ISA name from ELF header");
+  return IsaName;
 }
 
-amd_comgr_status_t getIsaIndex(StringRef IsaString, size_t &Index) {
-  auto IsaName = IsaString.take_until([](char C) { return C == ':'; });
+amd_comgr_status_t getElfIsaName(DataObject *DataP, std::string &IsaName) {
+  auto IsaOrErr =
+      getElfIsaName(MemoryBufferRef(StringRef(DataP->Data, DataP->Size), ""));
+  if (!IsaOrErr) {
+    consumeError(IsaOrErr.takeError());
+    return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
+  }
+  IsaName = std::move(*IsaOrErr);
+  return AMD_COMGR_STATUS_SUCCESS;
+}
+
+amd_comgr_status_t getIsaIndex(StringRef TargetIDString, size_t &Index,
+                               StringRef *Processor) {
+  // Validate the target ID and resolve the processor (derived from the subarch
+  // when the name omits it).
+  std::optional<AMDGPU::TargetID> TID =
+      AMDGPU::TargetID::parseTargetIDString(TargetIDString);
+  if (!TID || TID->getGPUKind() == AMDGPU::GK_NONE) {
+    return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
+  }
+
+  StringRef CanonicalProcessor = AMDGPU::getArchNameAMDGCN(TID->getGPUKind());
+  if (Processor) {
+    *Processor = CanonicalProcessor;
+  }
+
+  // Match by processor only; TargetID already validated the rest of the triple,
+  // so the vendor/os/environ are not checked against the table (which stores an
+  // empty environment).
   auto *IsaIterator = std::find_if(
-      std::begin(IsaInfos), std::end(IsaInfos),
-      [&](const IsaInfo &IsaInfo) { return IsaName == IsaInfo.IsaName; });
+      std::begin(IsaInfos), std::end(IsaInfos), [&](const IsaInfo &IsaInfo) {
+        return CanonicalProcessor == IsaInfo.Processor;
+      });
   if (IsaIterator == std::end(IsaInfos)) {
     return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
   }
@@ -433,10 +473,13 @@ bool isSupportedFeature(size_t IsaIndex, StringRef Feature) {
     return false;
   }
 
+  unsigned ArchAttr = AMDGPU::getArchAttrAMDGCN(
+      AMDGPU::parseArchAMDGCN(IsaInfos[IsaIndex].Processor));
+
   return (Feature.drop_back() == "xnack" &&
-          IsaInfos[IsaIndex].XnackSupported) ||
+          (ArchAttr & AMDGPU::FEATURE_XNACK_ON_OFF_MODES)) ||
          (Feature.drop_back() == "sramecc" &&
-          IsaInfos[IsaIndex].SrameccSupported);
+          (ArchAttr & AMDGPU::FEATURE_SRAMECC));
 }
 
 const char *getIsaName(size_t Index) { return IsaInfos[Index].IsaName; }
@@ -467,11 +510,14 @@ amd_comgr_status_t getIsaMetadata(StringRef IsaName,
   Root["Processor"] = Doc.getNode(Ident.Processor, /*Copy=*/true);
   Root["Version"] = Doc.getNode("1.0.0", /*Copy=*/true);
 
+  AMDGPU::GPUKind Kind = AMDGPU::parseArchAMDGCN(IsaInfos[IsaIndex].Processor);
+  unsigned ArchAttr = AMDGPU::getArchAttrAMDGCN(Kind);
+
   auto FeaturesNode = Doc.getMapNode();
-  if (IsaInfos[IsaIndex].XnackSupported) {
+  if (ArchAttr & AMDGPU::FEATURE_XNACK_ON_OFF_MODES) {
     FeaturesNode["xnack"] = Doc.getNode("any", /*Copy=*/true);
   }
-  if (IsaInfos[IsaIndex].SrameccSupported) {
+  if (ArchAttr & AMDGPU::FEATURE_SRAMECC) {
     FeaturesNode["sramecc"] = Doc.getNode("any", /*Copy=*/true);
   }
 
@@ -508,11 +554,12 @@ amd_comgr_status_t getIsaMetadata(StringRef IsaName,
   Root["MaxFlatWorkGroupSize"] =
       Doc.getNode(std::to_string(Info.MaxFlatWorkGroupSize), /*Copy=*/true);
   Root["SGPRAllocGranule"] =
-      Doc.getNode(std::to_string(Info.SGPRAllocGranule), /*Copy=*/true);
-  Root["TotalNumSGPRs"] =
-      Doc.getNode(std::to_string(Info.TotalNumSGPRs), /*Copy=*/true);
-  Root["AddressableNumSGPRs"] =
-      Doc.getNode(std::to_string(Info.AddressableNumSGPRs), /*Copy=*/true);
+      Doc.getNode(std::to_string(AMDGPU::getSGPRAllocGranule(Kind)),
+                  /*Copy=*/true);
+  Root["TotalNumSGPRs"] = Doc.getNode(
+      std::to_string(AMDGPU::getTotalNumSGPRs(Kind)), /*Copy=*/true);
+  Root["AddressableNumSGPRs"] = Doc.getNode(
+      std::to_string(AMDGPU::getAddressableNumSGPRs(Kind)), /*Copy=*/true);
   Root["VGPRAllocGranule"] =
       Doc.getNode(std::to_string(Info.VGPRAllocGranule), /*Copy=*/true);
   Root["TotalNumVGPRs"] =
@@ -651,7 +698,7 @@ amd_comgr_status_t lookUpCodeObject(DataObject *DataP,
     return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
   }
 
-  uint64_t NumOfCodeObjects;
+  uint64_t NumOfCodeObjects = 0;
   if (auto EC = Reader.readInteger(NumOfCodeObjects)) {
     return AMD_COMGR_STATUS_ERROR;
   }
@@ -664,9 +711,9 @@ amd_comgr_status_t lookUpCodeObject(DataObject *DataP,
   // For each code object, extract BundleEntryID information, and check that
   // against each ISA in the QueryList
   for (uint64_t I = 0; I < NumOfCodeObjects; I++) {
-    uint64_t BundleEntryCodeObjectSize;
-    uint64_t BundleEntryCodeObjectOffset;
-    uint64_t BundleEntryIDSize;
+    uint64_t BundleEntryCodeObjectSize = 0;
+    uint64_t BundleEntryCodeObjectOffset = 0;
+    uint64_t BundleEntryIDSize = 0;
     StringRef BundleEntryID;
 
     if (auto EC = Reader.readInteger(BundleEntryCodeObjectOffset)) {
@@ -684,6 +731,8 @@ amd_comgr_status_t lookUpCodeObject(DataObject *DataP,
     if (Reader.readFixedString(BundleEntryID, BundleEntryIDSize)) {
       return AMD_COMGR_STATUS_ERROR;
     }
+    // The encoded size may include a null terminator; strip it.
+    BundleEntryID = BundleEntryID.rtrim('\0');
 
     const auto OffloadAndTargetId = BundleEntryID.split('-');
     if (OffloadAndTargetId.first != OffloadKindHip &&
@@ -721,4 +770,47 @@ amd_comgr_status_t lookUpCodeObject(DataObject *DataP,
 }
 
 } // namespace metadata
+
+amd_comgr_status_t parseTargetIdentifier(StringRef IdentStr,
+                                         TargetIdentifier &Ident) {
+  SmallVector<StringRef, 5> IsaNameComponents;
+  IdentStr.split(IsaNameComponents, '-', 4);
+  if (IsaNameComponents.size() != 5) {
+    return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
+  }
+
+  Ident.Arch = IsaNameComponents[0];
+  Ident.Vendor = IsaNameComponents[1];
+  Ident.OS = IsaNameComponents[2];
+  Ident.Environ = IsaNameComponents[3];
+
+  Ident.Features.clear();
+  IsaNameComponents[4].split(Ident.Features, ':');
+
+  Ident.Processor = Ident.Features[0];
+  Ident.Features.erase(Ident.Features.begin());
+
+  if (IdentStr == "spirv64-amd-amdhsa--amdgcnspirv" ||
+      IdentStr == "spirv64-amd-amdhsa-unknown-amdgcnspirv") {
+    // Features not supported for SPIR-V
+    if (!Ident.Features.empty())
+      return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
+    return AMD_COMGR_STATUS_SUCCESS;
+  }
+
+  size_t IsaIndex;
+  amd_comgr_status_t Status = metadata::getIsaIndex(IdentStr, IsaIndex);
+  if (Status != AMD_COMGR_STATUS_SUCCESS) {
+    return Status;
+  }
+
+  for (auto Feature : Ident.Features) {
+    if (!metadata::isSupportedFeature(IsaIndex, Feature)) {
+      return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
+    }
+  }
+
+  return AMD_COMGR_STATUS_SUCCESS;
+}
+
 } // namespace COMGR

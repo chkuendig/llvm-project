@@ -9,62 +9,30 @@
 #ifndef FORTRAN_SUPPORT_OPENMP_UTILS_H_
 #define FORTRAN_SUPPORT_OPENMP_UTILS_H_
 
-#include "flang/Optimizer/Builder/DirectivesCommon.h"
-#include "flang/Optimizer/Builder/FIRBuilder.h"
-#include "flang/Optimizer/Builder/HLFIRTools.h"
-#include "flang/Optimizer/Dialect/FIRType.h"
-#include "flang/Semantics/symbol.h"
-
-#include "mlir/Dialect/OpenMP/OpenMPDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Value.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLExtras.h"
 
 namespace Fortran::common::openmp {
 /// Structure holding the information needed to create and bind entry block
-/// arguments associated to a single clause.
-struct EntryBlockArgsEntry {
-  llvm::ArrayRef<const Fortran::semantics::Symbol *> syms;
-  llvm::ArrayRef<mlir::Value> vars;
-
-  bool isValid() const {
-    // This check allows specifying a smaller number of symbols than values
-    // because in some case cases a single symbol generates multiple block
-    // arguments.
-    return syms.size() <= vars.size();
-  }
-};
-
-/// Structure holding the information needed to create and bind entry block
 /// arguments associated to all clauses that can define them.
 struct EntryBlockArgs {
-  EntryBlockArgsEntry hasDeviceAddr;
+  llvm::ArrayRef<mlir::Value> hasDeviceAddrVars;
   llvm::ArrayRef<mlir::Value> hostEvalVars;
-  EntryBlockArgsEntry inReduction;
-  EntryBlockArgsEntry map;
-  EntryBlockArgsEntry priv;
-  EntryBlockArgsEntry reduction;
-  EntryBlockArgsEntry taskReduction;
-  EntryBlockArgsEntry useDeviceAddr;
-  EntryBlockArgsEntry useDevicePtr;
-
-  bool isValid() const {
-    return hasDeviceAddr.isValid() && inReduction.isValid() && map.isValid() &&
-        priv.isValid() && reduction.isValid() && taskReduction.isValid() &&
-        useDeviceAddr.isValid() && useDevicePtr.isValid();
-  }
-
-  auto getSyms() const {
-    return llvm::concat<const semantics::Symbol *const>(hasDeviceAddr.syms,
-        inReduction.syms, map.syms, priv.syms, reduction.syms,
-        taskReduction.syms, useDeviceAddr.syms, useDevicePtr.syms);
-  }
+  llvm::ArrayRef<mlir::Value> inReductionVars;
+  llvm::ArrayRef<mlir::Value> mapVars;
+  llvm::ArrayRef<mlir::Value> privVars;
+  llvm::ArrayRef<mlir::Value> reductionVars;
+  llvm::ArrayRef<mlir::Value> taskReductionVars;
+  llvm::ArrayRef<mlir::Value> useDeviceAddrVars;
+  llvm::ArrayRef<mlir::Value> useDevicePtrVars;
 
   auto getVars() const {
-    return llvm::concat<const mlir::Value>(hasDeviceAddr.vars, hostEvalVars,
-        inReduction.vars, map.vars, priv.vars, reduction.vars,
-        taskReduction.vars, useDeviceAddr.vars, useDevicePtr.vars);
+    return llvm::concat<const mlir::Value>(hasDeviceAddrVars, hostEvalVars,
+        inReductionVars, mapVars, privVars, reductionVars, taskReductionVars,
+        useDeviceAddrVars, useDevicePtrVars);
   }
 };
 
@@ -77,35 +45,6 @@ struct EntryBlockArgs {
 /// \param [in]  region - Empty region in which to create the entry block.
 mlir::Block *genEntryBlock(
     mlir::OpBuilder &builder, const EntryBlockArgs &args, mlir::Region &region);
-
-// Returns true if the variable has a dynamic size and therefore requires
-// bounds operations to describe its extents.
-inline bool needsBoundsOps(mlir::Value var) {
-  assert(mlir::isa<mlir::omp::PointerLikeType>(var.getType()) &&
-      "only pointer like types expected");
-  mlir::Type t = fir::unwrapRefType(var.getType());
-  if (mlir::Type inner = fir::dyn_cast_ptrOrBoxEleTy(t))
-    return fir::hasDynamicSize(inner);
-  return fir::hasDynamicSize(t);
-}
-
-// Generate MapBoundsOp operations for the variable if required.
-inline void genBoundsOps(fir::FirOpBuilder &builder, mlir::Value var,
-    llvm::SmallVectorImpl<mlir::Value> &boundsOps) {
-  mlir::Location loc = var.getLoc();
-  fir::factory::AddrAndBoundsInfo info =
-      fir::factory::getDataOperandBaseAddr(builder, var,
-          /*isOptional=*/false, loc);
-  fir::ExtendedValue exv =
-      hlfir::translateToExtendedValue(loc, builder, hlfir::Entity{info.addr},
-          /*contiguousHint=*/true)
-          .first;
-  llvm::SmallVector<mlir::Value> tmp =
-      fir::factory::genImplicitBoundsOps<mlir::omp::MapBoundsOp,
-          mlir::omp::MapBoundsType>(
-          builder, info, exv, /*dataExvIsAssumedSize=*/false, loc);
-  llvm::append_range(boundsOps, tmp);
-}
 } // namespace Fortran::common::openmp
 
 #endif // FORTRAN_SUPPORT_OPENMP_UTILS_H_

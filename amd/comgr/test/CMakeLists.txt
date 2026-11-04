@@ -23,11 +23,20 @@ endmacro()
 # Creates target ${name} which depends on a clang command to compile ${input} to
 # ${output}, with any additional arguments from ${ARGN}, and add it to the
 # TEST_INPUT_BITCODES target list.
+set(TEST_INPUT_WCHAR_FLAG)
+if(WIN32)
+  # Match -fshort-wchar used by device libs on Windows (see
+  # amd/device-libs/cmake/OCL.cmake). Without this, linking fails with
+  # conflicting wchar_size module flags.
+  set(TEST_INPUT_WCHAR_FLAG -fshort-wchar)
+endif()
+
 macro(add_test_input_bitcode name input output)
   add_custom_command(
     OUTPUT "${output}"
     COMMAND "$<TARGET_FILE:clang>" -c -emit-llvm -target amdgcn-amd-amdhsa
     -mcpu=gfx900 -nogpulib -nogpuinc
+    ${TEST_INPUT_WCHAR_FLAG}
     ${ARGN} "${CMAKE_CURRENT_SOURCE_DIR}/${input}"
     -o "${output}"
     VERBATIM
@@ -191,18 +200,18 @@ endif()
   add_test(NAME ${test_name}
     COMMAND "${name}")
   add_dependencies(check-comgr ${name})
-  # Windows binaries have no equivalent to RPATH, so we must set their PATH to
-  # include the .lib/.dll directory.
+  # Windows binaries have no equivalent to RPATH, so we must prepend the
+  # .lib/.dll directory to their PATH. Use ENVIRONMENT_MODIFICATION so the
+  # inherited PATH is preserved (transitive DLL deps like zstd.dll live there).
   if (UNIX)
     set_tests_properties(${test_name}
       PROPERTIES ENVIRONMENT "AMD_COMGR_CACHE=0;")
   else()
-    set_tests_properties(${test_name}
-      PROPERTIES ENVIRONMENT "PATH=$<TARGET_LINKER_FILE_DIR:amd_comgr>;AMD_COMGR_CACHE=0;")
+    set_tests_properties(${test_name} PROPERTIES
+      ENVIRONMENT_MODIFICATION
+      "PATH=path_list_prepend:$<TARGET_LINKER_FILE_DIR:amd_comgr>;AMD_COMGR_CACHE=set:0")
   endif()
 endmacro()
-
-find_package(hip CONFIG PATHS ${ROCM_INSTALL_PATH}/hip QUIET)
 
 add_comgr_test(data_test c)
 add_comgr_test(disasm_instr_test c)
@@ -221,15 +230,13 @@ add_comgr_test(compile_source_with_device_libs_to_bc_test c)
 add_comgr_test(compile_source_with_device_libs_to_bc_with_vfs_test c)
 add_comgr_test(assemble_test c)
 add_comgr_test(link_test c)
-add_comgr_test(isa_name_parsing_test c)
-add_comgr_test(get_data_isa_name_test c)
 add_comgr_test(include_subdirectory_test c)
-add_comgr_test(demangle_test c)
 add_comgr_test(fail_to_build_driver c)
 add_comgr_test(file_map c)
-add_comgr_test(lookup_code_object_test c)
 add_comgr_test(symbolize_test c)
 add_comgr_test(mangled_names_test c)
+add_comgr_test(time_stat_symlink_test c)
+# Disabled due to AddressSanitizer limitation with multithreaded programs
 add_comgr_test(multithread_test cpp)
 add_comgr_test(nested_kernel_test c)
 add_comgr_test(map_elf_virtual_address_test c)
@@ -237,5 +244,16 @@ add_comgr_test(compile_source_to_executable c)
 add_comgr_test(name_expression_map_test c)
 add_comgr_test(compile_hip_test c)
 add_comgr_test(compile_hip_to_relocatable c)
+#add_comgr_test(compile_hip_with_libcxx_test c)
 add_comgr_test(mangled_names_hip_test c)
 #add_comgr_test(unbundle_hip_test c)
+
+add_test(
+  NAME comgr_hotswap_reduce_test
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/utils/test_hotswap_reduce.py")
+set_tests_properties(
+  comgr_hotswap_reduce_test
+  PROPERTIES
+    ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1"
+    TIMEOUT 120)

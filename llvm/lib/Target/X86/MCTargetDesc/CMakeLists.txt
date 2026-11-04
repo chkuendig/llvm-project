@@ -9,6 +9,7 @@ add_llvm_component_library(LLVMX86Desc
   X86MCTargetDesc.cpp
   X86MCAsmInfo.cpp
   X86MCCodeEmitter.cpp
+  X86MCLFIRewriter.cpp
   X86MachObjectWriter.cpp
   X86MnemonicTables.cpp
   X86ELFObjectWriter.cpp
@@ -28,4 +29,3 @@ add_llvm_component_library(LLVMX86Desc
   ADD_TO_COMPONENT
   X86
   )
-set_source_files_properties(X86MCCodeEmitter.cpp PROPERTIES COMPILE_FLAGS "-O2")

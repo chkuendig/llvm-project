@@ -226,7 +226,7 @@ static kmp_depnode_list_t *__kmp_add_node(kmp_info_t *thread,
 static inline void __kmp_track_dependence(kmp_int32 gtid, kmp_depnode_t *source,
                                           kmp_depnode_t *sink,
                                           kmp_task_t *sink_task) {
-#if OMPX_TASKGRAPH
+#if OMP_TASKGRAPH_EXPERIMENTAL
   kmp_taskdata_t *task_source = KMP_TASK_TO_TASKDATA(source->dn.task);
   kmp_taskdata_t *task_sink = KMP_TASK_TO_TASKDATA(sink_task);
   if (source->dn.task && sink_task) {
@@ -315,7 +315,7 @@ __kmp_depnode_link_successor(kmp_int32 gtid, kmp_info_t *thread,
   // link node as successor of list elements
   for (kmp_depnode_list_t *p = plist; p; p = p->next) {
     kmp_depnode_t *dep = p->node;
-#if OMPX_TASKGRAPH
+#if OMP_TASKGRAPH_EXPERIMENTAL
     kmp_tdg_status tdg_status = KMP_TDG_NONE;
     if (task) {
       kmp_taskdata_t *td = KMP_TASK_TO_TASKDATA(task);
@@ -329,7 +329,7 @@ __kmp_depnode_link_successor(kmp_int32 gtid, kmp_info_t *thread,
       KMP_ACQUIRE_DEPNODE(gtid, dep);
       if (dep->dn.task) {
         if (!dep->dn.successors || dep->dn.successors->node != node) {
-#if OMPX_TASKGRAPH
+#if OMP_TASKGRAPH_EXPERIMENTAL
           if (!(__kmp_tdg_is_recording(tdg_status)) && task)
 #endif
             __kmp_track_dependence(gtid, dep, node, task);
@@ -356,7 +356,7 @@ static inline kmp_int32 __kmp_depnode_link_successor(kmp_int32 gtid,
   if (!sink)
     return 0;
   kmp_int32 npredecessors = 0;
-#if OMPX_TASKGRAPH
+#if OMP_TASKGRAPH_EXPERIMENTAL
   kmp_tdg_status tdg_status = KMP_TDG_NONE;
   kmp_taskdata_t *td = KMP_TASK_TO_TASKDATA(task);
   if (task) {
@@ -371,7 +371,7 @@ static inline kmp_int32 __kmp_depnode_link_successor(kmp_int32 gtid,
     KMP_ACQUIRE_DEPNODE(gtid, sink);
     if (sink->dn.task) {
       if (!sink->dn.successors || sink->dn.successors->node != source) {
-#if OMPX_TASKGRAPH
+#if OMP_TASKGRAPH_EXPERIMENTAL
         if (!(__kmp_tdg_is_recording(tdg_status)) && task)
 #endif
           __kmp_track_dependence(gtid, sink, source, task);
@@ -380,7 +380,7 @@ static inline kmp_int32 __kmp_depnode_link_successor(kmp_int32 gtid,
                     "%p\n",
                     gtid, KMP_TASK_TO_TASKDATA(sink->dn.task),
                     KMP_TASK_TO_TASKDATA(task)));
-#if OMPX_TASKGRAPH
+#if OMP_TASKGRAPH_EXPERIMENTAL
         if (__kmp_tdg_is_recording(tdg_status)) {
           kmp_taskdata_t *tdd = KMP_TASK_TO_TASKDATA(sink->dn.task);
           if (tdd->is_taskgraph) {
@@ -669,46 +669,6 @@ static bool __kmp_check_deps(kmp_int32 gtid, kmp_depnode_t *node,
   return npredecessors > 0 ? true : false;
 }
 
-/* AOCC begin */
-/*
- * a wrapper function to __kmpc_omp_task_with_deps
- */
-int __kmpc_omp_task_alloc_with_deps(ident_t *loc_ref, kmp_int32 gtid, kmp_task_t *new_task,
-                                    int ndeps, int nargs, ...) {
-  int *dependinfo = (int*)malloc(nargs*sizeof(int)); 
-  va_list valist;
-  va_start(valist, nargs);
-  for (int k = 0; k < nargs; k++) {
-    dependinfo[k] = va_arg(valist, int);
-  }
-  va_end(valist);
-  kmp_depend_info_t *deplist = (kmp_depend_info_t*)malloc(ndeps*sizeof(kmp_depend_info_t));
-
-  for (int i = 0, j = 0; i < ndeps && j < ndeps*3; i++, j+=3) {
-    kmp_depend_info_t depinfo;
-    depinfo.base_addr = dependinfo[j+2];
-    depinfo.len = dependinfo[j+1];
-    int deptype = dependinfo[j];
-    depinfo.flags.mtx = 1;
-    if (deptype == DI_DEP_TYPE_INOUT) {
-      depinfo.flags.in = 1;
-      depinfo.flags.out = 1;
-    } else if (deptype == DI_DEP_TYPE_IN) {
-      depinfo.flags.in = 1;
-    } else if (deptype == DI_DEP_TYPE_OUT) {
-      depinfo.flags.out = 1;
-    }
-    deplist[i] = depinfo;
-  }
-  free(dependinfo);  
-  __kmp_assert_valid_gtid(gtid);
-
-  int ret = __kmpc_omp_task_with_deps(loc_ref, gtid, new_task, ndeps, deplist, 0, deplist);
-  free(deplist);
-  return ret;
-}
-/* AOCC end */
-
 /*!
 @ingroup TASKING
 @param loc_ref location of the original task directive
@@ -738,7 +698,7 @@ kmp_int32 __kmpc_omp_task_with_deps(ident_t *loc_ref, kmp_int32 gtid,
   kmp_info_t *thread = __kmp_threads[gtid];
   kmp_taskdata_t *current_task = thread->th.th_current_task;
 
-#if OMPX_TASKGRAPH
+#if OMP_TASKGRAPH_EXPERIMENTAL
   // record TDG with deps
   if (new_taskdata->is_taskgraph &&
       __kmp_tdg_is_recording(new_taskdata->tdg->tdg_status)) {
@@ -758,7 +718,7 @@ kmp_int32 __kmpc_omp_task_with_deps(ident_t *loc_ref, kmp_int32 gtid,
 
         __kmp_free(old_record);
 
-        for (kmp_int i = old_size; i < new_size; i++) {
+        for (kmp_uint i = old_size; i < new_size; i++) {
           kmp_int32 *successorsList = (kmp_int32 *)__kmp_allocate(
               __kmp_successors_size * sizeof(kmp_int32));
           new_record[i].task = nullptr;

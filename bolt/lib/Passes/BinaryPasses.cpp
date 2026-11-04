@@ -13,13 +13,18 @@
 #include "bolt/Passes/BinaryPasses.h"
 #include "bolt/Core/FunctionLayout.h"
 #include "bolt/Core/ParallelUtilities.h"
+#include "bolt/Passes/BranchLivenessUtils.h"
+#include "bolt/Passes/RegAnalysis.h"
 #include "bolt/Passes/ReorderAlgorithm.h"
 #include "bolt/Passes/ReorderFunctions.h"
 #include "bolt/Utils/CommandLineOpts.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/CommandLine.h"
 #include <atomic>
+#include <cmath>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <vector>
 
 #define DEBUG_TYPE "bolt-opts"
@@ -256,6 +261,7 @@ bool BinaryFunctionPass::shouldPrint(const BinaryFunction &BF) const {
 }
 
 void NormalizeCFG::runOnFunction(BinaryFunction &BF) {
+  const BinaryContext &BC = BF.getBinaryContext();
   uint64_t NumRemoved = 0;
   uint64_t NumDuplicateEdges = 0;
   uint64_t NeedsFixBranches = 0;
@@ -285,7 +291,14 @@ void NormalizeCFG::runOnFunction(BinaryFunction &BF) {
     // Redirect all predecessors to the successor block.
     while (!BB.pred_empty()) {
       BinaryBasicBlock *Predecessor = *BB.pred_begin();
-      if (Predecessor->hasJumpTable())
+      // Do not redirect a predecessor that reaches this block via an indirect
+      // branch. This covers both a regular jump table and an unresolved
+      // "unknown control flow" indirect jump (in --strict mode), where the
+      // instruction has no jump table annotation but the jump table data still
+      // references this block. Removing this block would leave a dangling
+      // reference in .rodata, an undefined jump table entry at emission time.
+      const MCInst *LastInst = Predecessor->getLastNonPseudoInstr();
+      if (LastInst && BC.MIB->isIndirectBranch(*LastInst))
         break;
 
       if (Predecessor == Successor)
@@ -346,13 +359,16 @@ void EliminateUnreachableBlocks::runOnFunction(BinaryFunction &Function) {
   uint64_t Bytes;
   Function.markUnreachableBlocks();
   LLVM_DEBUG({
+    bool HasInvalidBB = false;
     for (BinaryBasicBlock &BB : Function) {
       if (!BB.isValid()) {
+        HasInvalidBB = true;
         dbgs() << "BOLT-INFO: UCE found unreachable block " << BB.getName()
                << " in function " << Function << "\n";
-        Function.dump();
       }
     }
+    if (HasInvalidBB)
+      Function.dump();
   });
   BinaryContext::IndependentCodeEmitter Emitter =
       BC.createIndependentMCCodeEmitter();
@@ -541,13 +557,65 @@ bool ReorderBasicBlocks::modifyFunctionLayout(BinaryFunction &BF,
 }
 
 Error FixupBranches::runOnFunctions(BinaryContext &BC) {
+  const bool ShouldRunRegisterAnalysis =
+      opts::FixBranchesWithLiveness &&
+      llvm::any_of(BC.getBinaryFunctions(), [&](auto &It) {
+        BinaryFunction &BF = It.second;
+        return BC.shouldEmit(BF) && BF.isSimple() && needsBranchLiveness(BF);
+      });
+
+  std::optional<RegAnalysis> RA;
+  if (ShouldRunRegisterAnalysis)
+    RA.emplace(BC, nullptr, nullptr);
+
   for (auto &It : BC.getBinaryFunctions()) {
-    BinaryFunction &Function = It.second;
-    if (!BC.shouldEmit(Function) || !Function.isSimple())
+    BinaryFunction &BF = It.second;
+    if (!BC.shouldEmit(BF) || !BF.isSimple())
       continue;
 
-    Function.fixBranches();
+    if (!RA || !needsBranchLiveness(BF)) {
+      BF.fixBranches();
+      continue;
+    }
+
+    BranchLivenessInfo BLI = computeBranchLiveness(BF, *RA);
+    BF.fixBranches(&BLI);
   }
+  return Error::success();
+}
+
+Error PopulateOutputFunctions::runOnFunctions(BinaryContext &BC) {
+  BinaryFunctionListType &OutputFunctions = BC.getOutputBinaryFunctions();
+
+  assert(OutputFunctions.empty() && "Output function list already initialized");
+
+  OutputFunctions.reserve(BC.getBinaryFunctions().size() +
+                          BC.getInjectedBinaryFunctions().size());
+  llvm::transform(llvm::make_second_range(BC.getBinaryFunctions()),
+                  std::back_inserter(OutputFunctions),
+                  [](BinaryFunction &BF) { return &BF; });
+
+  llvm::erase_if(OutputFunctions,
+                 [&BC](BinaryFunction *BF) { return !BC.shouldEmit(*BF); });
+
+  llvm::stable_sort(OutputFunctions, compareBinaryFunctionByIndex);
+
+  llvm::copy(BC.getInjectedBinaryFunctions(),
+             std::back_inserter(OutputFunctions));
+
+  // Place hot text movers in front.
+  if (opts::HotText) {
+    std::stable_partition(
+        OutputFunctions.begin(), OutputFunctions.end(),
+        [](const BinaryFunction *A) { return opts::isHotTextMover(*A); });
+  }
+
+  if (opts::HotFunctionsAtEnd) {
+    std::stable_partition(
+        OutputFunctions.begin(), OutputFunctions.end(),
+        [](const BinaryFunction *A) { return !A->hasValidIndex(); });
+  }
+
   return Error::success();
 }
 
@@ -922,7 +990,11 @@ uint64_t SimplifyConditionalTailCalls::fixTailCalls(BinaryFunction &BF) {
       uint64_t Count = 0;
       if (CondSucc != BB) {
         // Patch the new target address into the conditional branch.
-        MIB->reverseBranchCondition(*CondBranch, CalleeSymbol, Ctx);
+        InstructionListType Code =
+            MIB->reverseBranchCondition(*CondBranch, CalleeSymbol, Ctx);
+        auto II = PredBB->replaceInstruction(
+            PredBB->findInstruction(CondBranch), Code);
+        CondBranch = &*(II + Code.size() - 1);
         // Since we reversed the condition on the branch we need to change
         // the target for the unconditional branch or add a unconditional
         // branch to the old target.  This has to be done manually since
@@ -1273,13 +1345,6 @@ Error SimplifyRODataLoads::runOnFunctions(BinaryContext &BC) {
 }
 
 Error AssignSections::runOnFunctions(BinaryContext &BC) {
-  for (BinaryFunction *Function : BC.getInjectedBinaryFunctions()) {
-    if (!Function->isPatch()) {
-      Function->setCodeSectionName(BC.getInjectedCodeSectionName());
-      Function->setColdCodeSectionName(BC.getInjectedColdCodeSectionName());
-    }
-  }
-
   // In non-relocation mode functions have pre-assigned section names.
   if (!BC.HasRelocations)
     return Error::success();
@@ -1505,12 +1570,6 @@ Error PrintProgramStats::runOnFunctions(BinaryContext &BC) {
   if (NumAllStaleFunctions) {
     const float PctStale =
         NumAllStaleFunctions / (float)NumAllProfiledFunctions * 100.0f;
-    const float PctStaleFuncsWithEqualBlockCount =
-        (float)BC.Stats.NumStaleFuncsWithEqualBlockCount /
-        NumAllStaleFunctions * 100.0f;
-    const float PctStaleBlocksWithEqualIcount =
-        (float)BC.Stats.NumStaleBlocksWithEqualIcount /
-        BC.Stats.NumStaleBlocks * 100.0f;
     auto printErrorOrWarning = [&]() {
       if (PctStale > opts::StaleThreshold)
         BC.errs() << "BOLT-ERROR: ";
@@ -1533,17 +1592,6 @@ Error PrintProgramStats::runOnFunctions(BinaryContext &BC) {
                 << "%) belong to functions with invalid"
                    " (possibly stale) profile.\n";
     }
-    BC.outs() << "BOLT-INFO: " << BC.Stats.NumStaleFuncsWithEqualBlockCount
-              << " stale function"
-              << (BC.Stats.NumStaleFuncsWithEqualBlockCount == 1 ? "" : "s")
-              << format(" (%.1f%% of all stale)",
-                        PctStaleFuncsWithEqualBlockCount)
-              << " have matching block count.\n";
-    BC.outs() << "BOLT-INFO: " << BC.Stats.NumStaleBlocksWithEqualIcount
-              << " stale block"
-              << (BC.Stats.NumStaleBlocksWithEqualIcount == 1 ? "" : "s")
-              << format(" (%.1f%% of all stale)", PctStaleBlocksWithEqualIcount)
-              << " have matching icount.\n";
     if (PctStale > opts::StaleThreshold) {
       return createFatalBOLTError(
           Twine("BOLT-ERROR: stale functions exceed specified threshold of ") +
@@ -1630,7 +1678,7 @@ Error PrintProgramStats::runOnFunctions(BinaryContext &BC) {
   }
 
   if (!opts::PrintSortedBy.empty()) {
-    std::vector<BinaryFunction *> Functions;
+    BinaryFunctionListType Functions;
     std::map<const BinaryFunction *, DynoStats> Stats;
 
     for (auto &BFI : BC.getBinaryFunctions()) {
@@ -1721,7 +1769,7 @@ Error PrintProgramStats::runOnFunctions(BinaryContext &BC) {
 
   // Collect and print information about suboptimal code layout on input.
   if (opts::ReportBadLayout) {
-    std::vector<BinaryFunction *> SuboptimalFuncs;
+    BinaryFunctionListType SuboptimalFuncs;
     for (auto &BFI : BC.getBinaryFunctions()) {
       BinaryFunction &BF = BFI.second;
       if (!BF.hasValidProfile())
@@ -1944,8 +1992,11 @@ std::set<size_t> SpecializeMemcpy1::getCallSitesToOptimize(
 }
 
 Error SpecializeMemcpy1::runOnFunctions(BinaryContext &BC) {
-  if (!BC.isX86())
-    return Error::success();
+  if (!BC.isX86()) {
+    BC.errs() << "BOLT-ERROR: " << getName()
+              << " is currently supported only on X86\n";
+    exit(1);
+  }
 
   uint64_t NumSpecialized = 0;
   uint64_t NumSpecializedDyno = 0;

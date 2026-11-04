@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 // REQUIRES: stdlib=apple-libc++
+// UNSUPPORTED: libcpp-has-no-availability-markup
 
 // This test ensures that we retain a way to disable availability markup on Apple platforms
 // in order to work around Clang bug https://llvm.org/PR134151.
@@ -38,7 +39,7 @@
 template <class T>
 struct optional {
   T val_;
-  _LIBCPP_HIDE_FROM_ABI _LIBCPP_INTRODUCED_IN_LLVM_11_ATTRIBUTE T value() const { return val_; }
+  _LIBCPP_HIDE_FROM_ABI _LIBCPP_INTRODUCED_IN_LLVM_18_ATTRIBUTE T value() const { return val_; }
 };
 
 using PMF = int (optional<int>::*)() const;

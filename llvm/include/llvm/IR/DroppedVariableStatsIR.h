@@ -34,9 +34,9 @@ public:
   DroppedVariableStatsIR(bool DroppedVarStatsEnabled)
       : llvm::DroppedVariableStats(DroppedVarStatsEnabled) {}
 
-  void runBeforePass(StringRef P, Any IR);
+  void runBeforePass(StringRef P, const Any &IR);
 
-  void runAfterPass(StringRef P, Any IR);
+  void runAfterPass(StringRef P, const Any &IR);
 
   void registerCallbacks(PassInstrumentationCallbacks &PIC);
 
@@ -71,18 +71,17 @@ private:
                                         StringRef PassLevel);
 
   /// Override base class method to run on an llvm::Function specifically.
-  virtual void
-  visitEveryInstruction(unsigned &DroppedCount,
-                        DenseMap<VarID, DILocation *> &InlinedAtsMap,
-                        VarID Var) override;
+  void visitEveryInstruction(unsigned &DroppedCount,
+                             DenseMap<VarID, DILocation *> &InlinedAtsMap,
+                             VarID Var) override;
 
   /// Override base class method to run on #dbg_values specifically.
-  virtual void visitEveryDebugRecord(
+  void visitEveryDebugRecord(
       DenseSet<VarID> &VarIDSet,
       DenseMap<StringRef, DenseMap<VarID, DILocation *>> &InlinedAtsMap,
       StringRef FuncName, bool Before) override;
 
-  template <typename IRUnitT> static const IRUnitT *unwrapIR(Any IR);
+  template <typename IRUnitT> static const IRUnitT *unwrapIR(const Any &IR);
 };
 
 } // namespace llvm

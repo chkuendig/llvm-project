@@ -16,8 +16,8 @@
 #include "clang/Driver/CommonArgs.h"
 #include "clang/Driver/Distro.h"
 #include "clang/Driver/Driver.h"
-#include "clang/Driver/Options.h"
 #include "clang/Driver/SanitizerArgs.h"
+#include "clang/Options/Options.h"
 #include "llvm/Option/ArgList.h"
 #include "llvm/ProfileData/InstrProf.h"
 #include "llvm/Support/Path.h"
@@ -203,8 +203,21 @@ static StringRef getOSLibDir(const llvm::Triple &Triple, const ArgList &Args) {
   if (Triple.getArch() == llvm::Triple::x86_64 && Triple.isX32())
     return "libx32";
 
-  if (Triple.getArch() == llvm::Triple::riscv32)
+  if (Triple.isRISCV32())
     return "lib32";
+
+  if (Triple.getArch() == llvm::Triple::loongarch32) {
+    switch (Triple.getEnvironment()) {
+    default:
+      return "lib32";
+    case llvm::Triple::GNUSF:
+    case llvm::Triple::MuslSF:
+      return "lib32/sf";
+    case llvm::Triple::GNUF32:
+    case llvm::Triple::MuslF32:
+      return "lib32/f32";
+    }
+  }
 
   return Triple.isArch32Bit() ? "lib" : "lib64";
 }
@@ -221,6 +234,9 @@ Linux::Linux(const Driver &D, const llvm::Triple &Triple, const ArgList &Args)
   GCCInstallation.init(Triple, Args);
   Multilibs = GCCInstallation.getMultilibs();
   SelectedMultilibs.assign({GCCInstallation.getMultilib()});
+
+  loadMultilibsFromYAML(Args, D);
+
   llvm::Triple::ArchType Arch = Triple.getArch();
   std::string SysRoot = computeSysRoot();
   ToolChain::path_list &PPaths = getProgramPaths();
@@ -261,15 +277,15 @@ Linux::Linux(const Driver &D, const llvm::Triple &Triple, const ArgList &Args)
       // issue that this flag is not accepted by other linkers.
       ExtraOpts.push_back("--no-rosegment");
     }
-    if (!Triple.isAndroidVersionLT(28)) {
-      // Android supports relr packing starting with API 28 and had its own
-      // flavor (--pack-dyn-relocs=android) starting in API 23.
-      // TODO: It's possible to use both with --pack-dyn-relocs=android+relr,
-      // but we need to gather some data on the impact of that form before we
-      // can know if it's a good default.
-      // On the other hand, relr should always be an improvement.
+    // SHT_RELR relocations are only supported at API level >= 30.
+    // ANDROID_RELR relocations were supported at API level >= 28.
+    if (!Triple.isAndroidVersionLT(30)) {
+      ExtraOpts.push_back("--pack-dyn-relocs=android+relr");
+    } else if (!Triple.isAndroidVersionLT(28)) {
+      ExtraOpts.push_back("--pack-dyn-relocs=android+relr");
       ExtraOpts.push_back("--use-android-relr-tags");
-      ExtraOpts.push_back("--pack-dyn-relocs=relr");
+    } else {
+      ExtraOpts.push_back("--pack-dyn-relocs=android");
     }
   }
 
@@ -300,16 +316,9 @@ Linux::Linux(const Driver &D, const llvm::Triple &Triple, const ArgList &Args)
   // and the MIPS ABI require .dynsym to be sorted in different ways.
   // .gnu.hash needs symbols to be grouped by hash code whereas the MIPS
   // ABI requires a mapping between the GOT and the symbol table.
-  // Android loader does not support .gnu.hash until API 23.
-  // Hexagon linker/loader does not support .gnu.hash
-  if (!IsMips && !IsHexagon) {
-    if (Distro.IsOpenSUSE() || Distro == Distro::UbuntuLucid ||
-        Distro == Distro::UbuntuJaunty || Distro == Distro::UbuntuKarmic ||
-        (IsAndroid && Triple.isAndroidVersionLT(23)))
-      ExtraOpts.push_back("--hash-style=both");
-    else
-      ExtraOpts.push_back("--hash-style=gnu");
-  }
+  // Hexagon linker/loader does not support .gnu.hash.
+  if (!IsMips && !IsHexagon)
+    ExtraOpts.push_back("--hash-style=gnu");
 
 #ifdef ENABLE_LINKER_BUILD_ID
   ExtraOpts.push_back("--build-id");
@@ -446,6 +455,114 @@ std::string Linux::computeSysRoot() const {
   return std::string();
 }
 
+static void setPAuthABIInTriple(const Driver &D, const ArgList &Args,
+                                llvm::Triple &Triple) {
+  Arg *ABIArg = Args.getLastArg(options::OPT_mabi_EQ);
+  bool HasPAuthABI =
+      ABIArg ? (StringRef(ABIArg->getValue()) == "pauthtest") : false;
+
+  switch (Triple.getEnvironment()) {
+  case llvm::Triple::UnknownEnvironment:
+    if (HasPAuthABI)
+      Triple.setEnvironment(llvm::Triple::PAuthTest);
+    break;
+  case llvm::Triple::PAuthTest:
+    break;
+  default:
+    if (HasPAuthABI)
+      D.Diag(diag::err_drv_unsupported_opt_for_target)
+          << ABIArg->getAsString(Args) << Triple.getTriple();
+    break;
+  }
+}
+
+std::string Linux::ComputeEffectiveClangTriple(const llvm::opt::ArgList &Args,
+                                               BoundArch BA,
+                                               types::ID InputType) const {
+  std::string TripleString =
+      Generic_ELF::ComputeEffectiveClangTriple(Args, BA, InputType);
+  if (getTriple().isAArch64()) {
+    llvm::Triple Triple(TripleString);
+    setPAuthABIInTriple(getDriver(), Args, Triple);
+    return Triple.getTriple();
+  }
+  return TripleString;
+}
+
+// Each combination of options here forms a signing schema, and in most cases
+// each signing schema is its own incompatible ABI. The default values of the
+// options represent the default signing schema.
+static void handlePAuthABI(const Driver &D, const ArgList &DriverArgs,
+                           ArgStringList &CC1Args) {
+  if (!DriverArgs.hasArg(options::OPT_fptrauth_intrinsics,
+                         options::OPT_fno_ptrauth_intrinsics))
+    CC1Args.push_back("-fptrauth-intrinsics");
+
+  if (!DriverArgs.hasArg(options::OPT_fptrauth_calls,
+                         options::OPT_fno_ptrauth_calls))
+    CC1Args.push_back("-fptrauth-calls");
+
+  if (!DriverArgs.hasArg(options::OPT_fptrauth_returns,
+                         options::OPT_fno_ptrauth_returns))
+    CC1Args.push_back("-fptrauth-returns");
+
+  if (!DriverArgs.hasArg(options::OPT_fptrauth_auth_traps,
+                         options::OPT_fno_ptrauth_auth_traps))
+    CC1Args.push_back("-fptrauth-auth-traps");
+
+  if (!DriverArgs.hasArg(
+          options::OPT_fptrauth_vtable_pointer_address_discrimination,
+          options::OPT_fno_ptrauth_vtable_pointer_address_discrimination))
+    CC1Args.push_back("-fptrauth-vtable-pointer-address-discrimination");
+
+  if (!DriverArgs.hasArg(
+          options::OPT_fptrauth_vtable_pointer_type_discrimination,
+          options::OPT_fno_ptrauth_vtable_pointer_type_discrimination))
+    CC1Args.push_back("-fptrauth-vtable-pointer-type-discrimination");
+
+  if (!DriverArgs.hasArg(
+          options::OPT_fptrauth_vtt_vtable_pointer_discrimination,
+          options::OPT_fno_ptrauth_vtt_vtable_pointer_discrimination))
+    CC1Args.push_back("-fptrauth-vtt-vtable-pointer-discrimination");
+
+  if (!DriverArgs.hasArg(
+          options::OPT_fptrauth_type_info_vtable_pointer_discrimination,
+          options::OPT_fno_ptrauth_type_info_vtable_pointer_discrimination))
+    CC1Args.push_back("-fptrauth-type-info-vtable-pointer-discrimination");
+
+  if (!DriverArgs.hasArg(options::OPT_fptrauth_indirect_gotos,
+                         options::OPT_fno_ptrauth_indirect_gotos))
+    CC1Args.push_back("-fptrauth-indirect-gotos");
+
+  if (!DriverArgs.hasArg(options::OPT_fptrauth_init_fini,
+                         options::OPT_fno_ptrauth_init_fini))
+    CC1Args.push_back("-fptrauth-init-fini");
+
+  if (!DriverArgs.hasArg(
+          options::OPT_fptrauth_init_fini_address_discrimination,
+          options::OPT_fno_ptrauth_init_fini_address_discrimination))
+    CC1Args.push_back("-fptrauth-init-fini-address-discrimination");
+
+  if (!DriverArgs.hasArg(options::OPT_fptrauth_elf_got,
+                         options::OPT_fno_ptrauth_elf_got))
+    CC1Args.push_back("-fptrauth-elf-got");
+
+  if (!DriverArgs.hasArg(options::OPT_faarch64_jump_table_hardening,
+                         options::OPT_fno_aarch64_jump_table_hardening))
+    CC1Args.push_back("-faarch64-jump-table-hardening");
+}
+
+void Linux::addClangTargetOptions(const llvm::opt::ArgList &DriverArgs,
+                                  llvm::opt::ArgStringList &CC1Args,
+                                  BoundArch BA,
+                                  Action::OffloadKind DeviceOffloadKind) const {
+  llvm::Triple Triple(ComputeEffectiveClangTriple(DriverArgs));
+  if (Triple.isAArch64() && Triple.getEnvironment() == llvm::Triple::PAuthTest)
+    handlePAuthABI(getDriver(), DriverArgs, CC1Args);
+  Generic_ELF::addClangTargetOptions(DriverArgs, CC1Args, BA,
+                                     DeviceOffloadKind);
+}
+
 std::string Linux::getDynamicLinker(const ArgList &Args) const {
   const llvm::Triple::ArchType Arch = getArch();
   const llvm::Triple &Triple = getTriple();
@@ -494,6 +611,14 @@ std::string Linux::getDynamicLinker(const ArgList &Args) const {
     if (Arch == llvm::Triple::ppc &&
         Triple.getSubArch() == llvm::Triple::PPCSubArch_spe)
       ArchName = "powerpc-sf";
+    if (Triple.isRISCV()) {
+      StringRef ABIName = tools::riscv::getRISCVABI(Args, Triple);
+      if (ABIName == "ilp32" || ABIName == "lp64") {
+        ArchName += "-sf";
+      } else if (ABIName == "ilp32f" || ABIName == "lp64f") {
+        ArchName += "-sp";
+      }
+    }
 
     return "/lib/ld-musl-" + ArchName + ".so.1";
   }
@@ -584,7 +709,9 @@ std::string Linux::getDynamicLinker(const ArgList &Args) const {
         (tools::ppc::hasPPCAbiArg(Args, "elfv1")) ? "ld64.so.1" : "ld64.so.2";
     break;
   case llvm::Triple::riscv32:
-  case llvm::Triple::riscv64: {
+  case llvm::Triple::riscv64:
+  case llvm::Triple::riscv32be:
+  case llvm::Triple::riscv64be: {
     StringRef ArchName = llvm::Triple::getArchTypeName(Arch);
     StringRef ABIName = tools::riscv::getRISCVABI(Args, Triple);
     LibDir = "lib";
@@ -636,10 +763,10 @@ void Linux::AddClangSystemIncludeArgs(const ArgList &DriverArgs,
   const Driver &D = getDriver();
   std::string SysRoot = computeSysRoot();
 
-  if (DriverArgs.hasArg(clang::driver::options::OPT_nostdinc))
+  if (DriverArgs.hasArg(options::OPT_nostdinc))
     return;
 
-  if (DriverArgs.hasArg(clang::driver::options::OPT_fopenmp)) {
+  if (DriverArgs.hasArg(clang::options::OPT_fopenmp)) {
     // Look for system files in our compiler AOMP/include dir first
     addSystemInclude(DriverArgs, CC1Args,
                      DriverArgs.MakeArgString(D.Dir + "/../include"));
@@ -657,6 +784,23 @@ void Linux::AddClangSystemIncludeArgs(const ArgList &DriverArgs,
 
   if (DriverArgs.hasArg(options::OPT_nostdlibinc))
     return;
+
+  // Add multilib variant include paths in priority order.
+  for (const Multilib &M : getOrderedMultilibs()) {
+    if (M.isDefault())
+      continue;
+    if (std::optional<std::string> StdlibIncDir = getStdlibIncludePath()) {
+      SmallString<128> Dir(*StdlibIncDir);
+      llvm::sys::path::append(Dir, M.includeSuffix());
+      if (D.getVFS().exists(Dir))
+        addSystemInclude(DriverArgs, CC1Args, Dir);
+    }
+  }
+
+  // After the resource directory, we prioritize the standard clang include
+  // directory.
+  if (std::optional<std::string> Path = getStdlibIncludePath())
+    addSystemInclude(DriverArgs, CC1Args, *Path);
 
   // LOCAL_INCLUDE_DIR
   addSystemInclude(DriverArgs, CC1Args, concat(SysRoot, "/usr/local/include"));
@@ -699,28 +843,6 @@ void Linux::AddClangSystemIncludeArgs(const ArgList &DriverArgs,
     addSystemInclude(DriverArgs, CC1Args, ResourceDirInclude);
 }
 
-/// Convert path list to Fortran frontend argument
-static void AddFlangSysIncludeArg(const ArgList &DriverArgs,
-                                  ArgStringList &Flang1args,
-                                  ToolChain::path_list IncludePathList) {
-  std::string ArgValue; // Path argument value
-
-  // Make up argument value consisting of paths separated by colons
-  bool first = true;
-  for (auto P : IncludePathList) {
-    if (first) {
-      first = false;
-    } else {
-      ArgValue += ":";
-    }
-    ArgValue += P;
-  }
-
-  // Add the argument
-  Flang1args.push_back("-stdinc");
-  Flang1args.push_back(DriverArgs.MakeArgString(ArgValue));
-}
-
 static std::string DetectLibcxxIncludePath(llvm::vfs::FileSystem &vfs,
                                            StringRef base) {
   std::error_code EC;
@@ -739,172 +861,6 @@ static std::string DetectLibcxxIncludePath(llvm::vfs::FileSystem &vfs,
     }
   }
   return MaxVersion ? (base + "/" + MaxVersionString).str() : "";
-}
-
-void Linux::AddFlangSystemIncludeArgs(const ArgList &DriverArgs,
-                                      ArgStringList &Flang1args) const {
-  path_list IncludePathList;
-  const Driver &D = getDriver();
-  std::string SysRoot = computeSysRoot();
-
-  if (DriverArgs.hasArg(options::OPT_nostdinc))
-    return;
-
-  {
-    SmallString<128> P(D.Dir);
-    llvm::sys::path::append(P, "../include");
-    IncludePathList.push_back(DriverArgs.MakeArgString(P.str()));
-  }
-
-  if (!DriverArgs.hasArg(options::OPT_nostdlibinc))
-    IncludePathList.push_back(SysRoot + "/usr/local/include");
-
-  if (!DriverArgs.hasArg(options::OPT_nobuiltininc)) {
-    SmallString<128> P(D.ResourceDir);
-    llvm::sys::path::append(P, "include");
-    IncludePathList.push_back(DriverArgs.MakeArgString(P.str()));
-  }
-
-  if (DriverArgs.hasArg(options::OPT_nostdlibinc)) {
-    AddFlangSysIncludeArg(DriverArgs, Flang1args, IncludePathList);
-    return;
-  }
-
-  // Check for configure-time C include directories.
-  StringRef CIncludeDirs(C_INCLUDE_DIRS);
-  if (CIncludeDirs != "") {
-    SmallVector<StringRef, 5> dirs;
-    CIncludeDirs.split(dirs, ":");
-    for (StringRef dir : dirs) {
-      StringRef Prefix =
-          llvm::sys::path::is_absolute(dir) ? StringRef(SysRoot) : "";
-      IncludePathList.push_back(Prefix.str() + dir.str());
-    }
-    AddFlangSysIncludeArg(DriverArgs, Flang1args, IncludePathList);
-    return;
-  }
-
-  // Lacking those, try to detect the correct set of system includes for the
-  // target triple.
-
-  // Add include directories specific to the selected multilib set and multilib.
-  if (GCCInstallation.isValid()) {
-    const auto &Callback = Multilibs.includeDirsCallback();
-    if (Callback) {
-      for (const auto &Path : Callback(GCCInstallation.getMultilib()))
-        addExternCSystemIncludeIfExists(
-            DriverArgs, Flang1args, GCCInstallation.getInstallPath() + Path);
-    }
-  }
-
-  // Implement generic Debian multiarch support.
-  const StringRef X86_64MultiarchIncludeDirs[] = {
-      "/usr/include/x86_64-linux-gnu",
-
-      // FIXME: These are older forms of multiarch. It's not clear that they're
-      // in use in any released version of Debian, so we should consider
-      // removing them.
-      "/usr/include/i686-linux-gnu/64", "/usr/include/i486-linux-gnu/64"};
-  const StringRef X86MultiarchIncludeDirs[] = {
-      "/usr/include/i386-linux-gnu",
-
-      // FIXME: These are older forms of multiarch. It's not clear that they're
-      // in use in any released version of Debian, so we should consider
-      // removing them.
-      "/usr/include/x86_64-linux-gnu/32", "/usr/include/i686-linux-gnu",
-      "/usr/include/i486-linux-gnu"};
-  const StringRef AArch64MultiarchIncludeDirs[] = {
-      "/usr/include/aarch64-linux-gnu"};
-  const StringRef ARMMultiarchIncludeDirs[] = {
-      "/usr/include/arm-linux-gnueabi"};
-  const StringRef ARMHFMultiarchIncludeDirs[] = {
-      "/usr/include/arm-linux-gnueabihf"};
-  const StringRef MIPSMultiarchIncludeDirs[] = {"/usr/include/mips-linux-gnu"};
-  const StringRef MIPSELMultiarchIncludeDirs[] = {
-      "/usr/include/mipsel-linux-gnu"};
-  const StringRef MIPS64MultiarchIncludeDirs[] = {
-      "/usr/include/mips64-linux-gnu", "/usr/include/mips64-linux-gnuabi64"};
-  const StringRef MIPS64ELMultiarchIncludeDirs[] = {
-      "/usr/include/mips64el-linux-gnu",
-      "/usr/include/mips64el-linux-gnuabi64"};
-  const StringRef PPCMultiarchIncludeDirs[] = {
-      "/usr/include/powerpc-linux-gnu"};
-  const StringRef PPC64MultiarchIncludeDirs[] = {
-      "/usr/include/powerpc64-linux-gnu"};
-  const StringRef PPC64LEMultiarchIncludeDirs[] = {
-      "/usr/include/powerpc64le-linux-gnu"};
-  const StringRef SparcMultiarchIncludeDirs[] = {
-      "/usr/include/sparc-linux-gnu"};
-  const StringRef Sparc64MultiarchIncludeDirs[] = {
-      "/usr/include/sparc64-linux-gnu"};
-  ArrayRef<StringRef> MultiarchIncludeDirs;
-  switch (getTriple().getArch()) {
-  case llvm::Triple::x86_64:
-    MultiarchIncludeDirs = X86_64MultiarchIncludeDirs;
-    break;
-  case llvm::Triple::x86:
-    MultiarchIncludeDirs = X86MultiarchIncludeDirs;
-    break;
-  case llvm::Triple::aarch64:
-  case llvm::Triple::aarch64_be:
-    MultiarchIncludeDirs = AArch64MultiarchIncludeDirs;
-    break;
-  case llvm::Triple::arm:
-    if (getTriple().getEnvironment() == llvm::Triple::GNUEABIHF)
-      MultiarchIncludeDirs = ARMHFMultiarchIncludeDirs;
-    else
-      MultiarchIncludeDirs = ARMMultiarchIncludeDirs;
-    break;
-  case llvm::Triple::mips:
-    MultiarchIncludeDirs = MIPSMultiarchIncludeDirs;
-    break;
-  case llvm::Triple::mipsel:
-    MultiarchIncludeDirs = MIPSELMultiarchIncludeDirs;
-    break;
-  case llvm::Triple::mips64:
-    MultiarchIncludeDirs = MIPS64MultiarchIncludeDirs;
-    break;
-  case llvm::Triple::mips64el:
-    MultiarchIncludeDirs = MIPS64ELMultiarchIncludeDirs;
-    break;
-  case llvm::Triple::ppc:
-    MultiarchIncludeDirs = PPCMultiarchIncludeDirs;
-    break;
-  case llvm::Triple::ppc64:
-    MultiarchIncludeDirs = PPC64MultiarchIncludeDirs;
-    break;
-  case llvm::Triple::ppc64le:
-    MultiarchIncludeDirs = PPC64LEMultiarchIncludeDirs;
-    break;
-  case llvm::Triple::sparc:
-    MultiarchIncludeDirs = SparcMultiarchIncludeDirs;
-    break;
-  case llvm::Triple::sparcv9:
-    MultiarchIncludeDirs = Sparc64MultiarchIncludeDirs;
-    break;
-  default:
-    break;
-  }
-  for (StringRef Dir : MultiarchIncludeDirs) {
-    if (llvm::sys::fs::exists(SysRoot + Dir)) {
-      IncludePathList.push_back(SysRoot + Dir.str());
-      break;
-    }
-  }
-
-  if (getTriple().getOS() == llvm::Triple::RTEMS) {
-    AddFlangSysIncludeArg(DriverArgs, Flang1args, IncludePathList);
-    return;
-  }
-
-  // Add an include of '/include' directly. This isn't provided by default by
-  // system GCCs, but is often used with cross-compiling GCCs, and harmless to
-  // add even when Clang is acting as-if it were a system compiler.
-  IncludePathList.push_back(SysRoot + "/include");
-
-  IncludePathList.push_back(SysRoot + "/usr/include");
-
-  AddFlangSysIncludeArg(DriverArgs, Flang1args, IncludePathList);
 }
 
 void Linux::addLibCxxIncludePaths(const llvm::opt::ArgList &DriverArgs,
@@ -971,19 +927,51 @@ void Linux::AddHIPIncludeArgs(const ArgList &DriverArgs,
   RocmInstallation->AddHIPIncludeArgs(DriverArgs, CC1Args);
 }
 
-void Linux::AddHIPRuntimeLibArgs(const ArgList &Args,
-                                 ArgStringList &CmdArgs) const {
-  CmdArgs.push_back(
-      Args.MakeArgString(StringRef("-L") + RocmInstallation->getLibPath()));
+void Linux::addOffloadRTLibs(unsigned ActiveKinds, const ArgList &Args,
+                             ArgStringList &CmdArgs) const {
+  if (!Args.hasFlag(options::OPT_offloadlib, options::OPT_no_offloadlib,
+                    true) ||
+      Args.hasArg(options::OPT_nostdlib) ||
+      Args.hasArg(options::OPT_no_hip_rt) || Args.hasArg(options::OPT_r))
+    return;
 
-  if (Args.hasFlag(options::OPT_frtlib_add_rpath,
-                   options::OPT_fno_rtlib_add_rpath, false)) {
-    SmallString<0> p = RocmInstallation->getLibPath();
-    llvm::sys::path::remove_dots(p, true);
-    CmdArgs.append({"-rpath", Args.MakeArgString(p)});
+  llvm::SmallVector<std::pair<StringRef, StringRef>> Libraries;
+  if (ActiveKinds & Action::OFK_HIP)
+    Libraries.emplace_back(RocmInstallation->getLibPath(), "libamdhip64.so");
+  else if ((ActiveKinds & Action::OFK_SYCL) &&
+           !Args.hasArg(options::OPT_nolibsycl))
+    Libraries.emplace_back(SYCLInstallation->getSYCLRTLibPath(),
+                           "libLLVMSYCL.so");
+
+  for (auto [Path, Library] : Libraries) {
+    if (Args.hasFlag(options::OPT_frtlib_add_rpath,
+                     options::OPT_fno_rtlib_add_rpath, false)) {
+      SmallString<0> p = Path;
+      llvm::sys::path::remove_dots(p, true);
+      CmdArgs.append({"-rpath", Args.MakeArgString(p)});
+    }
+
+    SmallString<0> p = Path;
+    llvm::sys::path::append(p, Library);
+    CmdArgs.push_back(Args.MakeArgString(p));
   }
 
-  CmdArgs.push_back("-lamdhip64");
+  // FIXME: The ROCm builds implicitly depends on this being present.
+  if (ActiveKinds & Action::OFK_HIP)
+    CmdArgs.push_back(
+        Args.MakeArgString(StringRef("-L") + RocmInstallation->getLibPath()));
+
+  // For HIP device PGO, link clang_rt.profile_rocm when available. It is a
+  // self-contained superset of clang_rt.profile, emitted first so the base
+  // archive stays inert.
+  if ((ActiveKinds & Action::OFK_HIP) && needsProfileRT(Args) &&
+      getVFS().exists(getCompilerRT(Args, "profile_rocm", FT_Static))) {
+    CmdArgs.push_back(getCompilerRTArgString(Args, "profile_rocm"));
+    // Force-retain the constructor-only hipModuleLoad* interceptor object; its
+    // constructor self-skips when the program does not use hipModuleLoad.
+    CmdArgs.push_back("-u");
+    CmdArgs.push_back("__llvm_profile_offload_register_dynamic_module");
+  }
 }
 
 void Linux::AddIAMCUIncludeArgs(const ArgList &DriverArgs,
@@ -1025,7 +1013,9 @@ bool Linux::IsMathErrnoDefault() const {
   return Generic_ELF::IsMathErrnoDefault();
 }
 
-SanitizerMask Linux::getSupportedSanitizers() const {
+SanitizerMask
+Linux::getSupportedSanitizers(BoundArch BA,
+                              Action::OffloadKind DeviceOffloadKind) const {
   const bool IsX86 = getTriple().getArch() == llvm::Triple::x86;
   const bool IsX86_64 = getTriple().getArch() == llvm::Triple::x86_64;
   const bool IsMIPS = getTriple().isMIPS32();
@@ -1039,11 +1029,11 @@ SanitizerMask Linux::getSupportedSanitizers() const {
                          getTriple().getArch() == llvm::Triple::armeb ||
                          getTriple().getArch() == llvm::Triple::thumbeb;
   const bool IsLoongArch64 = getTriple().getArch() == llvm::Triple::loongarch64;
-  const bool IsRISCV64 = getTriple().getArch() == llvm::Triple::riscv64;
+  const bool IsRISCV64 = getTriple().isRISCV64();
   const bool IsSystemZ = getTriple().getArch() == llvm::Triple::systemz;
   const bool IsHexagon = getTriple().getArch() == llvm::Triple::hexagon;
   const bool IsAndroid = getTriple().isAndroid();
-  SanitizerMask Res = ToolChain::getSupportedSanitizers();
+  SanitizerMask Res = ToolChain::getSupportedSanitizers(BA, DeviceOffloadKind);
   Res |= SanitizerKind::Address;
   Res |= SanitizerKind::PointerCompare;
   Res |= SanitizerKind::PointerSubtract;
@@ -1053,7 +1043,7 @@ SanitizerMask Linux::getSupportedSanitizers() const {
   Res |= SanitizerKind::KernelAddress;
   Res |= SanitizerKind::Vptr;
   Res |= SanitizerKind::SafeStack;
-  if (IsX86_64 || IsMIPS64 || IsAArch64 || IsLoongArch64)
+  if (IsX86_64 || IsMIPS64 || IsAArch64 || IsLoongArch64 || IsSystemZ)
     Res |= SanitizerKind::DataFlow;
   if (IsX86_64 || IsMIPS64 || IsAArch64 || IsX86 || IsArmArch || IsPowerPC64 ||
       IsRISCV64 || IsSystemZ || IsHexagon || IsLoongArch64)
@@ -1061,16 +1051,18 @@ SanitizerMask Linux::getSupportedSanitizers() const {
   if (IsX86_64 || IsMIPS64 || IsAArch64 || IsPowerPC64 || IsSystemZ ||
       IsLoongArch64 || IsRISCV64)
     Res |= SanitizerKind::Thread;
-  if (IsX86_64 || IsAArch64)
+  if (IsX86_64 || IsAArch64 || IsSystemZ || IsHexagon)
     Res |= SanitizerKind::Type;
   if (IsX86_64 || IsSystemZ || IsPowerPC64)
     Res |= SanitizerKind::KernelMemory;
   if (IsX86_64 || IsMIPS64 || IsAArch64 || IsX86 || IsMIPS || IsArmArch ||
-      IsPowerPC64 || IsHexagon || IsLoongArch64 || IsRISCV64)
+      IsPowerPC64 || IsHexagon || IsLoongArch64 || IsRISCV64 || IsSystemZ)
     Res |= SanitizerKind::Scudo;
   if (IsX86_64 || IsAArch64 || IsRISCV64) {
     Res |= SanitizerKind::HWAddress;
   }
+  if (IsHexagon)
+    Res |= SanitizerKind::ShadowCallStack;
   if (IsX86_64 || IsAArch64) {
     Res |= SanitizerKind::KernelHWAddress;
   }

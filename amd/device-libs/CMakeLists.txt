@@ -25,6 +25,9 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 add_custom_target(rocm-device-libs)
 
+option(USE_NEW_HOSTCALL_IMPL
+  "Use the new phase/occupancy-based ockl hostcall implementation" OFF)
+
 # Optionally, build Device Libs with ccache.
 set(ROCM_CCACHE_BUILD OFF CACHE BOOL "Set to ON for a ccache enabled build")
 if (ROCM_CCACHE_BUILD)
@@ -61,6 +64,7 @@ endif()
 
 # Following variables are required for ROCM backwards compatibility,
 # and should be removed in ROCM 7.0 release.
+set(ROCM_DEVICE_LIBS_BITCODE_INSTALL_LOC_CLANG_RESOURCE_DIR OFF CACHE STRING "Install bitcode to clang resource directory")
 set(ROCM_DEVICE_LIBS_BITCODE_INSTALL_LOC_NEW "" CACHE STRING "New bitcode install location relative to CMAKE_INSTALL_PREFIX")
 set(ROCM_DEVICE_LIBS_BITCODE_INSTALL_LOC_OLD "" CACHE STRING "Old bitcode install location relative to CMAKE_INSTALL_PREFIX")
 

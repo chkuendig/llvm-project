@@ -13,16 +13,19 @@
 //===----------------------------------------------------------------------===//
 
 #include "comgr.h"
+#include "amd_comgr.h"
 #include "comgr-compiler.h"
 #include "comgr-device-libs.h"
 #include "comgr-disassembly.h"
 #include "comgr-env.h"
+#include "comgr-logger.h"
 #include "comgr-metadata.h"
 #include "comgr-signal.h"
 #include "comgr-symbol.h"
 #include "comgr-symbolizer.h"
 
 #include "clang/Basic/Version.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/Constants.h"
@@ -53,6 +56,28 @@ using namespace COMGR;
 using namespace COMGR::TimeStatistics;
 
 namespace {
+// Forwards writes to both the in-memory comgr.log buffer and the redirect sink.
+// The sink write goes through Logger::writeToSink to hold the mutex vs emit().
+class TeeStream : public raw_ostream {
+public:
+  explicit TeeStream(raw_ostream &Buffer, Logger &Log)
+      : Buffer(Buffer), Log(Log) {
+    SetUnbuffered();
+  }
+
+private:
+  void write_impl(const char *Ptr, size_t Size) override {
+    Buffer.write(Ptr, Size);
+    Log.writeToSink(StringRef(Ptr, Size));
+    Pos += Size;
+  }
+  uint64_t current_pos() const override { return Pos; }
+
+  raw_ostream &Buffer;
+  Logger &Log;
+  uint64_t Pos = 0;
+};
+
 bool isLanguageValid(amd_comgr_language_t Language) {
   return Language >= AMD_COMGR_LANGUAGE_NONE &&
          Language <= AMD_COMGR_LANGUAGE_LAST;
@@ -67,7 +92,6 @@ bool isSymbolInfoValid(amd_comgr_symbol_info_t SymbolInfo) {
          SymbolInfo <= AMD_COMGR_SYMBOL_INFO_LAST;
 }
 
-
 amd_comgr_status_t dispatchCompilerAction(amd_comgr_action_kind_t ActionKind,
                                           DataAction *ActionInfo,
                                           DataSet *InputSet, DataSet *ResultSet,
@@ -80,6 +104,8 @@ amd_comgr_status_t dispatchCompilerAction(amd_comgr_action_kind_t ActionKind,
     return Compiler.compileToBitcode();
   case AMD_COMGR_ACTION_UNBUNDLE:
     return Compiler.unbundle();
+  case AMD_COMGR_ACTION_UNPACKAGE:
+    return Compiler.unpackage();
   case AMD_COMGR_ACTION_LINK_BC_TO_BC:
     return Compiler.linkBitcodeToBitcode();
   case AMD_COMGR_ACTION_CODEGEN_BC_TO_RELOCATABLE:
@@ -102,6 +128,8 @@ amd_comgr_status_t dispatchCompilerAction(amd_comgr_action_kind_t ActionKind,
     return Compiler.compileSpirvToRelocatable();
   case AMD_COMGR_ACTION_TRANSLATE_SPIRV_TO_BC:
     return Compiler.translateSpirvToBitcode();
+  case AMD_COMGR_ACTION_COMPILE_SOURCE_TO_SPIRV:
+    return Compiler.compileSourceToSpirv();
 
   default:
     return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
@@ -122,7 +150,8 @@ StringRef getLanguageName(amd_comgr_language_t Language) {
     return "AMD_COMGR_LANGUAGE_LLVM_IR";
   }
 
-  llvm_unreachable("invalid language");
+  assert(false && "invalid language");
+  return "<unknown>";
 }
 
 StringRef getStatusName(amd_comgr_status_t Status) {
@@ -137,7 +166,8 @@ StringRef getStatusName(amd_comgr_status_t Status) {
     return "AMD_COMGR_STATUS_ERROR_OUT_OF_RESOURCES";
   }
 
-  llvm_unreachable("invalid status");
+  assert(false && "invalid status");
+  return "<unknown>";
 }
 
 /// Perform a simple quoting of an option to allow separating options with
@@ -193,9 +223,14 @@ StringRef getActionKindName(amd_comgr_action_kind_t ActionKind) {
     return "AMD_COMGR_ACTION_COMPILE_SPIRV_TO_RELOCATABLE";
   case AMD_COMGR_ACTION_TRANSLATE_SPIRV_TO_BC:
     return "AMD_COMGR_ACTION_TRANSLATE_SPIRV_TO_BC";
+  case AMD_COMGR_ACTION_COMPILE_SOURCE_TO_SPIRV:
+    return "AMD_COMGR_ACTION_COMPILE_SOURCE_TO_SPIRV";
+  case AMD_COMGR_ACTION_UNPACKAGE:
+    return "AMD_COMGR_ACTION_UNPACKAGE";
   }
 
-  llvm_unreachable("invalid action");
+  assert(false && "invalid action");
+  return "<unknown>";
 }
 
 bool COMGR::isDataKindValid(amd_comgr_data_kind_t DataKind) {
@@ -203,71 +238,13 @@ bool COMGR::isDataKindValid(amd_comgr_data_kind_t DataKind) {
          DataKind <= AMD_COMGR_DATA_KIND_LAST;
 }
 
-amd_comgr_status_t COMGR::setCStr(char *&Dest, StringRef Src, size_t *Size) {
-  free(Dest);
-  Dest = reinterpret_cast<char *>(malloc(Src.size() + 1));
-  if (!Dest) {
-    return AMD_COMGR_STATUS_ERROR_OUT_OF_RESOURCES;
-  }
-  memcpy(Dest, Src.data(), Src.size());
-  Dest[Src.size()] = '\0';
-  if (Size) {
-    *Size = Src.size();
-  }
-  return AMD_COMGR_STATUS_SUCCESS;
-}
-
 StringRef COMGR::getComgrHashIdentifier() {
   return xstringify(AMD_COMGR_VERSION_ID);
 }
 
-amd_comgr_status_t COMGR::parseTargetIdentifier(StringRef IdentStr,
-                                                TargetIdentifier &Ident) {
-  SmallVector<StringRef, 5> IsaNameComponents;
-  IdentStr.split(IsaNameComponents, '-', 4);
-  if (IsaNameComponents.size() != 5) {
-    return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
-  }
-
-  Ident.Arch = IsaNameComponents[0];
-  Ident.Vendor = IsaNameComponents[1];
-  Ident.OS = IsaNameComponents[2];
-  Ident.Environ = IsaNameComponents[3];
-
-  Ident.Features.clear();
-  IsaNameComponents[4].split(Ident.Features, ':');
-
-  Ident.Processor = Ident.Features[0];
-  Ident.Features.erase(Ident.Features.begin());
-
-
-  // TODO: Add a LIT test for this
-  if (IdentStr == "spirv64-amd-amdhsa--amdgcnspirv" ||
-      IdentStr == "spirv64-amd-amdhsa-unknown-amdgcnspirv") {
-    // Features not supported for SPIR-V
-    if (!Ident.Features.empty())
-      return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
-    return AMD_COMGR_STATUS_SUCCESS;
-  }
-
-  size_t IsaIndex;
-  amd_comgr_status_t Status = metadata::getIsaIndex(IdentStr, IsaIndex);
-  if (Status != AMD_COMGR_STATUS_SUCCESS) {
-    return Status;
-  }
-
-  for (auto Feature : Ident.Features) {
-    if (!metadata::isSupportedFeature(IsaIndex, Feature)) {
-      return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
-    }
-  }
-
-  return AMD_COMGR_STATUS_SUCCESS;
-}
-
 void COMGR::ensureLLVMInitialized() {
 
-  // LLVMInitializeAMDGPUTargetInfo calls TargetRegistry.cpp:RegisterTarget()
+  // LLVMInitialize<...>TargetInfo calls TargetRegistry.cpp:RegisterTarget()
   // This function is not thread safe. There may be thread safety issues
   // with the other LLVMInitialize functions as well. For completeness, we
   // include all of these initialization functions in mutual exclusion region
@@ -286,6 +263,12 @@ void COMGR::ensureLLVMInitialized() {
     LLVMInitializeAMDGPUDisassembler();
     LLVMInitializeAMDGPUAsmParser();
     LLVMInitializeAMDGPUAsmPrinter();
+#ifdef COMGR_SPIRV_BACKEND_AVAILABLE
+    LLVMInitializeSPIRVTarget();
+    LLVMInitializeSPIRVTargetInfo();
+    LLVMInitializeSPIRVTargetMC();
+    LLVMInitializeSPIRVAsmPrinter();
+#endif
     LLVMInitialized = true;
   }
 }
@@ -410,6 +393,20 @@ DataAction::setBundleEntryIDs(ArrayRef<const char *> EntryIDs) {
 
 ArrayRef<std::string> DataAction::getBundleEntryIDs() { return BundleEntryIDs; }
 
+amd_comgr_status_t
+DataAction::setPackageEntryIDs(llvm::ArrayRef<amd_comgr_target_id_t> EntryIDs) {
+  PackageEntryIDs.clear();
+  for (const amd_comgr_target_id_t &ID : EntryIDs) {
+    PackageEntryIDs.emplace_back(ID.triple, ID.arch);
+  }
+  return AMD_COMGR_STATUS_SUCCESS;
+}
+
+llvm::ArrayRef<std::pair<std::string, std::string>>
+DataAction::getPackageEntryIDs() {
+  return PackageEntryIDs;
+}
+
 amd_comgr_metadata_kind_t DataMeta::getMetadataKind() {
   if (DocNode.isScalar()) {
     return AMD_COMGR_METADATA_KIND_STRING;
@@ -432,9 +429,6 @@ std::string DataMeta::convertDocNodeToString(msgpack::DocNode DocNode) {
   }
   return DocNode.toString();
 }
-
-DataSymbol::DataSymbol(SymbolContext *DataSym) : DataSym(DataSym) {}
-DataSymbol::~DataSymbol() { delete DataSym; }
 
 amd_comgr_status_t AMD_COMGR_API
     // NOLINTNEXTLINE(readability-identifier-naming)
@@ -630,6 +624,11 @@ amd_comgr_status_t AMD_COMGR_API
   DataObject *DataP = DataObject::convert(Data);
 
   if (!DataP || !DataP->hasValidDataKind()) {
+    return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
+  }
+
+  // Drive letters like "C:\" break getFilePath()'s temp-dir join.
+  if (Name && StringRef(Name).contains(':')) {
     return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
   }
 
@@ -922,8 +921,8 @@ amd_comgr_status_t AMD_COMGR_API
     return AMD_COMGR_STATUS_SUCCESS;
   }
 
-  if (StringRef(IsaName) == "spir64-amd-amdhsa--amdgcnspirv" ||
-      StringRef(IsaName )== "spir64-amd-amdhsa-unknown-amdgcnspirv") {
+  if (StringRef(IsaName) == "spirv64-amd-amdhsa--amdgcnspirv" ||
+      StringRef(IsaName) == "spirv64-amd-amdhsa-unknown-amdgcnspirv") {
     return ActionP->setIsaName(IsaName);
   }
 
@@ -1102,6 +1101,73 @@ amd_comgr_status_t AMD_COMGR_API
 
 amd_comgr_status_t AMD_COMGR_API
     // NOLINTNEXTLINE(readability-identifier-naming)
+    amd_comgr_action_info_get_package_entry_id_count
+    //
+    (amd_comgr_action_info_t ActionInfo, size_t *Count) {
+  DataAction *ActionP = DataAction::convert(ActionInfo);
+
+  if (!ActionP) {
+    return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
+  }
+
+  *Count = ActionP->getPackageEntryIDs().size();
+
+  return AMD_COMGR_STATUS_SUCCESS;
+}
+
+amd_comgr_status_t AMD_COMGR_API
+    // NOLINTNEXTLINE(readability-identifier-naming)
+    amd_comgr_action_info_get_package_entry_id
+    //
+    (amd_comgr_action_info_t ActionInfo, size_t Index, size_t *TripleSize,
+     char *Triple, size_t *ArchSize, char *Arch) {
+  DataAction *ActionP = DataAction::convert(ActionInfo);
+
+  if (!ActionP || !TripleSize || !ArchSize) {
+    return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
+  }
+
+  ArrayRef<std::pair<std::string, std::string>> ActionPackageEntryIDs =
+      ActionP->getPackageEntryIDs();
+
+  if (Index >= ActionPackageEntryIDs.size()) {
+    return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
+  }
+
+  const std::pair<std::string, std::string> &EntryID =
+      ActionPackageEntryIDs[Index];
+
+  // First return the sizes of the triple and arch strings; once the caller has
+  // allocated memory and passed in both buffers, copy the strings.
+  if (!Triple || !Arch) {
+    *TripleSize = EntryID.first.size() + 1;
+    *ArchSize = EntryID.second.size() + 1;
+  } else {
+    memcpy(Triple, EntryID.first.c_str(), *TripleSize);
+    memcpy(Arch, EntryID.second.c_str(), *ArchSize);
+  }
+
+  return AMD_COMGR_STATUS_SUCCESS;
+}
+
+amd_comgr_status_t AMD_COMGR_API
+    // NOLINTNEXTLINE(readability-identifier-naming)
+    amd_comgr_action_info_set_package_entry_ids
+    //
+    (amd_comgr_action_info_t ActionInfo, const amd_comgr_target_id_t EntryIDs[],
+     size_t Count) {
+  DataAction *ActionP = DataAction::convert(ActionInfo);
+
+  if (!ActionP || (!EntryIDs && Count)) {
+    return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
+  }
+
+  return ActionP->setPackageEntryIDs(
+      ArrayRef<amd_comgr_target_id_t>(EntryIDs, Count));
+}
+
+amd_comgr_status_t AMD_COMGR_API
+    // NOLINTNEXTLINE(readability-identifier-naming)
     amd_comgr_action_info_set_vfs
     //
     (amd_comgr_action_info_t ActionInfo, bool ShouldUseVFS) {
@@ -1128,6 +1194,62 @@ amd_comgr_status_t AMD_COMGR_API
   }
 
   ActionP->ShouldLinkDeviceLibs = ShouldLinkDeviceLibs;
+
+  return AMD_COMGR_STATUS_SUCCESS;
+}
+
+amd_comgr_status_t AMD_COMGR_API
+    // NOLINTNEXTLINE(readability-identifier-naming)
+    amd_comgr_action_info_set_block_sizes
+    //
+    (amd_comgr_action_info_t ActionInfo, const size_t *BlockSizes,
+     size_t Count) {
+  DataAction *ActionP = DataAction::convert(ActionInfo);
+
+  if (!ActionP || (!BlockSizes && Count)) {
+    return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
+  }
+
+  ActionP->BlockSizes.clear();
+  if (BlockSizes && Count > 0) {
+    ActionP->BlockSizes.assign(BlockSizes, BlockSizes + Count);
+  }
+
+  return AMD_COMGR_STATUS_SUCCESS;
+}
+
+amd_comgr_status_t AMD_COMGR_API
+    // NOLINTNEXTLINE(readability-identifier-naming)
+    amd_comgr_action_info_get_block_sizes_count
+    //
+    (amd_comgr_action_info_t ActionInfo, size_t *Count) {
+  DataAction *ActionP = DataAction::convert(ActionInfo);
+
+  if (!ActionP || !Count) {
+    return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
+  }
+
+  *Count = ActionP->BlockSizes.size();
+
+  return AMD_COMGR_STATUS_SUCCESS;
+}
+
+amd_comgr_status_t AMD_COMGR_API
+    // NOLINTNEXTLINE(readability-identifier-naming)
+    amd_comgr_action_info_get_block_sizes
+    //
+    (amd_comgr_action_info_t ActionInfo, size_t Count, size_t *BlockSizes) {
+  DataAction *ActionP = DataAction::convert(ActionInfo);
+
+  if (!ActionP || !BlockSizes) {
+    return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
+  }
+
+  if (Count < ActionP->BlockSizes.size()) {
+    return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
+  }
+
+  std::copy(ActionP->BlockSizes.begin(), ActionP->BlockSizes.end(), BlockSizes);
 
   return AMD_COMGR_STATUS_SUCCESS;
 }
@@ -1238,52 +1360,54 @@ amd_comgr_status_t AMD_COMGR_API
     std::string PerfLog = "PerfStatsLog.txt";
     raw_string_ostream LogS(LogStr);
 
-    // The log stream when redirecting to a file.
-    std::unique_ptr<raw_fd_ostream> LogF;
-
     // Pointer to the currently selected log stream.
     raw_ostream *LogP = &LogS;
 
-    if (std::optional<StringRef> RedirectLogs = env::getRedirectLogs()) {
-      StringRef RedirectLog = *RedirectLogs;
-      if (RedirectLog == "stdout") {
-        LogP = &outs();
-      } else if (RedirectLog == "stderr") {
-        LogP = &errs();
-      } else {
-        std::error_code EC;
-        LogF.reset(new (std::nothrow) raw_fd_ostream(
-            RedirectLog, EC, sys::fs::OF_Text | sys::fs::OF_Append));
-        if (EC) {
-          LogF.reset();
-          *LogP << "Comgr unable to redirect log to file '" << RedirectLog
-                << "': " << EC.message() << "\n";
-        } else {
-          LogP = LogF.get();
-          PerfLog = RedirectLog.str();
-        }
+    LogCaptureScope LogCapture(LogS);
+    Logger &Log = getLogger();
+
+    // On redirect, tee the compiler-diagnostic stream to both LogS and the
+    // sink so comgr.log and the redirect destination get the same content.
+    std::optional<TeeStream> RedirectTee;
+    if (env::getRedirectLogs()) {
+      // The Logger already resolved and opened the destination (see
+      // Logger::Logger); reuse its sink. A null sink means the open failed.
+      if (Log.hasSink()) {
+        RedirectTee.emplace(LogS, Log);
+        LogP = &RedirectTee.value();
+        // Empty when the sink is a stream (stdout/stderr/"-"), so time
+        // statistics stay off in that case.
+        StringRef RedirectFile = Log.getRedirectFilename();
+        if (!RedirectFile.empty())
+          PerfLog = RedirectFile.str();
+      } else if (StringRef SinkError = Log.getSinkError(); !SinkError.empty()) {
+        // Redirect open failed: surface the diagnostic into comgr.log
+        // unconditionally (emit() would gate it behind AMD_COMGR_LOG_LEVEL).
+        LogS << "comgr: " << SinkError << '\n';
       }
     }
 
     InitTimeStatistics(PerfLog);
 
-    if (env::shouldEmitVerboseLogs()) {
-      *LogP << "amd_comgr_do_action:\n"
-            << "\t  ActionKind: " << getActionKindName(ActionKind) << '\n'
-            << "\t     IsaName: " << ActionInfoP->IsaName << '\n'
-            << "\t     Options:";
+    if (Log.isEnabled(LogLevel::Debug)) {
+      SmallString<256> HeaderStr;
+      raw_svector_ostream HeaderS(HeaderStr);
+      HeaderS << "amd_comgr_do_action:\n"
+              << "\t  ActionKind: " << getActionKindName(ActionKind) << '\n'
+              << "\t     IsaName: " << ActionInfoP->IsaName << '\n'
+              << "\t     Options:";
       for (auto &Option : ActionInfoP->getOptions()) {
-        *LogP << ' ';
-        printQuotedOption(*LogP, Option);
+        HeaderS << ' ';
+        printQuotedOption(HeaderS, Option);
       }
-      *LogP << '\n'
-            << "\t        Path: " << ActionInfoP->Path << '\n'
-            << "\t    Language: " << getLanguageName(ActionInfoP->Language)
-            << '\n'
-            << " Comgr Branch-Commit: " << xstringify(AMD_COMGR_GIT_BRANCH)
-            << '-' << xstringify(AMD_COMGR_GIT_COMMIT) << '\n'
-            << "\t LLVM Commit: " << clang::getLLVMRevision() << '\n';
-      (*LogP).flush();
+      HeaderS << '\n'
+              << "\t        Path: " << ActionInfoP->Path << '\n'
+              << "\t    Language: " << getLanguageName(ActionInfoP->Language)
+              << '\n'
+              << " Comgr Branch-Commit: " << xstringify(AMD_COMGR_GIT_BRANCH)
+              << '-' << xstringify(AMD_COMGR_GIT_COMMIT) << '\n'
+              << "\t LLVM Commit: " << clang::getLLVMRevision();
+      Log.emit(LogLevel::Debug, HeaderStr);
     }
 
     ProfilePoint ProfileAction(getActionKindName(ActionKind));
@@ -1291,6 +1415,7 @@ amd_comgr_status_t AMD_COMGR_API
     case AMD_COMGR_ACTION_SOURCE_TO_PREPROCESSOR:
     case AMD_COMGR_ACTION_COMPILE_SOURCE_TO_BC:
     case AMD_COMGR_ACTION_UNBUNDLE:
+    case AMD_COMGR_ACTION_UNPACKAGE:
     case AMD_COMGR_ACTION_LINK_BC_TO_BC:
     case AMD_COMGR_ACTION_CODEGEN_BC_TO_RELOCATABLE:
     case AMD_COMGR_ACTION_CODEGEN_BC_TO_ASSEMBLY:
@@ -1302,6 +1427,7 @@ amd_comgr_status_t AMD_COMGR_API
     case AMD_COMGR_ACTION_COMPILE_SOURCE_TO_EXECUTABLE:
     case AMD_COMGR_ACTION_COMPILE_SPIRV_TO_RELOCATABLE:
     case AMD_COMGR_ACTION_TRANSLATE_SPIRV_TO_BC:
+    case AMD_COMGR_ACTION_COMPILE_SOURCE_TO_SPIRV:
       ActionStatus = dispatchCompilerAction(ActionKind, ActionInfoP, InputSetP,
                                             ResultSetP, *LogP);
       break;
@@ -1324,9 +1450,10 @@ amd_comgr_status_t AMD_COMGR_API
       return Status;
     }
 
-    if (env::shouldEmitVerboseLogs()) {
-      *LogP << "\tReturnStatus: " << getStatusName(ActionStatus) << "\n\n";
-    }
+    Log.emit(LogLevel::Debug,
+             Twine("\tReturnStatus: ") + getStatusName(ActionStatus) + "\n");
+
+    Log.sinkFlush();
 
     if (ActionInfoP->Logging) {
       amd_comgr_data_t LogT;
@@ -1334,11 +1461,11 @@ amd_comgr_status_t AMD_COMGR_API
         return Status;
       }
       ScopedDataObjectReleaser LogSDOR(LogT);
-      DataObject *Log = DataObject::convert(LogT);
-      if (auto Status = Log->setName("comgr.log")) {
+      DataObject *LogData = DataObject::convert(LogT);
+      if (auto Status = LogData->setName("comgr.log")) {
         return Status;
       }
-      if (auto Status = Log->setData(LogS.str())) {
+      if (auto Status = LogData->setData(LogS.str())) {
         return Status;
       }
       if (auto Status = amd_comgr_data_set_add(ResultSet, LogT)) {
@@ -1649,7 +1776,7 @@ amd_comgr_status_t AMD_COMGR_API
     *(size_t *)Value = strlen(Sym->Name);
     return AMD_COMGR_STATUS_SUCCESS;
   case AMD_COMGR_SYMBOL_INFO_NAME:
-    strcpy((char *)Value, Sym->Name);
+    memcpy((char *)Value, Sym->Name, strlen(Sym->Name) + 1);
     return AMD_COMGR_STATUS_SUCCESS;
   case AMD_COMGR_SYMBOL_INFO_TYPE:
     *(amd_comgr_symbol_type_t *)Value = Sym->Type;
@@ -1665,7 +1792,8 @@ amd_comgr_status_t AMD_COMGR_API
     return AMD_COMGR_STATUS_SUCCESS;
   }
 
-  llvm_unreachable("invalid symbol info");
+  assert(false && "invalid symbol info");
+  return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
 }
 
 amd_comgr_status_t AMD_COMGR_API
@@ -2067,14 +2195,23 @@ amd_comgr_populate_name_expression_map(amd_comgr_data_t Data, size_t *Count) {
     auto Rodata = std::move(RodataOrError.get());
 
     // Collect an unmangled name for each name expression
+    StringRef RodataStr(reinterpret_cast<const char *>(Rodata.data()),
+                        Rodata.size());
     for (auto *ExpData : NameExpDataVec) {
       // TODO: If/when an accessor API becomes available to get the starting
       // address for the section, switch to that
       size_t Offset = ExpData->RodataOffset - RodataShdr.sh_offset;
 
-      // Store from the offset up until the first '\0'
-      const char *Unmangled = reinterpret_cast<const char *>(&Rodata[Offset]);
-      ExpData->UnmangledName = StringRef(Unmangled);
+      // RodataOffset derives from the untrusted ELF r_addend; reject offsets
+      // outside .rodata (a too-small value also wraps to a large Offset here).
+      if (Offset >= Rodata.size()) {
+        for (auto *Ptr : NameExpDataVec)
+          delete Ptr;
+        return AMD_COMGR_STATUS_ERROR;
+      }
+
+      // Store from the offset up until the first '\0', bounded to .rodata.
+      ExpData->UnmangledName = RodataStr.substr(Offset).split('\0').first;
     }
 
     // Populate mangled names now that mangled values are set

@@ -1,16 +1,21 @@
 set(LLVM_LINK_COMPONENTS
+  BinaryFormat
   DebugInfoDWARF
   DebugInfoDWARFLowLevel
   AllTargetsDescs
   AllTargetsInfos
   BinaryFormat
+  Core
+  IRReader
   MC
   Object
   Support
   TargetParser
+  BinaryFormat
   )
 
 add_llvm_tool(llvm-dwarfdump
+  Coverage.cpp
   SectionSizes.cpp
   Statistics.cpp
   llvm-dwarfdump.cpp

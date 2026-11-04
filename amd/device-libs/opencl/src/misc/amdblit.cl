@@ -52,6 +52,13 @@ typedef union streamBatchMemOpParams_union {
   ulong pad[6];
 } BatchMemOpParams;
 
+typedef struct CopyBufferBatchDescriptor {
+  ulong source_address;
+  ulong destination_address;
+  ulong aligned_element_count;
+  uint aligned_element_size;
+  uint trailing_byte_count;
+} CopyBufferBatchDescriptor;
 
 static const uint SplitCount = 3;
 
@@ -471,6 +478,92 @@ __amd_copyBufferExt(
 }
 
 __attribute__((always_inline)) void
+__amd_copyBufferBatch(
+    __global void* descriptor_buffer,
+    uint workgroup_size,
+    uint copy_stride)
+{
+  __global const CopyBufferBatchDescriptor* descriptors =
+      (__global const CopyBufferBatchDescriptor*)descriptor_buffer;
+  uint work_item_id = (uint)get_local_id(0);
+  uint group_ordinal = (uint)get_group_id(0);
+  uint descriptor_index = (uint)get_group_id(1);
+
+  CopyBufferBatchDescriptor descriptor = descriptors[descriptor_index];
+  __global uchar* source = (__global uchar*)descriptor.source_address;
+  __global uchar* destination = (__global uchar*)descriptor.destination_address;
+  ulong copy_index = ((ulong)group_ordinal * workgroup_size) + work_item_id;
+
+  if (descriptor.aligned_element_size == sizeof(ulong2)) {
+    __global ulong2* source_data = (__global ulong2*)source;
+    __global ulong2* destination_data = (__global ulong2*)destination;
+    while (copy_index < descriptor.aligned_element_count) {
+      destination_data[copy_index] = source_data[copy_index];
+      copy_index += copy_stride;
+    }
+  } else {
+    __global uint* source_data = (__global uint*)source;
+    __global uint* destination_data = (__global uint*)destination;
+    while (copy_index < descriptor.aligned_element_count) {
+      destination_data[copy_index] = source_data[copy_index];
+      copy_index += copy_stride;
+    }
+  }
+  if ((descriptor.trailing_byte_count != 0) && (group_ordinal == 0) &&
+      (work_item_id == 0)) {
+    ulong tail_start =
+        descriptor.aligned_element_count * descriptor.aligned_element_size;
+    ulong tail_end = tail_start + descriptor.trailing_byte_count;
+    for (ulong i = tail_start; i < tail_end; ++i) {
+      destination[i] = source[i];
+    }
+  }
+}
+
+__attribute__((always_inline)) void __amd_fillBufferUnAligned(__global void* __restrict buf,
+                                                 __constant uchar* __restrict pattern,
+                                                 int body_pattern, ulong2 body_tile_pattern,
+                                                 ulong body_tile_count, ulong body_tile_passes,
+                                                 ulong stride, ulong pattern_size,
+                                                 ulong tail_offset, __global uchar* __restrict body_ptr,
+                                                 __global uchar* __restrict body_tail_ptr,
+                                                 __global uchar* __restrict tail_ptr,
+                                                 __global ulong2* __restrict element_tiled,
+                                                 ushort4 counts, int isAligned) {
+  ulong id = get_global_id(0);
+
+  // Handle head, body and tail in the first warp only.
+  // count values are each <= 4, so all unaligned work fits in 32 lanes.
+  // Skip when buffer is 16-byte aligned (no head/body/body_tail/tail regions).
+  if (!isAligned && id < 32) {
+    __global uchar* head_ptr = (__global uchar*)buf;
+    const uint lane = (uint)id;
+    const uint head_end = (uint)counts.s0;
+    const uint body_end = head_end + (uint)counts.s1;
+    const uint body_tail_end = body_end + (uint)counts.s2;
+    const uint tail_end = body_tail_end + (uint)counts.s3;
+
+    if (lane < head_end) {
+      head_ptr[lane] = pattern[lane & (pattern_size - 1)];
+    } else if (lane < body_end) {
+      ((__global int*)body_ptr)[lane - head_end] = body_pattern;
+    } else if (lane < body_tail_end) {
+      ((__global int*)body_tail_ptr)[lane - body_end] = body_pattern;
+    } else if (lane < tail_end) {
+      const ulong tail_byte_idx = (ulong)(lane - body_tail_end);
+      tail_ptr[tail_byte_idx] =
+          pattern[(tail_offset + tail_byte_idx) & (pattern_size - 1)];
+    }
+  }
+
+  // We pass in the number of passes from the CPU to get the best code-gen
+  // We use the number of passes and the size to get correct behiaviour
+  for (ulong j = 0; (j < body_tile_passes) && (j * stride + id < body_tile_count); ++j) {
+    element_tiled[j * stride + id] = body_tile_pattern;
+  }
+}
+
+__attribute__((always_inline)) void
 __amd_fillBuffer(
     __global uchar* bufUChar,
     __global uint* bufUInt,
@@ -727,6 +820,34 @@ __amd_streamOpsWrite(
   }
 }
 
+__attribute__((always_inline)) void
+__amd_streamOpsIncrement(
+    __global atomic_uint* ptrUint,
+    __global atomic_ulong* ptrUlong,
+    ulong value) {
+
+    if (ptrUint) {
+      atomic_fetch_add_explicit (ptrUint, value,  memory_order_relaxed, memory_scope_all_svm_devices);
+    } else {
+      atomic_fetch_add_explicit  (ptrUlong, value,  memory_order_relaxed, memory_scope_all_svm_devices);
+    }
+}
+
+__attribute__((always_inline)) void
+__amd_streamOpsDecrement(
+    __global atomic_uint* ptrUint,
+    __global atomic_ulong* ptrUlong,
+    ulong value) {
+
+    __attribute__((atomic(remote_memory, fine_grained_memory)))
+    {
+      if (ptrUint) {
+        __scoped_atomic_fetch_sub((volatile uint*)ptrUint, (uint)value, memory_order_relaxed, __MEMORY_SCOPE_SYSTEM);
+      } else {
+        __scoped_atomic_fetch_sub((volatile ulong*)ptrUlong, value, memory_order_relaxed, __MEMORY_SCOPE_SYSTEM);
+      }
+    }
+}
 
 __attribute__((always_inline)) void
 __amd_streamOpsWait(

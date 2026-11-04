@@ -11,6 +11,7 @@
 
 #include "amd_comgr.h"
 #include "comgr-symbol.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -133,6 +134,15 @@ public:
   ~ScopedDataObjectReleaser() { Obj->release(); }
 };
 
+class ScopedDataSetReleaser {
+  amd_comgr_data_set_t Set;
+
+public:
+  ScopedDataSetReleaser(amd_comgr_data_set_t Set) : Set(Set) {}
+
+  ~ScopedDataSetReleaser() { amd_comgr_destroy_data_set(Set); }
+};
+
 struct DataSet {
 
   DataSet();
@@ -199,6 +209,10 @@ struct DataAction {
   amd_comgr_status_t setBundleEntryIDs(llvm::ArrayRef<const char *> EntryIDs);
   llvm::ArrayRef<std::string> getBundleEntryIDs();
 
+  amd_comgr_status_t
+  setPackageEntryIDs(llvm::ArrayRef<amd_comgr_target_id_t> EntryIDs);
+  llvm::ArrayRef<std::pair<std::string, std::string>> getPackageEntryIDs();
+
   char *IsaName;
   char *Path;
   amd_comgr_language_t Language;
@@ -207,6 +221,8 @@ struct DataAction {
   bool ShouldUseVFS = true;
 
   std::vector<std::string> BundleEntryIDs;
+  std::vector<std::pair<std::string, std::string>> PackageEntryIDs;
+  std::vector<size_t> BlockSizes;
 
 private:
   std::vector<std::string> ListOptions;

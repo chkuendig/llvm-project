@@ -49,7 +49,7 @@ OMPContext::OMPContext(bool IsDeviceCompilation, Triple TargetTriple,
     case Triple::x86_64:
       ActiveTraits.set(unsigned(TraitProperty::target_device_kind_cpu));
       break;
-    case Triple::amdgcn:
+    case Triple::amdgpu:
     case Triple::nvptx:
     case Triple::nvptx64:
     case Triple::spirv64:
@@ -61,11 +61,7 @@ OMPContext::OMPContext(bool IsDeviceCompilation, Triple TargetTriple,
     // Add the appropriate device architecture trait based on the triple.
 #define OMP_TRAIT_PROPERTY(Enum, TraitSetEnum, TraitSelectorEnum, Str)         \
   if (TraitSelector::TraitSelectorEnum == TraitSelector::target_device_arch) { \
-    if (TargetOffloadTriple.getArch() ==                                       \
-        TargetOffloadTriple.getArchTypeForLLVMName(Str))                       \
-      ActiveTraits.set(unsigned(TraitProperty::Enum));                         \
-    if (StringRef(Str) == "x86_64" &&                                          \
-        TargetOffloadTriple.getArch() == Triple::x86_64)                       \
+    if (TargetOffloadTriple.getArch() == Triple::parseArch(Str))               \
       ActiveTraits.set(unsigned(TraitProperty::Enum));                         \
   }
 #include "llvm/Frontend/OpenMP/OMPKinds.def"
@@ -96,7 +92,7 @@ OMPContext::OMPContext(bool IsDeviceCompilation, Triple TargetTriple,
       ActiveTraits.set(unsigned(TraitProperty::device_kind_cpu));
       ActiveTraits.set(unsigned(TraitProperty::target_device_kind_cpu));
       break;
-    case Triple::amdgcn:
+    case Triple::amdgpu:
     case Triple::nvptx:
     case Triple::nvptx64:
     case Triple::spirv64:
@@ -111,10 +107,7 @@ OMPContext::OMPContext(bool IsDeviceCompilation, Triple TargetTriple,
 #define OMP_TRAIT_PROPERTY(Enum, TraitSetEnum, TraitSelectorEnum, Str)         \
   if (TraitSelector::TraitSelectorEnum == TraitSelector::device_arch ||        \
       TraitSelector::TraitSelectorEnum == TraitSelector::target_device_arch) { \
-    if (TargetTriple.getArch() == TargetTriple.getArchTypeForLLVMName(Str))    \
-      ActiveTraits.set(unsigned(TraitProperty::Enum));                         \
-    if (StringRef(Str) == "x86_64" &&                                          \
-        TargetTriple.getArch() == Triple::x86_64)                              \
+    if (TargetTriple.getArch() == Triple::parseArch(Str))                      \
       ActiveTraits.set(unsigned(TraitProperty::Enum));                         \
   }
 #include "llvm/Frontend/OpenMP/OMPKinds.def"
@@ -123,8 +116,8 @@ OMPContext::OMPContext(bool IsDeviceCompilation, Triple TargetTriple,
     //       The discussion on the list did not seem to have come to an agreed
     //       upon solution.
 
-  // AMD should be the "OpenMP Compiler vendor" for Rocmcc Unified compiler.
-  ActiveTraits.set(unsigned(TraitProperty::implementation_vendor_amd));
+    // AMD should be the "OpenMP Compiler vendor" for Rocmcc Unified compiler.
+    ActiveTraits.set(unsigned(TraitProperty::implementation_vendor_amd));
 
     // The user condition true is accepted but not false.
     ActiveTraits.set(unsigned(TraitProperty::user_condition_true));
@@ -166,15 +159,6 @@ template <typename T> static bool isSubset(ArrayRef<T> C0, ArrayRef<T> C1) {
     ++It0;
   }
   return true;
-}
-
-/// Return true if \p C0 is a strict subset of \p C1. Note that both arrays are
-/// expected to be sorted.
-template <typename T>
-static bool isStrictSubset(ArrayRef<T> C0, ArrayRef<T> C1) {
-  if (C0.size() >= C1.size())
-    return false;
-  return isSubset<T>(C0, C1);
 }
 
 static bool isStrictSubset(const VariantMatchInfo &VMI0,

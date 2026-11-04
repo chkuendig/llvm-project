@@ -4,21 +4,17 @@ MyST (https://myst-parser.readthedocs.io/en/latest/). -->
 <!-- If you want to modify sections/contents permanently, you should modify both
 ReleaseNotes.md and ReleaseNotesTemplate.txt. -->
 
-LLVM {{env.config.release}} Release Notes
-=========================================
+# LLVM {{env.config.release}} Release Notes
 
-```{contents}
-```
 
-````{only} PreRelease
-```{warning} These are in-progress notes for the upcoming LLVM {{env.config.release}}
+::::{only} PreRelease
+:::{warning} These are in-progress notes for the upcoming LLVM {{env.config.release}}
              release. Release notes for previous releases can be found on
              [the Download Page](https://releases.llvm.org/download.html).
-```
-````
+:::
+::::
 
-Introduction
-============
+## Introduction
 
 This document contains the release notes for the LLVM Compiler Infrastructure,
 release {{env.config.release}}.  Here we describe the status of LLVM, including
@@ -36,8 +32,7 @@ LLVM web page, this document applies to the *next* release, not the current
 one.  To see the release notes for a specific release, please see the
 [releases page](https://llvm.org/releases/).
 
-Non-comprehensive list of changes in this release
-=================================================
+## Non-comprehensive list of changes in this release
 
 <!-- For small 1-3 sentence descriptions, just add an entry at the end of
 this list. If your description won't fit comfortably in one bullet
@@ -50,140 +45,113 @@ for adding a new subsection. -->
 <!-- If you would like to document a larger change, then you can add a
 subsection about it right here. You can copy the following boilerplate:
 
-Special New Feature
--------------------
+### Special New Feature
 
 Makes programs 10x faster by doing Special New Thing.
 -->
 
-Changes to the LLVM IR
-----------------------
+### Changes to the LLVM IR
 
-* The `ptrtoaddr` instruction was introduced. This instruction returns the
-  address component of a pointer type variable but unlike `ptrtoint` does not
-  capture provenance ([#125687](https://github.com/llvm/llvm-project/pull/125687)).
+### Changes to LLVM infrastructure
 
-Changes to LLVM infrastructure
-------------------------------
+### Changes to building LLVM
 
-Changes to building LLVM
-------------------------
+### Changes to TableGen
 
-Changes to TableGen
--------------------
+* `!cond` operator short-circuits at the first `true` condition.  Subsequent
+  `condition : value` pairs, along with their corresponding side effects,
+  are left unresolved.
 
-Changes to Interprocedural Optimizations
-----------------------------------------
+### Changes to Interprocedural Optimizations
 
-* Added `-enable-machine-outliner={optimistic-pgo,conservative-pgo}` to read
-  profile data to guide the machine outliner
-  ([#154437](https://github.com/llvm/llvm-project/pull/154437)).
+- Interprocedural passes no longer rewrite the signature of functions marked
+  `optnone`, so their argument list, return type, and calling convention are
+  preserved. Interprocedural analysis and transformation of such functions is
+  otherwise unaffected.
 
-Changes to Vectorizers
-----------------------------------------
+- The IR Outliner has been removed, due to lack of a maintainer and the presence
+  of correctness issues.
 
-* Added initial support for copyable elements in SLP, which models copyable
-  elements as add <element>, 0, i.e. uses identity constants for missing lanes.
-* SLP vectorizer supports initial recognition of FMA/FMAD pattern
+### Changes to Vectorizers
 
-Changes to the AArch64 Backend
-------------------------------
+### Changes to the AArch64 Backend
 
-Changes to the AMDGPU Backend
------------------------------
+### Changes to the AMDGPU Backend
 
-Changes to the ARM Backend
---------------------------
+* Replaced `xnack` and `sramecc` target features with `amdgpu.xnack`
+  and `amdgpu.sramecc` module flags.
+* `llvm.amdgcn.make.buffer.rsrc` now accepts any integer width for its
+  `numRecords` argument to account for targets that use 32-bit and 45-bit
+  `numRecords` widths more accurately. If an integer of the incorrect width
+  is used, it will be zero-extended or truncated as needed.
 
-Changes to the AVR Backend
---------------------------
+### Changes to the ARM Backend
 
-Changes to the DirectX Backend
-------------------------------
+### Changes to the AVR Backend
 
-Changes to the Hexagon Backend
-------------------------------
+### Changes to the DirectX Backend
 
-Changes to the LoongArch Backend
---------------------------------
+### Changes to the Hexagon Backend
 
-Changes to the MIPS Backend
----------------------------
+### Changes to the LoongArch Backend
 
-Changes to the PowerPC Backend
-------------------------------
+### Changes to the MIPS Backend
 
-Changes to the RISC-V Backend
------------------------------
+### Changes to the PowerPC Backend
 
-* The loop vectorizer now performs tail folding by default on RISC-V, which
-  removes the need for a scalar epilogue loop. To restore the previous behaviour
-  use `-prefer-predicate-over-epilogue=scalar-epilogue`.
-* `llvm-objdump` now has basic support for switching between disassembling code
-  and data using mapping symbols such as `$x` and `$d`. Switching architectures
-  using `$x` with an architecture string suffix is not yet supported.
-* Ssctr and Smctr extensions are no longer experimental.
-* Add support for Zvfbfa (Additional BF16 vector compute support)
-* Adds experimental support for the 'Zibi` (Branch with Immediate) extension.
-* Add support for Zvfofp8min (OFP8 conversion extension)
-* Adds assembler support for the Andes `XAndesvsinth` (Andes Vector Small Int Handling Extension).
+### Changes to the RISC-V Backend
 
-Changes to the WebAssembly Backend
-----------------------------------
+* Added experimental MC support for the `Smcsps` and `Sscsps`
+  conditional stack pointer swap extensions.
 
-Changes to the Windows Target
------------------------------
+* Adds experimental assembler/CodeGen support for the `Zilx` (Indexed Integer
+  Load) extension.
 
-Changes to the X86 Backend
---------------------------
+* Added experimental MC support for the `Smijt` and `Ssijt` interrupt jump
+  table extensions and the `Smehv` and `Ssehv` synchronous exception hardware
+  vectoring extensions.
 
-Changes to the OCaml bindings
------------------------------
+* Bump Svukte extension to 1.0.
 
-Changes to the Python bindings
-------------------------------
+### Changes to the WebAssembly Backend
 
-Changes to the C API
---------------------
+### Changes to the Windows Target
 
-Changes to the CodeGen infrastructure
--------------------------------------
+### Changes to the X86 Backend
 
-Changes to the Metadata Info
----------------------------------
+### Changes to the OCaml bindings
 
-Changes to the Debug Info
----------------------------------
+### Changes to the Python bindings
 
-Changes to the LLVM tools
----------------------------------
+### Changes to the C API
 
-* `llvm-readelf` now dumps all hex format values in lower-case mode.
-* Some code paths for supporting Python 2.7 in `llvm-lit` have been removed.
-* Support for `%T` in lit has been removed.
+### Changes to the CodeGen infrastructure
 
-Changes to LLDB
----------------------------------
+### Changes to the Metadata Info
 
-* LLDB can now set breakpoints, show backtraces, and display variables when
-  debugging Wasm with supported runtimes (WAMR and V8).
+### Changes to the Debug Info
 
-Changes to BOLT
----------------------------------
+### Changes to the LLVM tools
 
-Changes to Sanitizers
----------------------
+* llvm-mca no longer defaults -mcpu to "native"
 
-Other Changes
--------------
+### Changes to LLDB
 
-External Open Source Projects Using LLVM {{env.config.release}}
-===============================================================
+#### Windows
 
-* A project...
+* Python 3.11 or later is now required for building LLDB 24 on Windows.
+* For better performance, LLDB now turns off the Windows debug heap by default when debugging.
+  If you need the debug heap enabled, set `platform.plugin.windows.disable-debug-heap` to `false`.
 
-Additional Information
-======================
+### Changes to BOLT
+
+### Changes to Sanitizers
+
+### Other Changes
+
+## External Open Source Projects Using LLVM {{env.config.release}}
+
+## Additional Information
 
 A wide variety of additional information is available on the
 [LLVM web page](https://llvm.org/), in particular in the

@@ -1,16 +1,14 @@
 ; RUN: not mlir-translate -import-llvm -emit-expensive-warnings -split-input-file %s 2>&1 -o /dev/null | FileCheck %s
 
-; Check that debug intrinsics with an unsupported argument are dropped.
-
-declare void @llvm.dbg.value(metadata, metadata, metadata)
+; Check that debug records with an unsupported argument are dropped.
 
 ; CHECK:      import-failure.ll
-; CHECK-SAME: warning: dropped intrinsic: tail call void @llvm.dbg.value(metadata !DIArgList(i64 %{{.*}}, i64 undef), metadata !3, metadata !DIExpression(DW_OP_LLVM_arg, 0, DW_OP_LLVM_arg, 1, DW_OP_constu, 1, DW_OP_mul, DW_OP_plus, DW_OP_stack_value))
+; CHECK-SAME: warning: unhandled debug variable record #dbg_value(!DIArgList(i64 %{{.*}}, i64 undef), !{{.*}}, !DIExpression(DW_OP_LLVM_arg, 0, DW_OP_LLVM_arg, 1, DW_OP_constu, 1, DW_OP_mul, DW_OP_plus, DW_OP_stack_value), !{{.*}})
 ; CHECK:      import-failure.ll
-; CHECK-SAME: warning: dropped intrinsic: tail call void @llvm.dbg.value(metadata !6, metadata !3, metadata !DIExpression())
+; CHECK-SAME: warning: unhandled debug variable record #dbg_value(!{{.*}}, !{{.*}}, !DIExpression(), !{{.*}})
 define void @unsupported_argument(i64 %arg1) {
-  tail call void @llvm.dbg.value(metadata !DIArgList(i64 %arg1, i64 undef), metadata !3, metadata !DIExpression(DW_OP_LLVM_arg, 0, DW_OP_LLVM_arg, 1, DW_OP_constu, 1, DW_OP_mul, DW_OP_plus, DW_OP_stack_value)), !dbg !5
-  tail call void @llvm.dbg.value(metadata !6, metadata !3, metadata !DIExpression()), !dbg !5
+  #dbg_value(!DIArgList(i64 %arg1, i64 undef), !3, !DIExpression(DW_OP_LLVM_arg, 0, DW_OP_LLVM_arg, 1, DW_OP_constu, 1, DW_OP_mul, DW_OP_plus, DW_OP_stack_value), !5)
+  #dbg_value(!6, !3, !DIExpression(), !5)
   ret void
 }
 
@@ -20,9 +18,11 @@ define void @unsupported_argument(i64 %arg1) {
 !1 = distinct !DICompileUnit(language: DW_LANG_C, file: !2)
 !2 = !DIFile(filename: "import-failure.ll", directory: "/")
 !3 = !DILocalVariable(scope: !4, name: "arg1", file: !2, line: 1, arg: 1, align: 64);
-!4 = distinct !DISubprogram(name: "intrinsic", scope: !2, file: !2, spFlags: DISPFlagDefinition, unit: !1)
+!4 = distinct !DISubprogram(name: "intrinsic", scope: !2, file: !2, spFlags: DISPFlagDefinition, unit: !1, type: !999)
 !5 = !DILocation(line: 1, column: 2, scope: !4)
 !6 = !{}
+!999 = !DISubroutineType(types: !1000)
+!1000 = !{null}
 
 ; // -----
 
@@ -52,9 +52,7 @@ define dso_local void @tbaa(ptr %0) {
 
 ; // -----
 
-; CHECK:      import-failure.ll
-; CHECK-SAME: warning: expected an access group node to be empty and distinct
-; CHECK:      error: unsupported access group node: !0 = !{}
+; CHECK: Access scope must be 'distinct'
 define void @access_group(ptr %arg1) {
   %1 = load i32, ptr %arg1, !llvm.access.group !0
   ret void
@@ -157,22 +155,6 @@ end:
 !0 = distinct !{!0, !1, !2}
 !1 = !{!"llvm.loop.unroll.enable"}
 !2 = !{!"llvm.loop.unroll.disable"}
-
-; // -----
-
-; CHECK:      <unknown>
-; CHECK-SAME: warning: expected metadata node llvm.loop.vectorize.enable to hold a boolean value
-; CHECK:      <unknown>
-; CHECK-SAME: warning: unhandled metadata: !0 = distinct !{!0, !1}
-define void @unsupported_loop_annotation(i64 %n, ptr %A) {
-entry:
-  br label %end, !llvm.loop !0
-end:
-  ret void
-}
-
-!0 = distinct !{!0, !1}
-!1 = !{!"llvm.loop.vectorize.enable"}
 
 ; // -----
 
@@ -456,3 +438,98 @@ bb1:
 !91885 = !{!91886, !91887}
 !91886 = !{i32 10000, i64 86427, i32 1}
 !91887 = !{i32 100000, i64 86427, i32 1}
+
+; // -----
+
+; CHECK: error: unsupported metadata: !{{[0-9]+}} = distinct !{!"sp"}
+declare i32 @llvm.read_register.i32(metadata)
+
+define i32 @distinct_metadata_as_value() {
+  %r = call i32 @llvm.read_register.i32(metadata !0)
+  ret i32 %r
+}
+
+!0 = distinct !{!"sp"}
+
+; // -----
+
+; CHECK: error: unsupported metadata: !{{[0-9]+}} = !{!{{[0-9]+}}}
+declare i32 @llvm.read_register.i32(metadata)
+
+define i32 @nested_distinct_metadata_as_value() {
+  %r = call i32 @llvm.read_register.i32(metadata !0)
+  ret i32 %r
+}
+
+!0 = !{!1}
+!1 = distinct !{!"sp"}
+
+; // -----
+
+; CHECK: error: unsupported metadata: !{{[0-9]+}} = distinct !{!{{[0-9]+}}}
+declare i32 @llvm.read_register.i32(metadata)
+
+define i32 @cyclic_metadata_as_value() {
+  %r = call i32 @llvm.read_register.i32(metadata !0)
+  ret i32 %r
+}
+
+!0 = distinct !{!0}
+
+; // -----
+
+; Local values cannot be represented by symbol-backed metadata attributes.
+; CHECK: error: unsupported metadata: i32 %{{.*}}
+declare i32 @llvm.read_register.i32(metadata)
+
+define i32 @local_value_metadata(i32 %arg) {
+  %r = call i32 @llvm.read_register.i32(metadata i32 %arg)
+  ret i32 %r
+}
+
+; // -----
+
+; Intrinsics with dedicated import conversions have no imported symbol for a
+; metadata symbol reference to target.
+; CHECK: error: unsupported metadata: ptr @llvm.memcpy.p0.p0.i64
+declare i32 @llvm.read_register.i32(metadata)
+declare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly, ptr noalias readonly, i64, i1 immarg)
+
+define i32 @skipped_intrinsic_metadata() {
+  %r = call i32 @llvm.read_register.i32(metadata !0)
+  ret i32 %r
+}
+
+!0 = !{ptr @llvm.memcpy.p0.p0.i64}
+
+; // -----
+
+; CHECK: error: unsupported metadata: ptr @llvm.global_ctors
+declare i32 @llvm.read_register.i32(metadata)
+define void @ctor() {
+  ret void
+}
+@llvm.global_ctors = appending global [1 x { i32, ptr, ptr }] [{ i32, ptr, ptr } { i32 0, ptr @ctor, ptr null }]
+
+define i32 @metadata_ref_global_ctors() {
+  %r = call i32 @llvm.read_register.i32(metadata !0)
+  ret i32 %r
+}
+
+!0 = !{ptr @llvm.global_ctors}
+
+; // -----
+
+; CHECK: error: unsupported metadata: ptr @llvm.global_dtors
+declare i32 @llvm.read_register.i32(metadata)
+define void @dtor() {
+  ret void
+}
+@llvm.global_dtors = appending global [1 x { i32, ptr, ptr }] [{ i32, ptr, ptr } { i32 0, ptr @dtor, ptr null }]
+
+define i32 @metadata_ref_global_dtors() {
+  %r = call i32 @llvm.read_register.i32(metadata !0)
+  ret i32 %r
+}
+
+!0 = !{ptr @llvm.global_dtors}

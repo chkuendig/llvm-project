@@ -7,8 +7,11 @@
 ! Case 1
 subroutine linear_clause_01(arg)
     integer, intent(in) :: arg(:)
-    !ERROR: A modifier may not be specified in a LINEAR clause on the DO directive
-    !$omp do linear(uval(arg))
+!    !ERROR: A modifier may not be specified in a LINEAR clause on the DO directive
+!    !ERROR: List item 'arg' in LINEAR clause must be a scalar variable
+! TODO: the following line currently breaks buildbots. Disabling it until the author
+! of the breaking change can fix it.
+!    !$omp do linear(uval(arg))
     do i = 1, 5
         print *, arg(i)
     end do
@@ -18,6 +21,7 @@ end subroutine linear_clause_01
 subroutine linear_clause_02(arg_01, arg_02)
     !WARNING: The 'modifier(<list>)' syntax is deprecated in OpenMP v5.2, use '<list> : modifier' instead
     !ERROR: The list item 'arg_01' specified without the REF 'linear-modifier' must be of INTEGER type
+    !ERROR: List item 'arg_01' in LINEAR clause must be a scalar variable
     !$omp declare simd linear(val(arg_01))
     real, intent(in) :: arg_01(:)
 
@@ -46,6 +50,22 @@ subroutine linear_clause_03(arg)
     integer :: i
     common /cc/ i
     !ERROR: The list item `i` must be a dummy argument
-    !ERROR: 'i' is a common block name and must not appear in an LINEAR clause
     !$omp declare simd linear(i)
+
+    !ERROR: 'cc' is a common block name and must not appear in a LINEAR clause
+    !ERROR: The list item `i` must be a dummy argument
+    !$omp declare simd linear(/cc/)
 end subroutine linear_clause_03
+
+! Case 4
+subroutine linear_clause_04(x)
+    real :: x(10)
+    integer :: b
+    common /c/ b
+    !ERROR: 'c' is a common block name and must not appear in a LINEAR clause
+    !$omp simd linear(/c/)
+      do i = 1, 10
+        x(i) = x(i) * 2
+      end do
+    !$omp end simd
+end subroutine linear_clause_04

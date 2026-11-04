@@ -9,24 +9,26 @@
 #include "clang/Driver/Compilation.h"
 #include "clang/Basic/LLVM.h"
 #include "clang/Driver/Action.h"
+#include "clang/Driver/CommonArgs.h"
 #include "clang/Driver/Driver.h"
 #include "clang/Driver/Job.h"
-#include "clang/Driver/Options.h"
 #include "clang/Driver/ToolChain.h"
 #include "clang/Driver/Util.h"
+#include "clang/Options/Options.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Option/ArgList.h"
 #include "llvm/Option/OptSpecifier.h"
 #include "llvm/Option/Option.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/ThreadPool.h"
+#include "llvm/Support/Threading.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
+#include <algorithm>
 #include <cassert>
-#include <chrono>
-#include <functional>
-#include <mutex>
+#include <optional>
 #include <string>
 #include <system_error>
-#include <thread>
 #include <utility>
 
 using namespace clang;
@@ -59,12 +61,12 @@ Compilation::~Compilation() {
 }
 
 const DerivedArgList &
-Compilation::getArgsForToolChain(const ToolChain *TC, StringRef BoundArch,
+Compilation::getArgsForToolChain(const ToolChain *TC, BoundArch BA,
                                  Action::OffloadKind DeviceOffloadKind) {
   if (!TC)
     TC = &DefaultToolChain;
 
-  DerivedArgList *&Entry = TCArgs[{TC, BoundArch, DeviceOffloadKind}];
+  DerivedArgList *&Entry = TCArgs[{TC, BA, DeviceOffloadKind}];
   if (!Entry) {
     SmallVector<Arg *, 4> AllocatedArgs;
     DerivedArgList *OpenMPArgs = nullptr;
@@ -78,10 +80,10 @@ Compilation::getArgsForToolChain(const ToolChain *TC, StringRef BoundArch,
 
     DerivedArgList *NewDAL = nullptr;
     if (!OpenMPArgs) {
-      NewDAL = TC->TranslateXarchArgs(*TranslatedArgs, BoundArch,
-                                      DeviceOffloadKind, &AllocatedArgs);
+      NewDAL = TC->TranslateXarchArgs(*TranslatedArgs, BA, DeviceOffloadKind,
+                                      &AllocatedArgs);
     } else {
-      NewDAL = TC->TranslateXarchArgs(*OpenMPArgs, BoundArch, DeviceOffloadKind,
+      NewDAL = TC->TranslateXarchArgs(*OpenMPArgs, BA, DeviceOffloadKind,
                                       &AllocatedArgs);
       if (!NewDAL)
         NewDAL = OpenMPArgs;
@@ -90,11 +92,11 @@ Compilation::getArgsForToolChain(const ToolChain *TC, StringRef BoundArch,
     }
 
     if (!NewDAL) {
-      Entry = TC->TranslateArgs(*TranslatedArgs, BoundArch, DeviceOffloadKind);
+      Entry = TC->TranslateArgs(*TranslatedArgs, BA, DeviceOffloadKind);
       if (!Entry)
         Entry = TranslatedArgs;
     } else {
-      Entry = TC->TranslateArgs(*NewDAL, BoundArch, DeviceOffloadKind);
+      Entry = TC->TranslateArgs(*NewDAL, BA, DeviceOffloadKind);
       if (!Entry)
         Entry = NewDAL;
       else
@@ -236,100 +238,129 @@ static bool ActionFailed(const Action *A,
   return false;
 }
 
-namespace {
-class JobScheduler {
-public:
-  enum JobState { JS_WAIT, JS_RUN, JS_DONE, JS_FAIL };
-  JobScheduler(const JobList &Jobs, size_t NJobs = 1)
-      : Jobs(Jobs), NumJobs(NJobs) {
-#if !LLVM_ENABLE_THREADS
-    NumJobs = 1;
-#endif
-    for (auto &Job : Jobs) {
-      JState[&Job] = JS_WAIT;
-      for (const auto *AI : Job.getDependentActions()) {
-        for (const auto *CI : ActToCmds[AI]) {
-          DependentCmds[&Job].push_back(CI);
-        }
-      }
-      for (const auto *CI : ActToCmds[&Job.getSource()]) {
-        DependentCmds[&Job].push_back(CI);
-      }
-      ActToCmds[&Job.getSource()].push_back(&Job);
-    }
-  }
-  /// \return true if all jobs are done. Otherwise, \p Next contains the
-  /// the next job ready to be executed if it is not null pointer. Otherwise
-  /// all jobs are running or waiting.
-  bool IsDone(const Command *&Next) {
-    std::lock_guard<std::mutex> lock(Mutex);
-    Next = nullptr;
-    unsigned Done = 0;
-    unsigned Running = 0;
-    for (auto &Cmd : Jobs) {
-      switch (JState[&Cmd]) {
-      case JS_RUN:
-        ++Running;
-        break;
-      case JS_DONE:
-      case JS_FAIL:
-        ++Done;
-        break;
-      case JS_WAIT: {
-        bool InputsReady = true;
-        for (const auto *CI : DependentCmds[&Cmd]) {
-          if (JState[CI] == JS_FAIL) {
-            JState[&Cmd] = JS_FAIL;
-            ++Done;
-            InputsReady = false;
-            break;
-          }
-          if (JState[CI] != JS_DONE) {
-            InputsReady = false;
-            break;
-          }
-        }
-        if (!Next && InputsReady) {
-          Next = &Cmd;
-        }
-        break;
-      }
-      }
-    }
-    if (Running >= NumJobs)
-      Next = nullptr;
-    return Done == Jobs.size();
-  }
+static bool ActionDependsOn(const Action *A, const Action *Other) {
+  return A == Other || llvm::any_of(A->inputs(), [&](const Action *Input) {
+           return ActionDependsOn(Input, Other);
+         });
+}
 
-  void setJobState(const Command *Cmd, JobState JS) {
-    std::lock_guard<std::mutex> lock(Mutex);
-    JState[Cmd] = JS;
-  }
+static bool ActionsAreIndependent(const Action *A, const Action *B) {
+  return !ActionDependsOn(A, B) && !ActionDependsOn(B, A);
+}
 
-  void launch(std::function<void()> Work) {
-#if LLVM_ENABLE_THREADS
-    if (NumJobs == 1) {
-      Work();
-      return;
-    }
-    std::thread Th(Work);
-    Th.detach();
-#else
-    Work();
-#endif
-  }
+static bool CanRunInParallelOffloadJobGroup(const Command &Job) {
+  return !Job.InProcess && !Job.PrintInputFilenames &&
+         !Job.getBoundArch().empty() &&
+         !Job.getOffloadDeviceParallelJobGroup().empty();
+}
 
-private:
-  std::mutex Mutex;
-  const JobList &Jobs;
-  llvm::DenseMap<const Command *, JobState> JState;
-  llvm::DenseMap<const Action *, llvm::SmallVector<const Command *, 4>>
-      ActToCmds;
-  llvm::DenseMap<const Command *, llvm::SmallVector<const Command *, 4>>
-      DependentCmds;
-  size_t NumJobs; // Number of parallel jobs to run
+static bool SameParallelOffloadJobGroup(const Command &A, const Command &B) {
+  return A.getOffloadDeviceParallelJobGroup() ==
+         B.getOffloadDeviceParallelJobGroup();
+}
+
+static bool HasDistinctBoundArch(const Command &Candidate,
+                                 ArrayRef<const Command *> Jobs) {
+  BoundArch CandidateArch = Candidate.getBoundArch();
+  return llvm::none_of(Jobs, [&](const Command *Job) {
+    return Job->getBoundArch() == CandidateArch;
+  });
+}
+
+static std::optional<llvm::ThreadPoolStrategy>
+getParallelOffloadJobsStrategy(const ArgList &Args, unsigned NumJobs) {
+  if (NumJobs < 2)
+    return std::nullopt;
+
+  auto OffloadJobs = tools::parseOffloadJobs(Args);
+  if (!OffloadJobs.isValid())
+    return std::nullopt;
+
+  if (OffloadJobs.K == tools::OffloadJobsOpt::Kind::Jobserver)
+    return llvm::jobserver_concurrency();
+
+  if (OffloadJobs.NumThreads < 2)
+    return std::nullopt;
+
+  return llvm::hardware_concurrency(std::min(OffloadJobs.NumThreads, NumJobs));
+}
+
+struct ParallelJobResult {
+  int Res = 0;
+  bool ExecutionFailed = false;
+  std::string Error;
 };
-} // namespace
+
+struct ParallelOffloadJobGroupResult {
+  size_t NumJobs = 0;
+};
+
+static std::optional<ParallelOffloadJobGroupResult>
+tryExecuteParallelOffloadJobGroup(const Driver &D, const ArgList &Args,
+                                  ArrayRef<std::optional<StringRef>> Redirects,
+                                  const JobList::list_type &JobStorage,
+                                  size_t StartIndex,
+                                  FailingCommandList &FailingCommands) {
+  const Command &Job = *JobStorage[StartIndex];
+  if (!CanRunInParallelOffloadJobGroup(Job))
+    return std::nullopt;
+
+  SmallVector<const Command *, 4> ParallelJobs;
+  for (size_t I = StartIndex; I < JobStorage.size(); ++I) {
+    const Command &Candidate = *JobStorage[I];
+    if (ActionFailed(&Candidate.getSource(), FailingCommands))
+      break;
+
+    if (!CanRunInParallelOffloadJobGroup(Candidate))
+      break;
+
+    if (!SameParallelOffloadJobGroup(Job, Candidate))
+      break;
+
+    if (!HasDistinctBoundArch(Candidate, ParallelJobs))
+      break;
+
+    if (!llvm::all_of(ParallelJobs, [&](const Command *Other) {
+          return ActionsAreIndependent(&Candidate.getSource(),
+                                       &Other->getSource());
+        }))
+      break;
+
+    ParallelJobs.push_back(&Candidate);
+  }
+
+  std::optional<llvm::ThreadPoolStrategy> Strategy =
+      getParallelOffloadJobsStrategy(Args, ParallelJobs.size());
+  if (!Strategy)
+    return std::nullopt;
+
+  SmallVector<ParallelJobResult, 4> Results(ParallelJobs.size());
+  llvm::DefaultThreadPool Pool(*Strategy);
+  for (auto IndexedJob : llvm::enumerate(ParallelJobs)) {
+    size_t Index = IndexedJob.index();
+    const Command *ParallelJob = IndexedJob.value();
+    Pool.async([&, Index, ParallelJob] {
+      Results[Index].Res = ParallelJob->Execute(
+          Redirects, &Results[Index].Error, &Results[Index].ExecutionFailed);
+    });
+  }
+  Pool.wait();
+
+  for (auto [Index, ParallelJob] : llvm::enumerate(ParallelJobs)) {
+    ParallelJobResult &Result = Results[Index];
+    if (!Result.Error.empty()) {
+      assert(Result.Res && "Error string set with 0 result code!");
+      D.Diag(diag::err_drv_command_failure) << Result.Error;
+    }
+
+    if (Result.Res) {
+      FailingCommands.push_back(
+          std::make_pair(Result.ExecutionFailed ? 1 : Result.Res, ParallelJob));
+    }
+  }
+
+  return ParallelOffloadJobGroupResult{ParallelJobs.size()};
+}
 
 void Compilation::ExecuteJobs(const JobList &Jobs,
                               FailingCommandList &FailingCommands,
@@ -338,35 +369,38 @@ void Compilation::ExecuteJobs(const JobList &Jobs,
   // inputs on the command line even one of them failed.
   // In all but CLMode, execute all the jobs unless the necessary inputs for the
   // job is missing due to previous failures.
-  JobScheduler JS(Jobs, getDriver().getNumberOfParallelJobs());
+  bool CanRunJobsInParallel =
+      !LogOnly && !getDriver().CCPrintOptions &&
+      !getDriver().CCPrintProcessStats && !getDriver().CCGenDiagnostics &&
+      !getDriver().IsCLMode() && !getArgs().hasArg(options::OPT_v) &&
+      Redirects.empty() && !PostCallback;
 
-  const Command *Next = nullptr;
-  while (!JS.IsDone(Next)) {
-    if (!Next) {
-      // sleep, rather than yield so we do not busy wait.
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  const auto &JobStorage = Jobs.getJobs();
+  for (size_t I = 0; I < JobStorage.size();) {
+    const auto &Job = *JobStorage[I];
+    if (ActionFailed(&Job.getSource(), FailingCommands)) {
+      ++I;
       continue;
     }
 
-    if (ActionFailed(&Next->getSource(), FailingCommands)) {
-      JS.setJobState(Next, JobScheduler::JS_FAIL);
+    if (CanRunJobsInParallel) {
+      if (std::optional<ParallelOffloadJobGroupResult> Result =
+              tryExecuteParallelOffloadJobGroup(getDriver(), getArgs(),
+                                                Redirects, JobStorage, I,
+                                                FailingCommands)) {
+        I += Result->NumJobs;
+        continue;
+      }
+    }
+
+    const Command *FailingCommand = nullptr;
+    if (int Res = ExecuteCommand(Job, FailingCommand, LogOnly)) {
+      FailingCommands.push_back(std::make_pair(Res, FailingCommand));
       // Bail as soon as one command fails in cl driver mode.
       if (TheDriver.IsCLMode())
         return;
-      continue;
     }
-
-    JS.setJobState(Next, JobScheduler::JS_RUN);
-    auto Work = [&, Next]() {
-      const Command *FailingCommand = nullptr;
-      if (int Res = ExecuteCommand(*Next, FailingCommand, LogOnly)) {
-        FailingCommands.push_back(std::make_pair(Res, FailingCommand));
-        JS.setJobState(Next, JobScheduler::JS_FAIL);
-      } else {
-        JS.setJobState(Next, JobScheduler::JS_DONE);
-      }
-    };
-    JS.launch(Work);
+    ++I;
   }
 }
 

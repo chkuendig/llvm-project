@@ -16,6 +16,7 @@
 
 #include <clang/Driver/OffloadBundler.h>
 #include <llvm/BinaryFormat/Magic.h>
+#include <llvm/Object/OffloadBundle.h>
 
 namespace COMGR {
 using namespace llvm;
@@ -111,7 +112,9 @@ amd_comgr_status_t UnbundleCommand::execute(raw_ostream &LogS) {
     break;
   }
   default:
-    llvm_unreachable("invalid bundle type");
+    assert(false && "invalid bundle type");
+    LogS << "Unbundle Error: invalid bundle type\n";
+    return AMD_COMGR_STATUS_ERROR;
   }
 
   return AMD_COMGR_STATUS_SUCCESS;
@@ -141,7 +144,7 @@ Error UnbundleCommand::addInputIdentifier(HashAlgorithm &H) const {
 
   MemoryBuffer &InputBuffer = **MaybeInputBuffer;
 
-  using Header = CompressedOffloadBundle::CompressedBundleHeader;
+  using Header = object::CompressedOffloadBundle::CompressedBundleHeader;
   Expected<Header> MaybeHeader = Header::tryParse(InputBuffer.getBuffer());
   if (!MaybeHeader)
     return MaybeHeader.takeError();

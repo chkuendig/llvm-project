@@ -11,6 +11,8 @@
 #==============================================================================#
 # Temp files created by most text editors.
 *~
+# Emacs lock files
+.#*
 # Merge files created by git.
 *.orig
 # Reject files created by patch.
@@ -20,8 +22,8 @@
 # vim swap files
 .*.sw?
 .sw?
-#OS X specific files.
-.DS_store
+#macOS specific
+.DS_Store
 
 # Ignore the user specified CMake presets in subproject directories.
 /*/CMakeUserPresets.json
@@ -47,16 +49,33 @@ cscope.out
 autoconf/aclocal.m4
 autoconf/autom4te.cache
 /compile_commands.json
+/tablegen_compile_commands.yml
 # Visual Studio built-in CMake configuration
 /CMakeSettings.json
 # CLion project configuration
 /.idea
 /cmake-build*
 # Coding assistants' stuff
+.agents/
 /CLAUDE.md
-/.claude/
+/instructions.md
+.claude/
 /GEMINI.md
-/.gemini/
+.gemini/
+AGENTS.md
+.codex/
+# Cursor specific files
+.cursor
+.cursorignore
+.cursorindexingignore
+/.opencode/
+/.nvim/
+/.nvimlog
+/dhw-extension/
+/install*/
+/tmp/
+# Documentation artifacts
+_toc.yml
 
 #==============================================================================#
 # Directories to ignore (do not add trailing '/'s, they skip symlinks).
@@ -71,6 +90,7 @@ pythonenv*
 # clangd index. (".clangd" is a config file now, thus trailing slash)
 .clangd/
 .cache
+.clangd
 # static analyzer regression testing project files
 /clang/utils/analyzer/projects/*/CachedSource
 /clang/utils/analyzer/projects/*/PatchedSource
@@ -78,3 +98,5 @@ pythonenv*
 /clang/utils/analyzer/projects/*/RefScanBuildResults
 # automodapi puts generated documentation files here.
 /lldb/docs/python_api/
+# documentation artifacts
+/_build

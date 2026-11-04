@@ -19,6 +19,8 @@
 #include "llvm/Object/ELFObjectFile.h"
 #include "llvm/Object/SymbolSize.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 
 using namespace llvm;
@@ -26,11 +28,28 @@ using namespace llvm::object;
 using namespace llvm::support;
 using namespace COMGR;
 
+amd_comgr_status_t COMGR::setCStr(char *&Dest, StringRef Src, size_t *Size) {
+  free(Dest);
+  Dest = reinterpret_cast<char *>(malloc(Src.size() + 1));
+  if (!Dest) {
+    return AMD_COMGR_STATUS_ERROR_OUT_OF_RESOURCES;
+  }
+  memcpy(Dest, Src.data(), Src.size());
+  Dest[Src.size()] = '\0';
+  if (Size) {
+    *Size = Src.size();
+  }
+  return AMD_COMGR_STATUS_SUCCESS;
+}
+
 SymbolContext::SymbolContext()
     : Name(nullptr), Type(AMD_COMGR_SYMBOL_TYPE_NOTYPE), Size(0),
       Undefined(true), Value(0) {}
 
 SymbolContext::~SymbolContext() { free(Name); }
+
+DataSymbol::DataSymbol(SymbolContext *DataSym) : DataSym(DataSym) {}
+DataSymbol::~DataSymbol() { delete DataSym; }
 
 amd_comgr_status_t SymbolContext::setName(llvm::StringRef Name) {
   return setCStr(this->Name, Name);
@@ -61,12 +80,12 @@ SymbolHelper::mapToComgrSymbolType(uint8_t ELFSymbolType) {
 // SymbolHelper version of createBinary, contrary to the one in Binary.cpp,
 // in_text is textual input, not a filename.
 Expected<OwningBinary<Binary>> SymbolHelper::createBinary(StringRef InText) {
-  ErrorOr<std::unique_ptr<MemoryBuffer>> BufOrErr =
+  std::unique_ptr<MemoryBuffer> Buffer =
       MemoryBuffer::getMemBuffer(InText);
-  if (std::error_code EC = BufOrErr.getError()) {
-    return errorCodeToError(EC);
+  if (!Buffer) {
+    return createStringError(std::errc::invalid_argument,
+                              "Failed to create memory buffer");
   }
-  std::unique_ptr<MemoryBuffer> &Buffer = BufOrErr.get();
 
   Expected<std::unique_ptr<Binary>> BinOrErr =
       llvm::object::createBinary(Buffer->getMemBufferRef());
@@ -179,6 +198,18 @@ SymbolContext *SymbolHelper::createBinary(StringRef Ins, const char *Name,
   }
 
   return NULL;
+}
+
+Expected<SymbolRef> COMGR::lookupSymbolByName(ObjectFile &Obj, StringRef Name) {
+  for (const SymbolRef &Sym : Obj.symbols()) {
+    Expected<StringRef> NameOrErr = Sym.getName();
+    if (!NameOrErr)
+      return NameOrErr.takeError();
+    if (*NameOrErr == Name)
+      return Sym;
+  }
+  return createStringError(inconvertibleErrorCode(),
+                           "symbol '" + Name + "' not found");
 }
 
 amd_comgr_status_t SymbolHelper::iterateTable(

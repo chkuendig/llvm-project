@@ -8,13 +8,14 @@
 ///
 /// \file
 /// This file implements Comgr's built-in profiler, which can be enabled with
-/// the AMD_COMGR_TIME_STATISTICS enviornment variable.
+/// the AMD_COMGR_TIME_STATISTICS environment variable.
 ///
 //===----------------------------------------------------------------------===//
 
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <stdlib.h>
 #include <system_error>
 
@@ -28,8 +29,12 @@
 // Avoid introducing min as a macro from Windows headers.
 #define NOMINMAX
 #include <windows.h>
-#elif defined __linux__
+#else
 #include <time.h>
+#endif
+
+#if defined(__FreeBSD__) && !defined(CLOCK_MONOTONIC_RAW)
+#define CLOCK_MONOTONIC_RAW CLOCK_MONOTONIC
 #endif
 
 using namespace llvm;
@@ -43,7 +48,10 @@ namespace TimeStatistics {
 
 namespace {
 std::unique_ptr<PerfStats> PS = nullptr;
-void dump() { PS->dumpPerfStats(); }
+void dump() {
+  PS->dumpPerfStats();
+  PS.reset();
+}
 } // namespace
 
 void getLogFile(std::string &PerfLog) {
@@ -55,23 +63,25 @@ void getLogFile(std::string &PerfLog) {
 }
 
 bool InitTimeStatistics(std::string LogFile) {
-  if (!PS) {
-    if (!env::needTimeStatistics()) {
-      return false;
-    }
+  // Thread-safe lazy init: call_once creates PS and registers the atexit dump
+  // exactly once, even if concurrent Comgr calls reach here simultaneously.
+  static std::once_flag InitFlag;
+  std::call_once(InitFlag, [&LogFile]() {
+    if (!env::needTimeStatistics())
+      return;
 
-    if (LogFile == "") {
+    if (LogFile == "")
       getLogFile(LogFile);
-    }
 
-    PS = std::make_unique<PerfStats>();
-    if (!PS || !PS->Init(LogFile)) {
+    std::unique_ptr<PerfStats> Stats = std::make_unique<PerfStats>();
+    if (!Stats->Init(LogFile)) {
       std::cerr << "TimeStatistics failed to initialize\n";
-      return false;
+      return;
     }
+    PS = std::move(Stats);
     std::atexit(&dump);
-  }
-  return true;
+  });
+  return PS != nullptr;
 }
 
 void ProfilePoint::finish() {
@@ -96,6 +106,15 @@ ProfilePoint::~ProfilePoint() {
   }
 }
 
+void mergeStats(llvm::ArrayRef<PerfStatRecord> Records) {
+  // Lazily stand up the sink (and the atexit dump) exactly as ProfilePoint
+  // does; a no-op when AMD_COMGR_TIME_STATISTICS is unset.
+  if (!InitTimeStatistics(""))
+    return;
+  if (PS)
+    PS->mergeStats(Records);
+}
+
 // Timer implementation
 #if defined _WIN64 || defined _WIN32
 class PerfTimerWindows : public PerfTimerImpl {
@@ -117,8 +136,8 @@ public:
     }
     // QueryPerformanceFrequency returns counts per second
     // If we need milliseconds we divide by 10^3
-    // TODO: granularity as env var
-    PCFreq = li.QuadPart / 1e3;
+    GranularityPerSecond = env::getGranularityUnitsPerSecond();
+    PCFreq = li.QuadPart / GranularityPerSecond;
     return true;
   }
 
@@ -133,8 +152,8 @@ public:
   }
 };
 
-#elif defined __linux__
-class PerfTimerLinux : public PerfTimerImpl {
+#else
+class PerfTimerPosix : public PerfTimerImpl {
 public:
   virtual bool Init() override {
     struct timespec StartTime;
@@ -152,8 +171,8 @@ public:
     }
     // clock_getres returns counts per nanosecond
     // If we need milliseconds we multiply by 10^6
-    // TODO: granularity as env var
-    PCFreq = (Res.tv_sec * 1e9 + Res.tv_nsec) * 1e6;
+    GranularityPerSecond = env::getGranularityUnitsPerSecond();
+    PCFreq = (Res.tv_sec * 1e9 + Res.tv_nsec) * (1e9 / GranularityPerSecond);
     return true;
   }
 
@@ -171,8 +190,8 @@ public:
 bool PerfTimer::Init() {
 #if defined _WIN64 || defined _WIN32
   pImpl = std::make_unique<PerfTimerWindows>();
-#elif defined __linux__
-  pImpl = std::make_unique<PerfTimerLinux>();
+#else
+  pImpl = std::make_unique<PerfTimerPosix>();
 #endif
   return pImpl->Init();
 }

@@ -2,15 +2,15 @@ add_lldb_unittest(TargetTests
   ABITest.cpp
   DynamicRegisterInfoTest.cpp
   ExecutionContextTest.cpp
-  Language.cpp
+  LanguageTest.cpp
   LocateModuleCallbackTest.cpp
   MemoryRegionInfoTest.cpp
   MemoryTest.cpp
   MemoryTagMapTest.cpp
   ModuleCacheTest.cpp
   PathMappingListTest.cpp
-  RegisterFlagsTest.cpp
   RemoteAwarePlatformTest.cpp
+  ScratchTypeSystemTest.cpp
   StackFrameRecognizerTest.cpp
   SummaryStatisticsTest.cpp
   FindFileTest.cpp
@@ -22,6 +22,7 @@ add_lldb_unittest(TargetTests
       lldbHost
       lldbPluginObjectFileBreakpad
       lldbPluginObjectFileELF
+      lldbPluginObjectFileMachO
       lldbPluginPlatformLinux
       lldbPluginPlatformMacOSX
       lldbPluginPlatformAndroid
@@ -31,6 +32,7 @@ add_lldb_unittest(TargetTests
       lldbSymbol
       lldbUtility
       lldbUtilityHelpers
+      LLVMTestingSupport
   )
 
 set(test_inputs

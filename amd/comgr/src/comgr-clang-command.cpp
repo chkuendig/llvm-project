@@ -58,7 +58,8 @@ bool skipProblematicFlag(IteratorTy &It, const IteratorTy &End) {
   // Skip flags related to opencl-c headers or device-libs builtins.
   StringRef Arg = *It;
   static const StringSet<> FlagsWithPathArg = {"-I", "-dumpdir", "-include",
-                                               "-mlink-builtin-bitcode"};
+                                               "-mlink-builtin-bitcode",
+                                               "-mlink-bitcode-file"};
   bool IsFlagWithPathArg = It + 1 != End && FlagsWithPathArg.contains(Arg);
   if (IsFlagWithPathArg) {
     ++It;
@@ -96,7 +97,8 @@ SmallVector<StringRef, 1> getInputFiles(driver::Command &Command) {
 
 } // namespace
 ClangCommand::ClangCommand(driver::Command &Command,
-                           DiagnosticOptions &DiagOpts, vfs::FileSystem &VFS,
+                           DiagnosticOptions &DiagOpts,
+                           IntrusiveRefCntPtr<vfs::FileSystem> VFS,
                            ExecuteFnTy &&ExecuteImpl)
     : Command(Command), DiagOpts(DiagOpts), VFS(VFS),
       ExecuteImpl(std::move(ExecuteImpl)) {}
